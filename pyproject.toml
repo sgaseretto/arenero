@@ -1,0 +1,17 @@
+[project]
+name = "webmonty"
+version = "0.1.0"
+description = "A persistent Monty REPL and agent tool"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.3.18",
+    "pydantic-monty>=0.0.21",
+]
+
+[project.scripts]
+webmonty = "webmonty.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
