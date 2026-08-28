@@ -27,6 +27,7 @@ class FilesystemConfig:
         max_scan_entries: Maximum paths visited by one recursive operation.
         max_grep_chars: Maximum file characters searched by one grep operation.
         max_depth: Maximum directory depth visited by recursive operations.
+        max_transfer_bytes: Maximum bytes uploaded or downloaded in one file.
     """
 
     default_read_limit_chars: int = 8_000
@@ -37,6 +38,7 @@ class FilesystemConfig:
     max_scan_entries: int = 5_000
     max_grep_chars: int = 2_000_000
     max_depth: int = 20
+    max_transfer_bytes: int = 10_000_000
 
     def __post_init__(self) -> None:
         """Validate all filesystem limits."""
@@ -49,6 +51,7 @@ class FilesystemConfig:
             self.max_scan_entries,
             self.max_grep_chars,
             self.max_depth,
+            self.max_transfer_bytes,
         )
         if any(value <= 0 for value in values):
             raise ValueError("filesystem limits must be greater than 0")

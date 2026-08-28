@@ -215,6 +215,84 @@ class PersistentMontyKernel:
         """
         return self._execute(session_id, code, output_limit_chars, file_path=file_path)
 
+    def download_file(
+        self,
+        path: str,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Read one binary file through the configured sandbox filesystem.
+
+        Args:
+            path: Absolute virtual POSIX file path.
+            max_bytes: Optional caller limit. The filesystem hard cap still applies.
+
+        Returns:
+            File content as bytes.
+
+        Raises:
+            ValueError: If the path is not absolute or the requested limit is invalid.
+            MontyError: If the sandbox denies or cannot read the file.
+        """
+        if not path.startswith("/"):
+            raise ValueError("path must be an absolute virtual POSIX path")
+        limit = self._transfer_limit(max_bytes)
+        source = (
+            "from pathlib import Path\n"
+            f"_webmonty_transfer_path = Path({json.dumps(path)})\n"
+            "_webmonty_transfer_size = _webmonty_transfer_path.stat().st_size\n"
+            f"if _webmonty_transfer_size > {limit}:\n"
+            "    raise ValueError('file exceeds the transfer limit')\n"
+            "_webmonty_transfer_path.read_bytes()"
+        )
+        result = self._run_isolated(source)
+        if not isinstance(result, bytes):
+            raise TypeError("the virtual file did not return binary content")
+        return result
+
+    def upload_file(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        create_parents: bool = True,
+    ) -> int:
+        """Write one binary file through the configured sandbox filesystem.
+
+        Args:
+            path: Absolute virtual POSIX file path.
+            content: Binary file content.
+            create_parents: Create missing parent directories when true.
+
+        Returns:
+            Number of bytes written.
+
+        Raises:
+            ValueError: If the path is invalid or content exceeds the hard cap.
+            MontyError: If the sandbox denies or cannot write the file.
+        """
+        if not path.startswith("/"):
+            raise ValueError("path must be an absolute virtual POSIX path")
+        if len(content) > self.filesystem_config.max_transfer_bytes:
+            raise ValueError("content exceeds the filesystem transfer limit")
+        parent_step = (
+            "_webmonty_transfer_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            if create_parents
+            else ""
+        )
+        source = (
+            "from pathlib import Path\n"
+            f"_webmonty_transfer_path = Path({json.dumps(path)})\n"
+            f"{parent_step}"
+            "_webmonty_transfer_path.write_bytes(_webmonty_transfer_content)"
+        )
+        result = self._run_isolated(
+            source,
+            inputs={"_webmonty_transfer_content": bytes(content)},
+        )
+        if not isinstance(result, int):
+            raise TypeError("the virtual file write did not return a byte count")
+        return result
+
     def call_filesystem(
         self,
         session_id: str,
@@ -287,6 +365,7 @@ class PersistentMontyKernel:
             streams = CollectStreams(max_bytes=self.config.max_stream_bytes)
             result: Any = None
             execution_error: MontyError | None = None
+            terminal_resource_error = False
             state: bytes | None = None
 
             try:
@@ -303,10 +382,13 @@ class PersistentMontyKernel:
                         raise
                     except MontyError as exc:
                         execution_error = exc
+                        terminal_resource_error = _is_terminal_resource_error(exc)
 
-                    if self.store.stores_state:
+                    if self.store.stores_state and not terminal_resource_error:
                         state = session.dump()
             except InfrastructureErrors as exc:
+                if isinstance(exc, MontyCrashedError):
+                    self.store.delete(session_id)
                 return self._result(
                     result=None,
                     streams=streams,
@@ -331,6 +413,21 @@ class PersistentMontyKernel:
                     state_saved=False,
                     state_restored=restored,
                     revision=stored.revision if stored else None,
+                )
+
+            if terminal_resource_error:
+                self.store.delete(session_id)
+                return self._result(
+                    result=result,
+                    streams=streams,
+                    error_type=type(execution_error).__name__,
+                    error_message=str(execution_error),
+                    retryable=False,
+                    limit=limit,
+                    limit_was_capped=limit_was_capped,
+                    state_saved=False,
+                    state_restored=restored,
+                    revision=None,
                 )
 
             if state is None:
@@ -459,6 +556,35 @@ class PersistentMontyKernel:
             os=self.os_handler,
         )
 
+    def _run_isolated(
+        self,
+        code: str,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Run one filesystem transfer without changing persistent REPL state.
+
+        Args:
+            code: Monty-compatible transfer code.
+            inputs: Optional host values bound before execution.
+
+        Returns:
+            Raw value returned across the Monty boundary.
+        """
+        if self._closed:
+            raise RuntimeError("the kernel is closed")
+        with self._pool.checkout(
+            script_name="<webmonty:transfer>",
+            limits=self._resource_limits(),
+        ) as session:
+            return session.feed_run(
+                code,
+                inputs=inputs,
+                external_lookup=self.external_lookup or None,
+                mount=self.mounts,
+                os=self.os_handler,
+            )
+
     def _lock_for(self, session_id: str) -> threading.Lock:
         """Get the process-local lock for one session.
 
@@ -497,6 +623,21 @@ class PersistentMontyKernel:
         normalized = max(0, requested)
         effective = min(normalized, self.config.max_output_limit_chars)
         return effective, effective != requested
+
+    def _transfer_limit(self, requested: int | None) -> int:
+        """Normalize a requested binary transfer limit.
+
+        Args:
+            requested: Caller byte limit, or ``None`` for the hard maximum.
+
+        Returns:
+            Effective byte limit.
+        """
+        if requested is None:
+            return self.filesystem_config.max_transfer_bytes
+        if requested < 0:
+            raise ValueError("max_bytes must be at least 0")
+        return min(requested, self.filesystem_config.max_transfer_bytes)
 
     def _error_result(
         self,
@@ -619,6 +760,25 @@ def _safe_result(value: Any, limit: int) -> tuple[Any, bool]:
     if len(serialized) <= limit:
         return value, False
     return _trim(serialized, limit)
+
+
+def _is_terminal_resource_error(error: MontyError) -> bool:
+    """Return whether a Monty error makes the current session unsafe.
+
+    Args:
+        error: Error raised by one Monty feed.
+
+    Returns:
+        ``True`` for time and memory failures.
+    """
+    exception_method = getattr(error, "exception", None)
+    if exception_method is None:
+        return False
+    try:
+        exception = exception_method()
+    except (AttributeError, TypeError):
+        return False
+    return isinstance(exception, (MemoryError, TimeoutError))
 
 
 def _trim(text: str, limit: int) -> tuple[str, bool]:

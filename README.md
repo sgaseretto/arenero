@@ -360,6 +360,7 @@ filesystem_config = FilesystemConfig(
     max_scan_entries=5_000,
     max_grep_chars=2_000_000,
     max_depth=20,
+    max_transfer_bytes=10_000_000,
 )
 
 kernel = PersistentMontyKernel(
@@ -427,7 +428,7 @@ module importing. Names defined by the file enter the current REPL namespace.
 - SQLite writes use transactions.
 - Calls for one session run in order inside one process.
 - Different sessions can run independently.
-- A Monty crash keeps the last saved state.
+- A Monty crash, time limit, or memory limit resets the affected session.
 - Code errors save valid changes made before the error.
 - Old sessions expire after `session_ttl_seconds`.
 - Dumps made by another Monty version require a session reset.
@@ -435,3 +436,70 @@ module importing. Names defined by the file enter the current REPL namespace.
 
 Monty supports a useful subset of Python. See the
 [Monty project](https://github.com/pydantic/monty) for its current language limits.
+
+## Binary files and model images
+
+The text tools remain text-only. Application code can move binary files through a
+separate transfer plane:
+
+```python
+from pathlib import Path
+
+from pydantic_monty import OSAccess
+
+from webmonty import PersistentMontyKernel, read_media_file
+
+filesystem = OSAccess()
+with PersistentMontyKernel(os_handler=filesystem) as kernel:
+    image = Path("ant-image.png").read_bytes()
+    kernel.upload_file("/images/ant-image.png", image)
+
+    downloaded = kernel.download_file("/images/ant-image.png")
+    assert downloaded == image
+
+    media = read_media_file(kernel, "/images/ant-image.png")
+    image_block = media.as_langchain_image(detail="low")
+```
+
+`image_block` is an OpenAI-style LangChain content block for a `HumanMessage`
+content list. WebMonty reads the bytes from the virtual filesystem and Base64-
+encodes them on the host. The model does not gain direct filesystem access.
+
+The binary transfer hard cap is `FilesystemConfig.max_transfer_bytes`. A caller
+can request a lower download cap but cannot exceed this application limit.
+
+## Limited sandbox facade
+
+`WebMontySandbox` groups execution, file utilities, binary transfer, and a stable
+sandbox ID behind one framework-neutral object:
+
+```python
+from pydantic_monty import OSAccess
+
+from webmonty import (
+    MONTY_SANDBOX_INSTRUCTIONS,
+    PersistentMontyKernel,
+    WebMontySandbox,
+)
+
+with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
+    sandbox = WebMontySandbox(kernel, session_id="thread-1")
+    sandbox.write("/helper.py", "value = 21\n")
+    sandbox.execute("python /helper.py")
+    result = sandbox.execute("python -c 'value * 2'")
+    print(result.output)
+    # 42
+```
+
+The `execute` method is deliberately not a shell. It accepts only:
+
+- `python -c '<Monty-compatible Python code>'`
+- `python /absolute/virtual/file.py`
+
+It rejects shell operators, pipes, redirection, Git, package installation,
+network commands, and all other executables. Per-call timeout overrides are not
+available; configure time and request limits on `KernelConfig`.
+
+Give `MONTY_SANDBOX_INSTRUCTIONS` to an LLM whenever it can call this limited
+execute operation. See [the sandbox compatibility report](docs/sandbox-compatibility.md)
+for the supported Deep Agents concepts and the remaining gaps.
