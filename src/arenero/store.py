@@ -29,6 +29,44 @@ class StoredSession:
     updated_at: float
 
 
+@dataclass(frozen=True)
+class SessionInfo:
+    """Expose safe metadata for one saved session.
+
+    Attributes:
+        session_id: Application session key.
+        monty_version: Monty version that created the snapshot.
+        revision: Monotonic saved-state revision.
+        updated_at: Last update time as a Unix timestamp.
+        state_size_bytes: Serialized snapshot size in bytes.
+    """
+
+    session_id: str
+    monty_version: str
+    revision: int
+    updated_at: float
+    state_size_bytes: int
+
+    @classmethod
+    def from_stored(cls, session_id: str, stored: StoredSession) -> "SessionInfo":
+        """Build metadata from one stored snapshot.
+
+        Args:
+            session_id: Application session key.
+            stored: Stored session snapshot.
+
+        Returns:
+            Safe session metadata without snapshot bytes.
+        """
+        return cls(
+            session_id=session_id,
+            monty_version=stored.monty_version,
+            revision=stored.revision,
+            updated_at=stored.updated_at,
+            state_size_bytes=len(stored.state),
+        )
+
+
 class SessionStore(Protocol):
     """Storage used for Monty session snapshots."""
 
@@ -89,6 +127,14 @@ class SessionStore(Protocol):
 
         Returns:
             Number of deleted sessions.
+        """
+        ...
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """List saved sessions without exposing snapshot bytes.
+
+        Returns:
+            Session metadata sorted by session ID.
         """
         ...
 
@@ -155,6 +201,14 @@ class StatelessSessionStore:
             Always zero.
         """
         return 0
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """Return no session metadata.
+
+        Returns:
+            Empty list because this store discards state.
+        """
+        return []
 
 
 class InMemorySessionStore:
@@ -257,6 +311,18 @@ class InMemorySessionStore:
             for session_id in expired:
                 del self._sessions[session_id]
             return len(expired)
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """List current in-memory sessions.
+
+        Returns:
+            Session metadata sorted by session ID.
+        """
+        with self._lock:
+            return [
+                SessionInfo.from_stored(session_id, self._sessions[session_id])
+                for session_id in sorted(self._sessions)
+            ]
 
 
 class SQLiteSessionStore:
@@ -446,3 +512,28 @@ class SQLiteSessionStore:
                 (cutoff,),
             )
             return cursor.rowcount
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """List current SQLite sessions.
+
+        Returns:
+            Session metadata sorted by session ID.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT session_id, monty_version, revision, updated_at, length(state)
+                FROM sessions
+                ORDER BY session_id
+                """
+            ).fetchall()
+        return [
+            SessionInfo(
+                session_id=session_id,
+                monty_version=monty_version,
+                revision=revision,
+                updated_at=updated_at,
+                state_size_bytes=state_size_bytes,
+            )
+            for session_id, monty_version, revision, updated_at, state_size_bytes in rows
+        ]

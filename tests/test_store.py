@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from webmonty.store import (
+from arenero.store import (
     ConcurrentSessionUpdate,
     InMemorySessionStore,
     SQLiteSessionStore,
@@ -76,6 +76,25 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(revision)
         self.assertIsNone(store.load("thread"))
         self.assertFalse(store.delete("thread"))
+        self.assertEqual(store.list_sessions(), [])
+
+    def test_stores_list_safe_session_metadata(self) -> None:
+        """List sorted metadata without returning snapshot content."""
+        self.store.save("two", b"22", "1.0", expected_revision=None)
+        self.store.save("one", b"1", "1.0", expected_revision=None)
+
+        sqlite_sessions = self.store.list_sessions()
+        memory = InMemorySessionStore()
+        memory.save("one", b"abc", "1.0", expected_revision=None)
+        memory_sessions = memory.list_sessions()
+
+        self.assertEqual(
+            [session.session_id for session in sqlite_sessions],
+            ["one", "two"],
+        )
+        self.assertEqual(sqlite_sessions[0].state_size_bytes, 1)
+        self.assertEqual(sqlite_sessions[1].state_size_bytes, 2)
+        self.assertEqual(memory_sessions[0].state_size_bytes, 3)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,22 @@
 import concurrent.futures
+import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from pydantic_monty import MemoryFile, MountDir, OSAccess
 
-from webmonty import (
+from arenero import (
     FilesystemConfig,
     InMemorySessionStore,
     KernelConfig,
     PersistentMontyKernel,
     SQLiteSessionStore,
     StatelessSessionStore,
+    WorkspaceConfig,
+    execute_repl_cell,
 )
 
 
@@ -398,8 +403,8 @@ class KernelTests(unittest.TestCase):
         ):
             execution = kernel.execute(
                 "thread",
-                "fs_write('/workspace/src/a.py', 'Alpha\\nbeta\\nAlpha\\n', "
-                "create_parents=True)\n"
+                "fs_mkdir('/workspace/src', parents=True, exist_ok=True)\n"
+                "fs_write('/workspace/src/a.py', 'Alpha\\nbeta\\nAlpha\\n')\n"
                 "fs_write('/workspace/src/b.txt', 'other')\n"
                 "edited = fs_edit('/workspace/src/a.py', 'beta', 'gamma')\n"
                 "listing = fs_ls('/workspace', recursive=True)\n"
@@ -548,6 +553,165 @@ class KernelTests(unittest.TestCase):
 
         self.assertTrue(all(item["ok"] for item in executions))
         self.assertEqual(final["result"], 12)
+
+    def test_worker_checkout_timeout_returns_retryable_result(self) -> None:
+        """Return bounded backpressure when the sync worker pool is full."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold() -> int:
+            """Own the only worker until the test releases it."""
+            started.set()
+            release.wait(timeout=1)
+            return 1
+
+        config = KernelConfig(
+            max_worker_processes=1,
+            worker_checkout_timeout_seconds=0.02,
+        )
+        with (
+            PersistentMontyKernel(
+                config=config,
+                external_lookup={"hold": hold},
+            ) as kernel,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            first = executor.submit(kernel.execute, "one", "hold()")
+            self.assertTrue(started.wait(timeout=1))
+            busy = kernel.execute("two", "2")
+            release.set()
+            first.result(timeout=1)
+
+        self.assertEqual(busy["error"]["type"], "WorkerCheckoutTimeout")
+        self.assertTrue(busy["retryable"])
+
+    def test_workspace_preserves_state_and_files_across_restarts(self) -> None:
+        """Restore SQLite state and host-backed files as one workspace."""
+        workspace = Path(self.directory.name) / "workspace"
+        workspace_config = WorkspaceConfig(workspace)
+        store = SQLiteSessionStore(self.database)
+
+        with PersistentMontyKernel(store, workspace=workspace_config) as kernel:
+            first = kernel.execute(
+                "thread",
+                "value = 40\nopen('/workspace/value.txt', 'w').write('2')",
+            )
+
+        with PersistentMontyKernel(store, workspace=workspace_config) as kernel:
+            restored = kernel.execute(
+                "thread",
+                "value + int(open('/workspace/value.txt').read())",
+            )
+            shell = execute_repl_cell(kernel, "new-thread", "!pwd")
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(restored["result"], 42)
+        self.assertTrue(restored["state_restored"])
+        self.assertEqual(shell["output"], "/workspace\n")
+        self.assertEqual((workspace / "value.txt").read_text(), "2")
+
+    def test_type_check_rejects_code_before_execution(self) -> None:
+        """Use Monty checking with filesystem and host-function declarations."""
+        config = KernelConfig(
+            type_check=True,
+            type_check_stubs="def host_add(a: int, b: int) -> int: ...",
+        )
+        workspace = WorkspaceConfig(Path(self.directory.name) / "typed")
+        with PersistentMontyKernel(
+            config=config,
+            external_lookup={"host_add": lambda a, b: a + b},
+            workspace=workspace,
+        ) as kernel:
+            valid = kernel.execute(
+                "thread",
+                "x: int = host_add(20, 22)\nfs_write('/workspace/value.txt', str(x))",
+            )
+            restored = kernel.execute("thread", "x + 1")
+            invalid = kernel.execute("thread", 'bad: int = "text"')
+            missing = kernel.execute("thread", "bad")
+
+        self.assertTrue(valid["ok"])
+        self.assertEqual(restored["result"], 43)
+        self.assertEqual(invalid["error"]["type"], "MontyTypingError")
+        self.assertIn("not assignable", invalid["error"]["message"])
+        self.assertFalse(missing["ok"])
+
+    def test_trimmed_python_and_shell_output_can_be_offloaded(self) -> None:
+        """Save larger bounded results when model-facing output is shortened."""
+        with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
+            python = execute_repl_cell(
+                kernel,
+                "thread",
+                '"abcdefgh"',
+                3,
+                output_file="/python.json",
+            )
+            shell = execute_repl_cell(
+                kernel,
+                "thread",
+                "!echo abcdefgh",
+                3,
+                output_file="/shell.txt",
+            )
+            python_file = json.loads(kernel.download_file("/python.json"))
+            shell_file = kernel.download_file("/shell.txt").decode()
+
+        self.assertEqual(python["mode"], "python")
+        self.assertEqual(python["output_file"], "/python.json")
+        self.assertTrue(python["truncation"]["result"])
+        self.assertEqual(python_file["result"], "abcdefgh")
+        self.assertEqual(shell["mode"], "shell")
+        self.assertEqual(shell["output"], "abc")
+        self.assertEqual(shell["output_file"], "/shell.txt")
+        self.assertTrue(shell["truncation"]["output"])
+        self.assertEqual(shell_file, "abcdefgh\n")
+
+    def test_shared_filesystem_serializes_different_sessions(self) -> None:
+        """Prevent same-kernel filesystem work from running at the same time."""
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        def slow_host_call() -> int:
+            """Record concurrent host calls during one Monty feed."""
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.03)
+            with state_lock:
+                active -= 1
+            return 1
+
+        with (
+            PersistentMontyKernel(
+                external_lookup={"slow_host_call": slow_host_call},
+                os_handler=OSAccess(),
+            ) as kernel,
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            results = list(
+                executor.map(
+                    lambda session: kernel.execute(session, "slow_host_call()"),
+                    ("one", "two"),
+                )
+            )
+
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(maximum_active, 1)
+
+    def test_kernel_lists_safe_session_metadata(self) -> None:
+        """Inspect sessions without exposing their snapshot bytes."""
+        with self.make_kernel() as kernel:
+            kernel.execute("two", "value = 2")
+            kernel.execute("one", "value = 1")
+            sessions = kernel.list_sessions()
+            one = kernel.get_session_info("one")
+
+        self.assertEqual([info.session_id for info in sessions], ["one", "two"])
+        self.assertEqual(one.session_id, "one")
+        self.assertGreater(one.state_size_bytes, 0)
+        self.assertEqual(one.revision, 1)
 
 
 if __name__ == "__main__":

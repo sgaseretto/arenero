@@ -1,12 +1,63 @@
-# WebMonty
+# Arenero
 
-WebMonty is a persistent Python tool built on
+Arenero is a persistent Python tool built on
 [Monty](https://github.com/pydantic/monty). It can run as a terminal REPL or as a
 LangChain and LangGraph tool.
 
 Each session can use in-memory, SQLite, or stateless storage. In-memory storage is
 the default kernel mode. It keeps variables and functions across agent loops and
 separate human turns while the application process stays active.
+
+```mermaid
+flowchart LR
+    User["Human or agent"] --> Interface["REPL, sandbox facade, or agent tools"]
+    Interface --> Cell["Cell dispatcher"]
+    Cell -->|Python| Kernel["Sync or native async persistent kernel"]
+    Cell -->|Shell cell| Shell["Virtual shell"]
+    Shell --> Kernel
+    Kernel --> Worker["Monty worker pool"]
+    Kernel <--> Store["Memory, SQLite, or stateless session store"]
+    Kernel <--> Files["Virtual files or persistent workspace"]
+    Kernel --> MCP["Optional configured MCP tools"]
+```
+
+The kernel is the shared control point for limits, session state, and virtual
+files. The virtual shell dispatches allowlisted operations. It does not start
+operating-system processes.
+
+## When to use Arenero
+
+Arenero is a good fit when an agent needs a small, persistent computation space:
+
+- Keep variables and helper functions between agent and human turns.
+- Calculate, filter, join, and transform plain Python values.
+- Read and change bounded virtual files.
+- Reuse a virtual Python helper file with `execute_file()`.
+- Run short allowlisted text pipelines.
+- Fetch bounded public HTTP or HTTPS data through virtual `curl`.
+- Call narrow application functions without giving Python ambient host access.
+- Discover and compose user-configured MCP tools from persistent Python.
+
+Use a container, VM, or managed code sandbox when the work needs full CPython,
+third-party packages, Git, package installation, system test tools, compilers,
+arbitrary executables, or a real shell.
+
+## Documentation map
+
+- [Architecture and components](docs/architecture.md) explains each layer,
+  execution flow, state ownership, locks, security boundaries, and extension
+  points.
+- [Usage and capabilities](docs/usage-and-capabilities.md) gives verified working
+  examples, rejected examples, selection tables, agent guidance, and a production
+  checklist.
+- [Virtual shell reference](docs/virtual-shell.md) lists every command, flag,
+  operator, exit code, limit, and deliberate exclusion.
+- [Sandbox compatibility](docs/sandbox-compatibility.md) compares Arenero with the
+  utilities expected by Deep Agents sandboxes.
+- [MCP tools inside the REPL](docs/mcp.md) explains configured servers,
+  progressive discovery, composition, persistence, limits, and security.
+- [Design decisions](docs/design-decisions.md) records why persistence, typing,
+  output, async, locking, and dependencies work as they do.
 
 ## Install and test
 
@@ -15,22 +66,39 @@ uv sync
 uv run python -m unittest discover -s tests -v
 ```
 
+The core package does not require LangChain or the MCP SDK. Install only the
+optional integrations that an application needs:
+
+```console
+uv add arenero
+uv add "arenero[langchain]"
+uv add "arenero[mcp]"
+```
+
 ## Terminal REPL
 
 ```console
-uv run webmonty
+uv run arenero
 ```
 
-The CLI uses SQLite by default, with `.webmonty/sessions.db` as its database. Its
+The CLI uses SQLite by default, with `.arenero/sessions.db` as its database. Its
 default session name is `cli`.
 
 ```console
-uv run webmonty --session research
-uv run webmonty --store memory --session research
-uv run webmonty --store none
-uv run webmonty --session research --output-limit 2000
-uv run webmonty --session research --reset
+uv run arenero --session research
+uv run arenero --store memory --session research
+uv run arenero --store none
+uv run arenero --session research --output-limit 2000
+uv run arenero --workspace .arenero/workspaces/shared
+uv run arenero --type-check
+uv run arenero --list-sessions
+uv run arenero --prune-sessions
+uv run arenero --session research --reset
 ```
+
+`--workspace` mounts a persistent host directory at `/workspace` and starts new
+shell sessions there. `--output-file /workspace/output.json` saves larger bounded
+cell output when the normal response is trimmed.
 
 The storage modes are:
 
@@ -43,18 +111,26 @@ The storage modes are:
 ## Kernel API
 
 ```python
-from webmonty import KernelConfig, PersistentMontyKernel
+from arenero import KernelConfig, PersistentMontyKernel
 
 config = KernelConfig(
     default_output_limit_chars=8_000,
     max_output_limit_chars=50_000,
+    max_shell_command_chars=20_000,
+    max_shell_commands=8,
     max_stream_bytes=1_000_000,
     max_state_bytes=5_000_000,
     max_duration_seconds=5,
     max_memory_bytes=64 * 1024 * 1024,
     max_recursion_depth=100,
     request_timeout_seconds=10,
+    min_worker_processes=1,
+    max_worker_processes=4,
+    worker_checkout_timeout_seconds=5,
+    max_checkouts_per_worker=None,
     session_ttl_seconds=24 * 60 * 60,
+    type_check=True,
+    type_check_stubs="def lookup_price(product_id: str) -> float: ...",
 )
 
 with PersistentMontyKernel(config=config) as kernel:
@@ -64,11 +140,67 @@ with PersistentMontyKernel(config=config) as kernel:
     # 42
 ```
 
+### Native async batch execution
+
+Use one `AsyncPersistentMontyKernel` for agents that run at the same time. Give
+each agent its own stable session ID. Calls with different IDs can use different
+workers. Calls with the same ID always run in order.
+
+```python
+import asyncio
+
+from arenero import AsyncPersistentMontyKernel, KernelConfig
+
+
+async def main() -> None:
+    config = KernelConfig(
+        min_worker_processes=2,
+        max_worker_processes=4,
+        worker_checkout_timeout_seconds=5,
+    )
+    async with AsyncPersistentMontyKernel(config=config) as kernel:
+        results = await asyncio.gather(
+            kernel.execute("agent-1", "sum(range(100))"),
+            kernel.execute("agent-2", "sum(range(200))"),
+        )
+        print([result["result"] for result in results])
+
+
+asyncio.run(main())
+```
+
+Monty's worker pool is the backpressure control. When no worker becomes free
+before `worker_checkout_timeout_seconds`, Arenero returns a retryable
+`WorkerCheckoutTimeout` result. Do not add an application semaphore unless the
+application needs a lower limit than the Monty pool.
+
+Async host functions must be called with `await` in Monty code. The async kernel
+also exposes `await mcp_call(...)` when it has an `McpHub`.
+
+The optional native async agent adapter contains three tools:
+
+```python
+from arenero import create_async_python_repl_tools
+
+tools = create_async_python_repl_tools(kernel)
+```
+
+- `python_repl`
+- `python_repl_execute_file`
+- `reset_python_repl`
+
+This small adapter does not claim virtual shell support. Use
+`AsyncAreneroSandbox` when an async application needs the full synchronous
+sandbox API through worker threads. The native async kernel also omits host-side
+upload, download, session listing, and output-file offloading methods. Agents can
+still use the virtual `fs_*` functions inside Python and can run a helper with
+`execute_file()`.
+
 The kernel uses `InMemorySessionStore` when no store is given. Select another mode
 with an explicit store:
 
 ```python
-from webmonty import (
+from arenero import (
     InMemorySessionStore,
     PersistentMontyKernel,
     SQLiteSessionStore,
@@ -111,11 +243,13 @@ stateless_kernel = PersistentMontyKernel(StatelessSessionStore())
 
 ## LangChain and LangGraph
 
-The adapter creates these Python tools:
+The adapter creates these tools:
 
-- `python_repl` runs code in the current graph thread.
+- `python_repl` runs Monty Python or notebook-style virtual shell cells in the
+  current graph thread.
 - `python_repl_execute_file` runs a virtual Python file and optional follow-up
   code in one tool call.
+- `virtual_shell` runs allowlisted commands against the virtual filesystem.
 - `reset_python_repl` removes that thread's Python state.
 
 It also creates shared virtual filesystem tools:
@@ -128,10 +262,35 @@ It also creates shared virtual filesystem tools:
 - `glob_files`
 - `grep_files`
 
+An agent can use only `python_repl` and still access the virtual shell:
+
+```text
+!curl https://example.com/data | grep result
+```
+
+```text
+%%shell
+mkdir -p /work
+curl https://example.com/data > /work/data.txt
+grep result /work/data.txt
+```
+
+`!command` accepts one shell line. In a `%%shell` cell, each nonempty line runs in
+sequence. Python and shell cells use the same thread session, shell working
+directory, Python state, and virtual filesystem. For example, a later shell cell
+can run `python -c 'existing_variable'`, and a later Python cell can read a file
+that the shell created.
+
+Python and shell cells keep their existing detailed fields. Both modes also
+include `mode`, `ok`, `result`, `output`, `stdout`, `stderr`, `error`, `exit_code`,
+`truncation`, `retryable`, `output_file`, and `output_file_error`. Use the common
+fields when one adapter handles both modes. Python and shell source cannot be
+mixed in one cell.
+
 ```python
 from langchain.agents import create_agent
 
-from webmonty import (
+from arenero import (
     PersistentMontyKernel,
     SQLiteSessionStore,
     create_python_repl_tools,
@@ -145,9 +304,11 @@ agent = create_agent(
     model="your-model",
     tools=tools,
     system_prompt=(
-        "Use python_repl for calculations and temporary data. Use "
+        "Use python_repl for calculations, temporary data, and !COMMAND or "
+        "%%shell virtual shell cells. Use "
         "python_repl_execute_file when a known virtual Python file must be loaded. "
-        "Use the file tools to inspect and change virtual files."
+        "Use virtual_shell for short virtual file pipelines. Use the file tools "
+        "when a structured result is easier to use."
     ),
 )
 
@@ -173,7 +334,7 @@ The application controls two limits:
 - `default_output_limit_chars` is used when a tool call does not request a limit.
 - `max_output_limit_chars` is the hard maximum that a tool call cannot exceed.
 
-The `python_repl` and `python_repl_execute_file` tools expose
+The `python_repl`, `python_repl_execute_file`, and `virtual_shell` tools expose
 `output_limit_chars` to the model. The model can use a smaller value when it only
 needs a short answer:
 
@@ -188,6 +349,19 @@ The limit applies separately to `result`, `stdout`, `stderr`, and the error mess
 Set it to `0` to omit the contents of these fields. The response reports which
 fields were truncated and whether the requested value was capped.
 
+The agent can also set `output_file` to an absolute virtual path. When output is
+trimmed, Arenero saves the larger bounded Python result as JSON or the larger
+bounded shell output as text. The hard stream, result, and transfer limits still
+apply:
+
+```json
+{
+  "code": "large_result",
+  "output_limit_chars": 1000,
+  "output_file": "/workspace/outputs/result.json"
+}
+```
+
 `max_stream_bytes` is separate. It stops code that prints too much before trimming
 happens. This protects the host process.
 
@@ -197,18 +371,28 @@ Monty code has no direct host file, environment, or network access. You can expo
 specific synchronous functions:
 
 ```python
+from arenero import KernelConfig, PersistentMontyKernel
+
+
 def lookup_price(product_id: str) -> float:
     return 12.50
 
 
 kernel = PersistentMontyKernel(
+    config=KernelConfig(
+        type_check=True,
+        type_check_stubs=("def lookup_price(product_id: str) -> float: ..."),
+    ),
     external_lookup={"lookup_price": lookup_price},
 )
 
 kernel.execute("thread-1", 'lookup_price("item-42")')
 ```
 
-Only functions in `external_lookup` are available inside the sandbox.
+Only functions in `external_lookup` are available inside the sandbox. When type
+checking is enabled, declare each host function in `type_check_stubs`. Invalid
+typed code returns `MontyTypingError` and does not execute or enter the accumulated
+type-check context.
 
 ## Filesystem access
 
@@ -224,7 +408,7 @@ its files must remain available:
 ```python
 from pydantic_monty import MemoryFile, OSAccess
 
-from webmonty import PersistentMontyKernel
+from arenero import PersistentMontyKernel
 
 filesystem = OSAccess(
     files=[MemoryFile("/data/input.txt", "21")],
@@ -246,6 +430,33 @@ The same `OSAccess` object is shared by every session that uses that kernel. Use
 different object per user or thread when files must be isolated. These files are
 not part of a Monty session dump, so SQLite does not save them.
 
+### Persistent workspace
+
+`WorkspaceConfig` is the simple option when Python state and files must both
+survive an application restart. Arenero owns and closes the confined read-write
+mount:
+
+```python
+from arenero import (
+    PersistentMontyKernel,
+    SQLiteSessionStore,
+    WorkspaceConfig,
+)
+
+with PersistentMontyKernel(
+    SQLiteSessionStore(".arenero/sessions.db"),
+    workspace=WorkspaceConfig(".arenero/workspaces/shared"),
+) as kernel:
+    kernel.execute(
+        "thread-1",
+        "open('/workspace/result.txt', 'w').write('saved')",
+    )
+```
+
+The workspace appears at `/workspace` by default. New shell sessions start there.
+Sessions that use one kernel share the workspace. Use a different directory for
+each user or tenant when files must be isolated.
+
 ### Host directory mounts
 
 Pass one `MountDir` or a list of mounts to `mounts`. Virtual paths always use POSIX
@@ -256,7 +467,7 @@ from pathlib import Path
 
 from pydantic_monty import MountDir
 
-from webmonty import PersistentMontyKernel
+from arenero import PersistentMontyKernel
 
 workspace = Path("agent-workspace")
 workspace.mkdir(exist_ok=True)
@@ -291,16 +502,17 @@ directories when agents must be isolated. `write_bytes_limit` limits writes in o
 call, and `memory_usage_limit` limits memory used by the mount.
 
 `reset()` removes Python state only. It does not clear an `OSAccess` object or
-delete files in a mounted directory. Filesystem lifecycle, per-thread workspace
-creation, cleanup, and SQLite file storage are not part of this basic support.
+delete files in a mounted directory. `WorkspaceConfig` persists files in its host
+directory; it does not store file content inside SQLite.
 
 ### Filesystem helpers and agent tools
 
-WebMonty loads these bounded helper functions into every REPL session:
+Arenero loads these bounded helper functions into every REPL session:
 
 - `fs_read(path, offset=0, limit=None)`
 - `fs_write(path, content, append=False, create_parents=False)`
 - `fs_edit(path, old_text, new_text, replace_all=False)`
+- `fs_mkdir(path, parents=False, exist_ok=False)`
 - `fs_delete(path, recursive=False)`
 - `fs_ls(path="/", recursive=False, limit=None)`
 - `fs_glob(pattern, root="/", limit=None)`
@@ -349,7 +561,7 @@ default, and the virtual root `/` cannot be deleted.
 Configure hard filesystem limits separately from normal kernel limits:
 
 ```python
-from webmonty import FilesystemConfig, PersistentMontyKernel
+from arenero import FilesystemConfig, PersistentMontyKernel
 
 filesystem_config = FilesystemConfig(
     default_read_limit_chars=8_000,
@@ -375,7 +587,7 @@ hard caps. Kernel output trimming still applies after a helper returns its resul
 ### Execute a virtual Python file
 
 Monty does not import Python files from the virtual filesystem and does not expose
-`eval()` or `exec()`. WebMonty can still read a file and submit its source directly
+`eval()` or `exec()`. Arenero can still read a file and submit its source directly
 to the persistent Monty session:
 
 ```python
@@ -415,7 +627,7 @@ Agents receive the same feature as `python_repl_execute_file`:
 }
 ```
 
-The file source stays between WebMonty and Monty. It is not returned to the model,
+The file source stays between Arenero and Monty. It is not returned to the model,
 and the output limit does not shorten it. This is file execution, not normal Python
 module importing. Names defined by the file enter the current REPL namespace.
 
@@ -427,12 +639,22 @@ module importing. Names defined by the file enter the current REPL namespace.
 - In-memory and SQLite writes use revision checks.
 - SQLite writes use transactions.
 - Calls for one session run in order inside one process.
-- Different sessions can run independently.
+- Different sessions run independently when no shared filesystem is configured.
+- A kernel with shared files serializes filesystem-capable executions. This
+  prevents same-process read-modify-write races between sessions.
 - A Monty crash, time limit, or memory limit resets the affected session.
 - Code errors save valid changes made before the error.
 - Old sessions expire after `session_ttl_seconds`.
 - Dumps made by another Monty version require a session reset.
 - Oversized session states do not replace the last saved state.
+
+Use `kernel.list_sessions()` and `kernel.get_session_info(session_id)` to inspect
+safe metadata such as revision, update time, Monty version, and snapshot size.
+Snapshot bytes are not returned. Use `kernel.delete_expired()` for explicit
+cleanup. The CLI provides `--list-sessions` and `--prune-sessions`.
+
+The shared-file lock is local to one kernel process. Separate processes that write
+the same host directory still need application-level coordination.
 
 Monty supports a useful subset of Python. See the
 [Monty project](https://github.com/pydantic/monty) for its current language limits.
@@ -447,7 +669,7 @@ from pathlib import Path
 
 from pydantic_monty import OSAccess
 
-from webmonty import PersistentMontyKernel, read_media_file
+from arenero import PersistentMontyKernel, read_media_file
 
 filesystem = OSAccess()
 with PersistentMontyKernel(os_handler=filesystem) as kernel:
@@ -462,44 +684,129 @@ with PersistentMontyKernel(os_handler=filesystem) as kernel:
 ```
 
 `image_block` is an OpenAI-style LangChain content block for a `HumanMessage`
-content list. WebMonty reads the bytes from the virtual filesystem and Base64-
+content list. Arenero reads the bytes from the virtual filesystem and Base64-
 encodes them on the host. The model does not gain direct filesystem access.
 
 The binary transfer hard cap is `FilesystemConfig.max_transfer_bytes`. A caller
 can request a lower download cap but cannot exceed this application limit.
 
-## Limited sandbox facade
+## Virtual shell and sandbox facade
 
-`WebMontySandbox` groups execution, file utilities, binary transfer, and a stable
+`AreneroSandbox` groups execution, file utilities, binary transfer, and a stable
 sandbox ID behind one framework-neutral object:
 
 ```python
 from pydantic_monty import OSAccess
 
-from webmonty import (
+from arenero import (
     MONTY_SANDBOX_INSTRUCTIONS,
+    NetworkConfig,
     PersistentMontyKernel,
-    WebMontySandbox,
+    AreneroSandbox,
 )
 
 with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
-    sandbox = WebMontySandbox(kernel, session_id="thread-1")
-    sandbox.write("/helper.py", "value = 21\n")
-    sandbox.execute("python /helper.py")
-    result = sandbox.execute("python -c 'value * 2'")
+    sandbox = AreneroSandbox(kernel, session_id="thread-1")
+    sandbox.execute("mkdir -p /work")
+    sandbox.execute("cd /work")
+    sandbox.execute("echo 'Alpha' > notes.txt")
+    result = sandbox.execute("cat notes.txt | grep Alpha")
     print(result.output)
-    # 42
+    # Alpha
 ```
 
-The `execute` method is deliberately not a shell. It accepts only:
+Async applications that need the complete shell and file facade can use the same
+sync operations through worker threads:
 
-- `python -c '<Monty-compatible Python code>'`
-- `python /absolute/virtual/file.py`
+```python
+from arenero import AsyncAreneroSandbox
 
-It rejects shell operators, pipes, redirection, Git, package installation,
-network commands, and all other executables. Per-call timeout overrides are not
-available; configure time and request limits on `KernelConfig`.
+sandbox = AsyncAreneroSandbox(kernel, session_id="thread-1")
+result = await sandbox.execute("python -c '21 * 2'")
+await sandbox.write("/workspace/result.txt", result.output)
+```
 
-Give `MONTY_SANDBOX_INSTRUCTIONS` to an LLM whenever it can call this limited
-execute operation. See [the sandbox compatibility report](docs/sandbox-compatibility.md)
-for the supported Deep Agents concepts and the remaining gaps.
+The asynchronous facade uses the same kernel locks, limits, files, and persistent
+state. It does not create a second Monty runtime. Use
+`AsyncPersistentMontyKernel` for native concurrent Monty execution.
+
+`execute` provides a small virtual shell. It supports:
+
+- `help`, `which`, `pwd`, `cd`, `ls`, `mkdir`, `cat`, `head`, `tail`, `grep`,
+  `find`, `glob`, `echo`, `sort`, `uniq`, `rev`, `wc`, `basename`, `dirname`,
+  `tee`, `base64`, `sha256sum`, `rm`, `cp`, and `mv`
+- Opt-in, policy-limited `curl`
+- `python -c CODE` and `python FILE.py`
+- Text pipes with `|`
+- Command lists with `;`, `&&`, and `||`
+- Virtual file input and output with `<`, `>`, and `>>`
+
+The working directory belongs to the Monty session. Memory and SQLite storage
+preserve it with Python state. Stateless storage starts at `/` for every call.
+Files still follow the separate virtual filesystem lifecycle and can be shared by
+sessions.
+
+This shell never starts an operating-system process. It rejects background jobs,
+environment variables, wildcard expansion, command substitution, Git, package
+installation, and all other executables. The virtual `curl` command allows
+bounded requests to public HTTP and HTTPS URLs by default. Supply a host policy
+when you want a narrower URL or method set:
+
+```python
+network = NetworkConfig(
+    allowed_url_prefixes=("https://api.example.com/v1",),
+    allowed_methods=frozenset({"GET", "HEAD"}),
+    timeout_seconds=10,
+    max_response_bytes=1_000_000,
+    trusted_header_provider=lambda url: {"Authorization": "Bearer host-secret"},
+)
+
+with PersistentMontyKernel(
+    os_handler=OSAccess(),
+    network_config=network,
+) as kernel:
+    sandbox = AreneroSandbox(kernel, session_id="thread-1")
+    result = sandbox.execute("curl https://api.example.com/v1/items | grep active")
+```
+
+With no `NetworkConfig`, all public HTTP and HTTPS URLs are allowed with `GET` and
+`HEAD`. An empty `allowed_url_prefixes` tuple has the same meaning. A nonempty
+allowlist compares the exact scheme, host, effective port, and path prefix. Set
+`enabled=False` to remove `curl` from the shell.
+
+The default lets an agent send data that it knows to a public service. Configure
+narrow URL prefixes when the agent can access sensitive data.
+
+Private, local, and reserved IP addresses are blocked by default. DNS results are
+checked and the connection uses the checked address. Redirect targets are checked
+again. Request-body, response-body, and redirect limits are hard caps. The network
+timeout limits connection waits and idle time between reads. It is not a strict
+end-to-end wall-clock cap for DNS or a server that continuously sends small data.
+`curl -o FILE URL` saves raw response bytes in the virtual filesystem. Normal
+output and pipes require UTF-8 response text. Monty Python code still has no
+direct network access. The optional `trusted_header_provider` runs on the host
+after the URL check. Its values override agent headers, so an application can add
+an authorization token without putting that token in the prompt or command.
+When public URLs are allowed, the provider must check the URL before it returns a
+secret.
+
+Use
+`KernelConfig.allowed_shell_commands` to enable only selected virtual commands.
+Per-call timeout overrides are not available; configure time and request limits
+on `KernelConfig`. The supported `curl --max-time` option can only lower the
+network timeout in `NetworkConfig`. It does not have every timing guarantee of
+system curl.
+
+Shell `grep` uses literal substring search, not regular expressions. `glob` and
+`find` support only `*`, `?`, and `**`, and patterns are never expanded in normal
+command arguments. Pipes and redirection are UTF-8 text only. The `python` command
+runs Monty's Python subset, not CPython, and accepts only `-c CODE` or one virtual
+`.py` file. Each command supports only the flags listed above.
+
+Give `MONTY_SANDBOX_INSTRUCTIONS` to an LLM whenever it can call `execute`.
+See the [virtual shell reference](docs/virtual-shell.md) for every command form,
+flag, limit, exit code, and unsupported feature. See the
+[sandbox compatibility report](docs/sandbox-compatibility.md) for the supported
+Deep Agents concepts and remaining gaps. See
+[design decisions](docs/design-decisions.md) for the persistence, typing, result,
+async, locking, and dependency choices.

@@ -13,3 +13,9 @@ USE SIMPLE TERMS AND AVOID EXTREMELY COMPLEX JARGON
 use `uv` to manage the packages in this project
 Always use ASD-STE100 Simplified Technical English when you talk to me.
 Every Function, Class, and Method should include a clear and concise google style docstring explaining its purpose, parameters and potential values (if used as flags), and return values.
+
+Keep the project documentation and Mermaid diagrams current with the code.
+When a change affects behavior, APIs, configuration, architecture, data flow,
+persistence, security boundaries, or limitations, update the related README or
+`docs/` page in the same change. Update an existing diagram when possible. Add a
+new diagram only when it makes an important relationship easier to understand.

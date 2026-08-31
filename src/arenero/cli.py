@@ -6,13 +6,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
-from .kernel import PersistentMontyKernel
+from .cell import execute_repl_cell
+from .kernel import KernelConfig, PersistentMontyKernel
 from .store import (
     InMemorySessionStore,
     SessionStore,
     SQLiteSessionStore,
     StatelessSessionStore,
 )
+from .workspace import WorkspaceConfig
 
 EXIT_COMMANDS = {"exit", "exit()", "quit", "quit()"}
 
@@ -46,8 +48,13 @@ def read_cell(
         lines.append(line)
         source = "\n".join(lines)
 
+        if lines[0].strip() == "%%shell":
+            if len(lines) > 1 and not line.strip():
+                return "\n".join(lines[:-1])
+            continue
+
         try:
-            complete = compiler(source, "<webmonty>", "single") is not None
+            complete = compiler(source, "<arenero>", "single") is not None
         except (SyntaxError, OverflowError, ValueError):
             complete = True
 
@@ -59,6 +66,7 @@ def run_repl(
     kernel: PersistentMontyKernel,
     session_id: str = "cli",
     output_limit_chars: int | None = None,
+    output_file: str | None = None,
     input_fn: Callable[[str], str] = input,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
@@ -69,6 +77,7 @@ def run_repl(
         kernel: Kernel used to execute input cells.
         session_id: Persistent CLI session key.
         output_limit_chars: Optional output limit for each cell.
+        output_file: Optional virtual path used when a cell output is trimmed.
         input_fn: Function that reads prompted input.
         stdout: Stream used for normal output.
         stderr: Stream used for errors.
@@ -76,8 +85,12 @@ def run_repl(
     compiler = codeop.CommandCompiler()
     compiler.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
 
-    print("WebMonty -- a Python REPL powered by Monty", file=stdout)
-    print("Type exit or quit, or press Ctrl-D to leave.", file=stdout)
+    print("Arenero -- a Python REPL powered by Monty", file=stdout)
+    print(
+        "Use !command or %%shell for the virtual shell. "
+        "Type exit or quit, or press Ctrl-D to leave.",
+        file=stdout,
+    )
 
     number = 1
     while True:
@@ -93,7 +106,20 @@ def run_repl(
         if source is None:
             return
 
-        execution = kernel.execute(session_id, source, output_limit_chars)
+        execution = execute_repl_cell(
+            kernel,
+            session_id,
+            source,
+            output_limit_chars,
+            output_file=output_file,
+        )
+        if execution["mode"] == "shell":
+            output = execution["output"]
+            if output:
+                stream = stdout if execution["ok"] else stderr
+                print(output, end="" if output.endswith("\n") else "\n", file=stream)
+            number += 1
+            continue
         if execution["stdout"]:
             print(execution["stdout"], end="", file=stdout)
         if execution["stderr"]:
@@ -107,8 +133,8 @@ def run_repl(
 
 
 def main() -> None:
-    """Parse command-line options and run or reset a REPL session."""
-    parser = argparse.ArgumentParser(description="Run the WebMonty REPL")
+    """Parse command-line options and run or administer REPL sessions."""
+    parser = argparse.ArgumentParser(description="Run the Arenero REPL")
     parser.add_argument(
         "--store",
         choices=("memory", "sqlite", "none"),
@@ -118,7 +144,7 @@ def main() -> None:
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path(".webmonty/sessions.db"),
+        default=Path(".arenero/sessions.db"),
         help="SQLite session database",
     )
     parser.add_argument(
@@ -132,22 +158,61 @@ def main() -> None:
         help="Maximum characters returned for each output field",
     )
     parser.add_argument(
+        "--output-file",
+        help="Virtual path used when cell output is trimmed",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        help="Persistent host directory mounted at /workspace",
+    )
+    parser.add_argument(
+        "--type-check",
+        action="store_true",
+        help="Type-check each Monty cell before execution",
+    )
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
         "--reset",
         action="store_true",
         help="Reset the selected session and exit",
     )
+    actions.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List saved sessions and exit",
+    )
+    actions.add_argument(
+        "--prune-sessions",
+        action="store_true",
+        help="Delete expired sessions and exit",
+    )
     args = parser.parse_args()
 
     store = _create_store(args.store, args.db)
-    with PersistentMontyKernel(store) as kernel:
+    workspace = WorkspaceConfig(args.workspace) if args.workspace else None
+    config = KernelConfig(type_check=args.type_check)
+    with PersistentMontyKernel(store, config, workspace=workspace) as kernel:
         if args.reset:
             kernel.reset(args.session)
             print(f"Reset session {args.session!r}.")
+            return
+        if args.list_sessions:
+            for info in kernel.list_sessions():
+                print(
+                    f"{info.session_id}\trevision={info.revision}\t"
+                    f"bytes={info.state_size_bytes}\tmonty={info.monty_version}\t"
+                    f"updated={info.updated_at:.0f}"
+                )
+            return
+        if args.prune_sessions:
+            print(f"Deleted {kernel.delete_expired()} expired session(s).")
             return
         run_repl(
             kernel,
             session_id=args.session,
             output_limit_chars=args.output_limit,
+            output_file=args.output_file,
         )
 
 

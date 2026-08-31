@@ -1,0 +1,888 @@
+import asyncio
+import base64
+from dataclasses import dataclass
+from typing import Any
+
+from pydantic_monty import MontyError
+
+from .cell import execute_repl_cell
+from .kernel import ExecutionResult, PersistentMontyKernel
+from .shell import ShellResult, VirtualShell, shell_result_from_execution
+
+VIRTUAL_SHELL_TOOL_DESCRIPTION = """Run a small allowlisted shell over the
+Arenero virtual filesystem. This is not an operating-system shell and it never
+starts a process or arbitrary executable.
+
+Supported commands and forms:
+- help [COMMAND]; which COMMAND...; pwd; cd [PATH]; ls [PATH...]
+- mkdir [-p] PATH...; rm [-r] [-f] PATH...; cp SOURCE DESTINATION;
+  mv SOURCE DESTINATION
+- cat [FILE...]; head [-n COUNT] [FILE]; tail [-n COUNT] [FILE]
+- grep [-i] [-n] LITERAL [FILE...]; sort [-r] [FILE]; uniq [-c] [FILE];
+  rev [FILE]; wc [-lwc] [FILE]; echo [-n] [TEXT...]
+- find [PATH] [GLOB]; glob GLOB [PATH]; basename PATH; dirname PATH
+- tee [-a] FILE...; base64 [FILE]; sha256sum [FILE...]
+- curl [-fLsiI] [-X METHOD] [-H 'NAME: VALUE'] [-d DATA] [-o FILE]
+  [--max-time SECONDS] URL
+- python -c CODE or python FILE.py. python3 and monty are aliases.
+
+Grammar: | is a UTF-8 text pipe. ; always runs the next pipeline. && runs after
+success. || runs after failure. < reads a virtual UTF-8 file. > replaces a virtual
+text file. >> appends. Paths are POSIX virtual paths. Relative paths use a working
+directory that persists with the session.
+
+Important limits: use help to discover commands because the application can
+disable commands. grep is literal substring search, not regex. glob and find
+support only *, ?, and **. Wildcards are never expanded in normal command
+arguments. Pipes and redirection are text-only. base64 only encodes. cp and mv
+handle one regular file and mv is not atomic. Python runs Monty's limited Python
+subset, not CPython; it has no third-party packages or normal file imports. curl
+allows public HTTP and HTTPS URLs by default. NetworkConfig can restrict exact URL
+origins, path prefixes, and methods, or disable curl. Each redirect is checked
+again. Private, local, and reserved addresses are blocked by default. Use -o FILE
+for a binary response; normal curl output is UTF-8 text.
+--max-time lowers connection and between-read idle timeouts; it is not a strict
+wall-clock limit for DNS or a response that keeps sending small data.
+
+Not supported: unlisted flags or commands, shell scripts, subprocesses, Git,
+package managers, compilers, environment or tilde expansion, command substitution,
+automatic glob expansion, background jobs, process control, file descriptors,
+binary pipes, interactive input, network access from Monty code, unrestricted
+network access, or extra Python script arguments. Use a real container or managed
+sandbox for those tasks. Results have output, exit_code, and truncated fields.
+Check truncated before treating output as complete. Set output_file to an absolute
+virtual path to save larger bounded output when the response is trimmed."""
+
+MONTY_SANDBOX_INSTRUCTIONS = (
+    "## Arenero virtual shell\n\n" + VIRTUAL_SHELL_TOOL_DESCRIPTION
+)
+
+SandboxErrors = (MontyError, ValueError, TypeError, RuntimeError)
+
+
+@dataclass(frozen=True)
+class SandboxExecuteResult:
+    """Describe one limited sandbox execution.
+
+    Attributes:
+        output: Combined value, standard output, standard error, or error text.
+        exit_code: Zero for success and nonzero for failure.
+        truncated: Whether Arenero shortened any output field.
+        output_file: Virtual path that received larger bounded output.
+        output_file_error: Error that prevented output offloading.
+    """
+
+    output: str
+    exit_code: int
+    truncated: bool = False
+    output_file: str | None = None
+    output_file_error: str | None = None
+
+
+@dataclass(frozen=True)
+class SandboxReadResult:
+    """Describe a line-based text read or Base64 binary read.
+
+    Attributes:
+        error: Error text, or ``None`` on success.
+        file_data: Content and encoding metadata.
+        total_lines: Total text lines when content is UTF-8.
+        start_line: First returned one-based line number.
+        end_line: Last returned one-based line number.
+        next_offset: Next zero-based line offset, if more text remains.
+    """
+
+    error: str | None = None
+    file_data: dict[str, str] | None = None
+    total_lines: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    next_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class SandboxOperationResult:
+    """Describe one filesystem mutation.
+
+    Attributes:
+        error: Error text, or ``None`` on success.
+        path: Affected virtual path.
+        occurrences: Replacement count for edit operations.
+    """
+
+    error: str | None = None
+    path: str | None = None
+    occurrences: int | None = None
+
+
+@dataclass(frozen=True)
+class SandboxSearchResult:
+    """Describe a filesystem listing or search.
+
+    Attributes:
+        error: Error text, or ``None`` on success.
+        matches: Structured file entries or line matches.
+        truncated: Whether the configured search cap stopped the operation.
+    """
+
+    error: str | None = None
+    matches: list[dict[str, Any]] | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class FileUploadResult:
+    """Describe one application-side binary upload.
+
+    Attributes:
+        path: Requested virtual path.
+        error: Error text, or ``None`` on success.
+    """
+
+    path: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class FileDownloadResult:
+    """Describe one application-side binary download.
+
+    Attributes:
+        path: Requested virtual path.
+        content: File bytes, or ``None`` on failure.
+        error: Error text, or ``None`` on success.
+    """
+
+    path: str
+    content: bytes | None = None
+    error: str | None = None
+
+
+class AreneroSandbox:
+    """Expose sandbox-style utilities over one persistent Monty kernel."""
+
+    def __init__(
+        self,
+        kernel: PersistentMontyKernel,
+        session_id: str = "sandbox",
+        sandbox_id: str | None = None,
+    ) -> None:
+        """Create a limited sandbox facade.
+
+        Args:
+            kernel: Kernel that owns interpreter sessions and virtual files.
+            session_id: Persistent interpreter session used for execution.
+            sandbox_id: Optional public identifier.
+        """
+        self.kernel = kernel
+        self.session_id = session_id
+        self._id = sandbox_id or f"arenero:{session_id}"
+
+    @property
+    def id(self) -> str:
+        """Return the stable sandbox identifier.
+
+        Returns:
+            Sandbox identifier.
+        """
+        return self._id
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        output_limit_chars: int | None = None,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute one allowlisted virtual shell pipeline.
+
+        Args:
+            command: Text in the documented virtual shell grammar.
+            timeout: Unsupported per-call timeout. Configure ``KernelConfig``.
+            output_limit_chars: Optional final output limit below the hard maximum.
+            output_file: Optional absolute virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        if timeout is not None:
+            return SandboxExecuteResult(
+                output=(
+                    "Per-call timeouts are not supported. Configure "
+                    "KernelConfig.max_duration_seconds and "
+                    "request_timeout_seconds."
+                ),
+                exit_code=2,
+            )
+        return _shell_response(
+            VirtualShell(self.kernel, self.session_id).execute(
+                command,
+                output_limit_chars,
+                output_file=output_file,
+            )
+        )
+
+    def execute_python(
+        self,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute Monty-compatible Python directly.
+
+        Args:
+            code: Monty-compatible Python source.
+            output_limit_chars: Optional output limit below the hard maximum.
+            output_file: Optional absolute virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        return _execution_response(
+            self.kernel.execute(
+                self.session_id,
+                code,
+                output_limit_chars,
+                output_file=output_file,
+            )
+        )
+
+    def execute_cell(
+        self,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute one Python or notebook-style shell cell.
+
+        Args:
+            code: Monty Python, one ``!command``, or a ``%%shell`` cell.
+            output_limit_chars: Optional result limit below the hard maximum.
+            output_file: Optional absolute virtual path used when output is trimmed.
+
+        Returns:
+            A result with ``mode=python`` or ``mode=shell``.
+        """
+        return execute_repl_cell(
+            self.kernel,
+            self.session_id,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+        )
+
+    def execute_file(
+        self,
+        path: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute one virtual Python file in the persistent session.
+
+        Args:
+            path: Absolute virtual Python file path.
+            output_limit_chars: Optional output limit below the hard maximum.
+            output_file: Optional absolute virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        return _execution_response(
+            self.kernel.execute_file(
+                self.session_id,
+                path,
+                output_limit_chars=output_limit_chars,
+                output_file=output_file,
+            )
+        )
+
+    def read(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2_000,
+    ) -> SandboxReadResult:
+        """Read text by lines or return binary content as Base64.
+
+        Args:
+            file_path: Absolute virtual file path.
+            offset: Zero-based text line offset. Negative values become zero.
+            limit: Maximum text lines. Nonpositive values return empty text.
+
+        Returns:
+            Read result with content and pagination data.
+        """
+        try:
+            content = self.kernel.download_file(file_path)
+        except SandboxErrors as exc:
+            return SandboxReadResult(error=str(exc))
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return SandboxReadResult(
+                file_data={
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "encoding": "base64",
+                }
+            )
+        start = max(0, offset)
+        if limit <= 0:
+            return SandboxReadResult(file_data={"content": "", "encoding": "utf-8"})
+        lines = text.splitlines(keepends=True)
+        selected = lines[start : start + limit]
+        end = start + len(selected)
+        return SandboxReadResult(
+            file_data={"content": "".join(selected), "encoding": "utf-8"},
+            total_lines=len(lines),
+            start_line=start + 1 if selected else None,
+            end_line=end if selected else None,
+            next_offset=end if end < len(lines) else None,
+        )
+
+    def write(self, file_path: str, content: str) -> SandboxOperationResult:
+        """Create or replace one UTF-8 text file.
+
+        Args:
+            file_path: Absolute virtual file path.
+            content: Complete text content.
+
+        Returns:
+            Mutation result.
+        """
+        try:
+            self.kernel.upload_file(file_path, content.encode("utf-8"))
+        except SandboxErrors as exc:
+            return SandboxOperationResult(error=str(exc))
+        return SandboxOperationResult(path=file_path)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> SandboxOperationResult:
+        """Replace exact text in one UTF-8 file.
+
+        Args:
+            file_path: Absolute virtual file path.
+            old_string: Exact text to replace.
+            new_string: Replacement text.
+            replace_all: Replace every occurrence when true.
+
+        Returns:
+            Mutation result with the replacement count.
+        """
+        with self.kernel.filesystem_guard():
+            return self._edit_locked(
+                file_path,
+                old_string,
+                new_string,
+                replace_all,
+            )
+
+    def _edit_locked(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+    ) -> SandboxOperationResult:
+        """Edit one file while the shared filesystem lock is held.
+
+        Args:
+            file_path: Absolute virtual file path.
+            old_string: Exact text to replace.
+            new_string: Replacement text.
+            replace_all: Replace every occurrence when true.
+
+        Returns:
+            Mutation result with the replacement count.
+        """
+        if old_string == new_string:
+            return SandboxOperationResult(error="old_string and new_string must differ")
+        read = self.read(file_path)
+        if read.error is not None:
+            return SandboxOperationResult(error=read.error)
+        if read.file_data is None or read.file_data["encoding"] != "utf-8":
+            return SandboxOperationResult(error="edit requires a UTF-8 text file")
+        text = self.kernel.download_file(file_path).decode("utf-8")
+        occurrences = text.count(old_string)
+        if occurrences == 0:
+            return SandboxOperationResult(error="old_string was not found")
+        if not replace_all and occurrences != 1:
+            return SandboxOperationResult(
+                error="old_string must occur exactly once unless replace_all is true"
+            )
+        replacement_count = occurrences if replace_all else 1
+        updated = text.replace(old_string, new_string, -1 if replace_all else 1)
+        written = self.write(file_path, updated)
+        if written.error is not None:
+            return written
+        return SandboxOperationResult(
+            path=file_path,
+            occurrences=replacement_count,
+        )
+
+    def delete(self, file_path: str) -> SandboxOperationResult:
+        """Delete one virtual path recursively.
+
+        Args:
+            file_path: Absolute virtual file or directory path.
+
+        Returns:
+            Mutation result.
+        """
+        result = self.kernel.call_filesystem(
+            self.session_id,
+            "delete",
+            {"path": file_path, "recursive": True},
+        )
+        if not result["ok"]:
+            return SandboxOperationResult(error=_error_text(result))
+        return SandboxOperationResult(path=file_path)
+
+    def ls(self, path: str = "/") -> SandboxSearchResult:
+        """List direct entries under one virtual directory.
+
+        Args:
+            path: Absolute virtual directory path.
+
+        Returns:
+            Structured file entries.
+        """
+        result = self.kernel.call_filesystem(
+            self.session_id,
+            "ls",
+            {"path": path, "recursive": False, "limit": None},
+        )
+        if not result["ok"]:
+            return SandboxSearchResult(error=_error_text(result))
+        value = result["result"]
+        entries = [
+            {
+                "path": entry["path"],
+                "is_dir": entry["type"] == "directory",
+            }
+            for entry in value["entries"]
+        ]
+        return SandboxSearchResult(
+            matches=entries,
+            truncated=value["truncated"],
+        )
+
+    def glob(self, pattern: str, path: str = "/") -> SandboxSearchResult:
+        """Find virtual paths with a bounded glob search.
+
+        Args:
+            pattern: POSIX pattern with ``*``, ``?``, or ``**``.
+            path: Absolute virtual search root.
+
+        Returns:
+            Matching path entries.
+        """
+        result = self.kernel.call_filesystem(
+            self.session_id,
+            "glob",
+            {"pattern": pattern, "root": path, "limit": None},
+        )
+        if not result["ok"]:
+            return SandboxSearchResult(error=_error_text(result))
+        value = result["result"]
+        return SandboxSearchResult(
+            matches=[{"path": match} for match in value["matches"]],
+            truncated=value["truncated"],
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        path: str = "/",
+        glob: str = "**/*",
+        *,
+        max_count: int | None = None,
+    ) -> SandboxSearchResult:
+        """Search for literal text in bounded virtual text files.
+
+        Args:
+            pattern: Literal text to find.
+            path: Absolute virtual search root.
+            glob: File-selection glob pattern.
+            max_count: Optional requested match cap below the hard maximum.
+
+        Returns:
+            Structured line matches.
+        """
+        result = self.kernel.call_filesystem(
+            self.session_id,
+            "grep",
+            {
+                "query": pattern,
+                "root": path,
+                "pattern": glob,
+                "regex": False,
+                "case_sensitive": True,
+                "limit": max_count,
+            },
+        )
+        if not result["ok"]:
+            return SandboxSearchResult(error=_error_text(result))
+        value = result["result"]
+        return SandboxSearchResult(
+            matches=value["matches"],
+            truncated=value["truncated"],
+        )
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResult]:
+        """Upload binary files through the application transfer plane.
+
+        Args:
+            files: Ordered ``(absolute_path, content)`` pairs.
+
+        Returns:
+            One result per input file in the same order.
+        """
+        results = []
+        for path, content in files:
+            try:
+                self.kernel.upload_file(path, content)
+            except SandboxErrors as exc:
+                results.append(FileUploadResult(path=path, error=str(exc)))
+            else:
+                results.append(FileUploadResult(path=path))
+        return results
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResult]:
+        """Download binary files through the application transfer plane.
+
+        Args:
+            paths: Ordered absolute virtual file paths.
+
+        Returns:
+            One result per input path in the same order.
+        """
+        results = []
+        for path in paths:
+            try:
+                content = self.kernel.download_file(path)
+            except SandboxErrors as exc:
+                results.append(FileDownloadResult(path=path, error=str(exc)))
+            else:
+                results.append(FileDownloadResult(path=path, content=content))
+        return results
+
+
+class AsyncAreneroSandbox:
+    """Expose the synchronous sandbox through async worker-thread calls."""
+
+    def __init__(
+        self,
+        kernel: PersistentMontyKernel,
+        session_id: str = "sandbox",
+        sandbox_id: str | None = None,
+    ) -> None:
+        """Create an asynchronous sandbox facade.
+
+        Args:
+            kernel: Kernel that owns interpreter sessions and virtual files.
+            session_id: Persistent interpreter session used for execution.
+            sandbox_id: Optional public identifier.
+        """
+        self.sync = AreneroSandbox(kernel, session_id, sandbox_id)
+
+    @property
+    def id(self) -> str:
+        """Return the stable sandbox identifier.
+
+        Returns:
+            Sandbox identifier.
+        """
+        return self.sync.id
+
+    async def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        output_limit_chars: int | None = None,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute one virtual shell command list without blocking the event loop.
+
+        Args:
+            command: Text in the documented virtual shell grammar.
+            timeout: Unsupported per-call timeout.
+            output_limit_chars: Optional final output limit.
+            output_file: Optional virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        return await asyncio.to_thread(
+            self.sync.execute,
+            command,
+            timeout=timeout,
+            output_limit_chars=output_limit_chars,
+            output_file=output_file,
+        )
+
+    async def execute_python(
+        self,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute Monty Python without blocking the event loop.
+
+        Args:
+            code: Monty-compatible Python source.
+            output_limit_chars: Optional output limit.
+            output_file: Optional virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        return await asyncio.to_thread(
+            self.sync.execute_python,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+        )
+
+    async def execute_cell(
+        self,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute one Python or shell cell without blocking the event loop.
+
+        Args:
+            code: Monty Python, one ``!command``, or a ``%%shell`` cell.
+            output_limit_chars: Optional result limit.
+            output_file: Optional virtual path used when output is trimmed.
+
+        Returns:
+            Stable Python or shell cell result.
+        """
+        return await asyncio.to_thread(
+            self.sync.execute_cell,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+        )
+
+    async def execute_file(
+        self,
+        path: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+    ) -> SandboxExecuteResult:
+        """Execute one virtual Python file without blocking the event loop.
+
+        Args:
+            path: Absolute virtual Python file path.
+            output_limit_chars: Optional output limit.
+            output_file: Optional virtual path used when output is trimmed.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+        return await asyncio.to_thread(
+            self.sync.execute_file,
+            path,
+            output_limit_chars,
+            output_file=output_file,
+        )
+
+    async def read(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2_000,
+    ) -> SandboxReadResult:
+        """Read one virtual file without blocking the event loop.
+
+        Args:
+            file_path: Absolute virtual file path.
+            offset: Zero-based text line offset.
+            limit: Maximum text lines.
+
+        Returns:
+            Text or Base64 file result.
+        """
+        return await asyncio.to_thread(self.sync.read, file_path, offset, limit)
+
+    async def write(self, file_path: str, content: str) -> SandboxOperationResult:
+        """Write one virtual text file without blocking the event loop.
+
+        Args:
+            file_path: Absolute virtual file path.
+            content: Complete UTF-8 text.
+
+        Returns:
+            Filesystem mutation result.
+        """
+        return await asyncio.to_thread(self.sync.write, file_path, content)
+
+    async def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> SandboxOperationResult:
+        """Edit one virtual text file without blocking the event loop.
+
+        Args:
+            file_path: Absolute virtual file path.
+            old_string: Exact text to replace.
+            new_string: Replacement text.
+            replace_all: Replace every occurrence when true.
+
+        Returns:
+            Filesystem mutation result.
+        """
+        return await asyncio.to_thread(
+            self.sync.edit,
+            file_path,
+            old_string,
+            new_string,
+            replace_all,
+        )
+
+    async def delete(self, file_path: str) -> SandboxOperationResult:
+        """Delete one virtual path without blocking the event loop.
+
+        Args:
+            file_path: Absolute virtual file or directory path.
+
+        Returns:
+            Filesystem mutation result.
+        """
+        return await asyncio.to_thread(self.sync.delete, file_path)
+
+    async def ls(self, path: str = "/") -> SandboxSearchResult:
+        """List one virtual directory without blocking the event loop.
+
+        Args:
+            path: Absolute virtual directory path.
+
+        Returns:
+            Structured file entries.
+        """
+        return await asyncio.to_thread(self.sync.ls, path)
+
+    async def glob(self, pattern: str, path: str = "/") -> SandboxSearchResult:
+        """Find virtual paths without blocking the event loop.
+
+        Args:
+            pattern: POSIX pattern with ``*``, ``?``, or ``**``.
+            path: Absolute virtual search root.
+
+        Returns:
+            Matching path entries.
+        """
+        return await asyncio.to_thread(self.sync.glob, pattern, path)
+
+    async def grep(
+        self,
+        pattern: str,
+        path: str = "/",
+        glob: str = "**/*",
+        *,
+        max_count: int | None = None,
+    ) -> SandboxSearchResult:
+        """Search virtual text files without blocking the event loop.
+
+        Args:
+            pattern: Literal text to find.
+            path: Absolute virtual search root.
+            glob: File-selection glob pattern.
+            max_count: Optional requested match cap.
+
+        Returns:
+            Structured line matches.
+        """
+        return await asyncio.to_thread(
+            self.sync.grep,
+            pattern,
+            path,
+            glob,
+            max_count=max_count,
+        )
+
+    async def upload_files(
+        self,
+        files: list[tuple[str, bytes]],
+    ) -> list[FileUploadResult]:
+        """Upload binary files without blocking the event loop.
+
+        Args:
+            files: Ordered ``(absolute_path, content)`` pairs.
+
+        Returns:
+            One result per input file.
+        """
+        return await asyncio.to_thread(self.sync.upload_files, files)
+
+    async def download_files(self, paths: list[str]) -> list[FileDownloadResult]:
+        """Download binary files without blocking the event loop.
+
+        Args:
+            paths: Ordered absolute virtual file paths.
+
+        Returns:
+            One result per input path.
+        """
+        return await asyncio.to_thread(self.sync.download_files, paths)
+
+
+def _execution_response(result: ExecutionResult) -> SandboxExecuteResult:
+    """Convert one kernel result to the limited sandbox response.
+
+    Args:
+        result: Structured kernel execution result.
+
+    Returns:
+        Combined output, exit code, and truncation state.
+    """
+    return _shell_response(shell_result_from_execution(result))
+
+
+def _shell_response(result: ShellResult) -> SandboxExecuteResult:
+    """Convert one internal virtual shell result to the public response.
+
+    Args:
+        result: Internal shell result.
+
+    Returns:
+        Public sandbox execution result.
+    """
+    return SandboxExecuteResult(
+        output=result.output,
+        exit_code=result.exit_code,
+        truncated=result.truncated,
+        output_file=result.output_file,
+        output_file_error=result.output_file_error,
+    )
+
+
+def _error_text(result: ExecutionResult) -> str:
+    """Read the error text from a failed kernel result.
+
+    Args:
+        result: Structured kernel execution result.
+
+    Returns:
+        Error text or a generic fallback.
+    """
+    error = result["error"]
+    return error["message"] if error is not None else "unknown Arenero error"

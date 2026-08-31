@@ -1,4 +1,4 @@
-from webmonty.cli import main
+from arenero.cli import main
 
 if __name__ == "__main__":
     main()

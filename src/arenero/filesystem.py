@@ -6,12 +6,51 @@ FilesystemOperation = Literal[
     "read",
     "write",
     "edit",
+    "mkdir",
     "delete",
     "ls",
     "glob",
     "grep",
 ]
 type FilesystemValue = str | int | bool | None
+
+FILESYSTEM_TYPE_CHECK_STUBS = """\
+from typing import Any
+
+def fs_read(path: str, offset: int = ..., limit: int | None = ...) -> str: ...
+def fs_write(
+    path: str,
+    content: str,
+    append: bool = ...,
+    create_parents: bool = ...,
+) -> int: ...
+def fs_edit(
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = ...,
+) -> dict[str, Any]: ...
+def fs_mkdir(path: str, parents: bool = ..., exist_ok: bool = ...) -> str: ...
+def fs_delete(path: str, recursive: bool = ...) -> int: ...
+def fs_ls(
+    path: str = ...,
+    recursive: bool = ...,
+    limit: int | None = ...,
+) -> dict[str, Any]: ...
+def fs_glob(
+    pattern: str,
+    root: str = ...,
+    limit: int | None = ...,
+) -> dict[str, Any]: ...
+def fs_grep(
+    query: str,
+    root: str = ...,
+    pattern: str = ...,
+    regex: bool = ...,
+    case_sensitive: bool = ...,
+    limit: int | None = ...,
+) -> dict[str, Any]: ...
+"""
 
 
 @dataclass(frozen=True)
@@ -71,14 +110,14 @@ def build_filesystem_prelude(config: FilesystemConfig) -> str:
         Monty-compatible Python source code.
     """
     limits = (
-        f"_WEBMONTY_FS_DEFAULT_READ_LIMIT = {config.default_read_limit_chars}\n"
-        f"_WEBMONTY_FS_MAX_READ_LIMIT = {config.max_read_limit_chars}\n"
-        f"_WEBMONTY_FS_MAX_WRITE = {config.max_write_chars}\n"
-        f"_WEBMONTY_FS_DEFAULT_RESULTS = {config.default_result_limit}\n"
-        f"_WEBMONTY_FS_MAX_RESULTS = {config.max_result_limit}\n"
-        f"_WEBMONTY_FS_MAX_SCAN = {config.max_scan_entries}\n"
-        f"_WEBMONTY_FS_MAX_GREP_CHARS = {config.max_grep_chars}\n"
-        f"_WEBMONTY_FS_MAX_DEPTH = {config.max_depth}\n"
+        f"_ARENERO_FS_DEFAULT_READ_LIMIT = {config.default_read_limit_chars}\n"
+        f"_ARENERO_FS_MAX_READ_LIMIT = {config.max_read_limit_chars}\n"
+        f"_ARENERO_FS_MAX_WRITE = {config.max_write_chars}\n"
+        f"_ARENERO_FS_DEFAULT_RESULTS = {config.default_result_limit}\n"
+        f"_ARENERO_FS_MAX_RESULTS = {config.max_result_limit}\n"
+        f"_ARENERO_FS_MAX_SCAN = {config.max_scan_entries}\n"
+        f"_ARENERO_FS_MAX_GREP_CHARS = {config.max_grep_chars}\n"
+        f"_ARENERO_FS_MAX_DEPTH = {config.max_depth}\n"
     )
     return limits + _FILESYSTEM_PRELUDE
 
@@ -90,8 +129,8 @@ def build_filesystem_call(
     """Build a safe call to one sandbox filesystem helper.
 
     Args:
-        operation: One of ``read``, ``write``, ``edit``, ``delete``, ``ls``,
-            ``glob``, or ``grep``.
+        operation: One of ``read``, ``write``, ``edit``, ``mkdir``, ``delete``,
+            ``ls``, ``glob``, or ``grep``.
         arguments: Simple keyword arguments accepted by the selected helper.
 
     Returns:
@@ -107,6 +146,7 @@ def build_filesystem_call(
             "fs_edit",
             {"path", "old_text", "new_text", "replace_all"},
         ),
+        "mkdir": ("fs_mkdir", {"path", "parents", "exist_ok"}),
         "delete": ("fs_delete", {"path", "recursive"}),
         "ls": ("fs_ls", {"path", "recursive", "limit"}),
         "glob": ("fs_glob", {"pattern", "root", "limit"}),
@@ -147,11 +187,11 @@ def _filesystem_literal(value: FilesystemValue) -> str:
 
 
 _FILESYSTEM_PRELUDE = r'''
-from pathlib import Path as _WebMontyPath
-import re as _webmonty_re
+from pathlib import Path as _AreneroPath
+import re as _arenero_re
 
 
-def _webmonty_fs_limit(value, default, maximum):
+def _arenero_fs_limit(value, default, maximum):
     """Return a nonnegative request bounded by a hard maximum.
 
     Args:
@@ -168,7 +208,7 @@ def _webmonty_fs_limit(value, default, maximum):
     return min(effective, maximum)
 
 
-def _webmonty_fs_walk(root, recursive):
+def _arenero_fs_walk(root, recursive):
     """Collect bounded path metadata below one virtual directory.
 
     Args:
@@ -178,7 +218,7 @@ def _webmonty_fs_walk(root, recursive):
     Returns:
         Entries, truncation status, and scanned entry count.
     """
-    pending = [(_WebMontyPath(root), 0)]
+    pending = [(_AreneroPath(root), 0)]
     entries = []
     scanned = 0
     truncated = False
@@ -186,7 +226,7 @@ def _webmonty_fs_walk(root, recursive):
     while pending:
         current, depth = pending.pop()
         for child in current.iterdir():
-            if scanned >= _WEBMONTY_FS_MAX_SCAN:
+            if scanned >= _ARENERO_FS_MAX_SCAN:
                 return entries, True, scanned
 
             scanned += 1
@@ -199,7 +239,7 @@ def _webmonty_fs_walk(root, recursive):
 
             entries.append({"path": str(child), "type": kind})
             if recursive and kind == "directory":
-                if depth < _WEBMONTY_FS_MAX_DEPTH:
+                if depth < _ARENERO_FS_MAX_DEPTH:
                     pending.append((child, depth + 1))
                 else:
                     truncated = True
@@ -207,7 +247,7 @@ def _webmonty_fs_walk(root, recursive):
     return entries, truncated, scanned
 
 
-def _webmonty_fs_relative(path, root):
+def _arenero_fs_relative(path, root):
     """Return a path relative to one virtual root.
 
     Args:
@@ -217,13 +257,13 @@ def _webmonty_fs_relative(path, root):
     Returns:
         Relative virtual path.
     """
-    prefix = str(_WebMontyPath(root)).rstrip("/")
+    prefix = str(_AreneroPath(root)).rstrip("/")
     if prefix:
         return path[len(prefix):].lstrip("/")
     return path.lstrip("/")
 
 
-def _webmonty_fs_glob_regex(pattern):
+def _arenero_fs_glob_regex(pattern):
     """Translate a small POSIX glob pattern to a regular expression.
 
     Args:
@@ -256,7 +296,7 @@ def _webmonty_fs_glob_regex(pattern):
     return output + "$"
 
 
-def _webmonty_fs_match(path, pattern):
+def _arenero_fs_match(path, pattern):
     """Return whether a virtual path matches a glob pattern.
 
     Args:
@@ -266,7 +306,7 @@ def _webmonty_fs_match(path, pattern):
     Returns:
         True when the path matches.
     """
-    return _webmonty_re.fullmatch(_webmonty_fs_glob_regex(pattern), path) is not None
+    return _arenero_re.fullmatch(_arenero_fs_glob_regex(pattern), path) is not None
 
 
 def fs_read(path, offset=0, limit=None):
@@ -282,12 +322,12 @@ def fs_read(path, offset=0, limit=None):
     """
     if offset < 0:
         raise ValueError("offset must be at least 0")
-    effective = _webmonty_fs_limit(
+    effective = _arenero_fs_limit(
         limit,
-        _WEBMONTY_FS_DEFAULT_READ_LIMIT,
-        _WEBMONTY_FS_MAX_READ_LIMIT,
+        _ARENERO_FS_DEFAULT_READ_LIMIT,
+        _ARENERO_FS_MAX_READ_LIMIT,
     )
-    text = _WebMontyPath(path).read_text()
+    text = _AreneroPath(path).read_text()
     return text[offset:offset + effective]
 
 
@@ -303,9 +343,9 @@ def fs_write(path, content, append=False, create_parents=False):
     Returns:
         Number of written characters.
     """
-    if len(content) > _WEBMONTY_FS_MAX_WRITE:
+    if len(content) > _ARENERO_FS_MAX_WRITE:
         raise ValueError("content exceeds the filesystem write limit")
-    target = _WebMontyPath(path)
+    target = _AreneroPath(path)
     if create_parents:
         target.parent.mkdir(parents=True, exist_ok=True)
     if append:
@@ -328,7 +368,7 @@ def fs_edit(path, old_text, new_text, replace_all=False):
     """
     if old_text == "":
         raise ValueError("old_text must not be empty")
-    target = _WebMontyPath(path)
+    target = _AreneroPath(path)
     text = target.read_text()
     occurrences = text.count(old_text)
     if occurrences == 0:
@@ -343,10 +383,26 @@ def fs_edit(path, old_text, new_text, replace_all=False):
         updated = text.replace(old_text, new_text, 1)
         replacements = 1
 
-    if len(updated) > _WEBMONTY_FS_MAX_WRITE:
+    if len(updated) > _ARENERO_FS_MAX_WRITE:
         raise ValueError("edited content exceeds the filesystem write limit")
     target.write_text(updated)
     return {"replacements": replacements, "characters": len(updated)}
+
+
+def fs_mkdir(path, parents=False, exist_ok=False):
+    """Create one virtual directory.
+
+    Args:
+        path: Virtual directory path.
+        parents: Create missing parent directories when true.
+        exist_ok: Succeed when the directory already exists.
+
+    Returns:
+        Created directory path.
+    """
+    target = _AreneroPath(path)
+    target.mkdir(parents=parents, exist_ok=exist_ok)
+    return str(target)
 
 
 def fs_delete(path, recursive=False):
@@ -359,7 +415,7 @@ def fs_delete(path, recursive=False):
     Returns:
         Number of deleted paths.
     """
-    target = _WebMontyPath(path)
+    target = _AreneroPath(path)
     if str(target) == "/":
         raise ValueError("the virtual root cannot be deleted")
     if not target.is_dir() or target.is_symlink():
@@ -369,14 +425,14 @@ def fs_delete(path, recursive=False):
         target.rmdir()
         return 1
 
-    entries, truncated, scanned = _webmonty_fs_walk(target, True)
+    entries, truncated, scanned = _arenero_fs_walk(target, True)
     if truncated:
         raise ValueError("recursive delete exceeds the filesystem scan limit")
 
     index = len(entries) - 1
     while index >= 0:
         entry = entries[index]
-        child = _WebMontyPath(entry["path"])
+        child = _AreneroPath(entry["path"])
         if entry["type"] == "directory":
             child.rmdir()
         else:
@@ -397,12 +453,12 @@ def fs_ls(path="/", recursive=False, limit=None):
     Returns:
         Entries, scan count, and truncation status.
     """
-    effective = _webmonty_fs_limit(
+    effective = _arenero_fs_limit(
         limit,
-        _WEBMONTY_FS_DEFAULT_RESULTS,
-        _WEBMONTY_FS_MAX_RESULTS,
+        _ARENERO_FS_DEFAULT_RESULTS,
+        _ARENERO_FS_MAX_RESULTS,
     )
-    entries, scan_truncated, scanned = _webmonty_fs_walk(path, recursive)
+    entries, scan_truncated, scanned = _arenero_fs_walk(path, recursive)
     return {
         "entries": entries[:effective],
         "scanned": scanned,
@@ -421,18 +477,18 @@ def fs_glob(pattern, root="/", limit=None):
     Returns:
         Matching paths, scan count, and truncation status.
     """
-    effective = _webmonty_fs_limit(
+    effective = _arenero_fs_limit(
         limit,
-        _WEBMONTY_FS_DEFAULT_RESULTS,
-        _WEBMONTY_FS_MAX_RESULTS,
+        _ARENERO_FS_DEFAULT_RESULTS,
+        _ARENERO_FS_MAX_RESULTS,
     )
-    entries, scan_truncated, scanned = _webmonty_fs_walk(root, True)
+    entries, scan_truncated, scanned = _arenero_fs_walk(root, True)
     matches = []
     truncated = scan_truncated
     for entry in entries:
         path = entry["path"]
-        candidate = path if pattern.startswith("/") else _webmonty_fs_relative(path, root)
-        if _webmonty_fs_match(candidate, pattern):
+        candidate = path if pattern.startswith("/") else _arenero_fs_relative(path, root)
+        if _arenero_fs_match(candidate, pattern):
             if len(matches) >= effective:
                 truncated = True
                 break
@@ -461,16 +517,16 @@ def fs_grep(
     Returns:
         Line matches and scan metadata.
     """
-    effective = _webmonty_fs_limit(
+    effective = _arenero_fs_limit(
         limit,
-        _WEBMONTY_FS_DEFAULT_RESULTS,
-        _WEBMONTY_FS_MAX_RESULTS,
+        _ARENERO_FS_DEFAULT_RESULTS,
+        _ARENERO_FS_MAX_RESULTS,
     )
-    entries, scan_truncated, scanned = _webmonty_fs_walk(root, True)
+    entries, scan_truncated, scanned = _arenero_fs_walk(root, True)
     matcher = None
     if regex:
-        flags = 0 if case_sensitive else _webmonty_re.IGNORECASE
-        matcher = _webmonty_re.compile(query, flags)
+        flags = 0 if case_sensitive else _arenero_re.IGNORECASE
+        matcher = _arenero_re.compile(query, flags)
 
     matches = []
     files_scanned = 0
@@ -480,15 +536,15 @@ def fs_grep(
         if entry["type"] != "file":
             continue
         path = entry["path"]
-        relative = _webmonty_fs_relative(path, root)
-        if not _webmonty_fs_match(relative, pattern):
+        relative = _arenero_fs_relative(path, root)
+        if not _arenero_fs_match(relative, pattern):
             continue
-        if characters_scanned >= _WEBMONTY_FS_MAX_GREP_CHARS:
+        if characters_scanned >= _ARENERO_FS_MAX_GREP_CHARS:
             truncated = True
             break
 
-        text = _WebMontyPath(path).read_text()
-        remaining = _WEBMONTY_FS_MAX_GREP_CHARS - characters_scanned
+        text = _AreneroPath(path).read_text()
+        remaining = _ARENERO_FS_MAX_GREP_CHARS - characters_scanned
         if len(text) > remaining:
             text = text[:remaining]
             truncated = True

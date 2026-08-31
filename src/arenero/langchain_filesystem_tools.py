@@ -60,11 +60,13 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "read",
-            {"path": path, "offset": offset, "limit": limit},
-            output_limit_chars=limit,
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "read",
+                {"path": path, "offset": offset, "limit": limit},
+                output_limit_chars=limit,
+            )
         )
 
     @tool("write_file")
@@ -99,15 +101,17 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "write",
-            {
-                "path": path,
-                "content": content,
-                "append": append,
-                "create_parents": create_parents,
-            },
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "write",
+                {
+                    "path": path,
+                    "content": content,
+                    "append": append,
+                    "create_parents": create_parents,
+                },
+            )
         )
 
     @tool("edit_file")
@@ -147,15 +151,17 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "edit",
-            {
-                "path": path,
-                "old_text": old_text,
-                "new_text": new_text,
-                "replace_all": replace_all,
-            },
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "edit",
+                {
+                    "path": path,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "replace_all": replace_all,
+                },
+            )
         )
 
     @tool("delete_file")
@@ -188,10 +194,12 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "delete",
-            {"path": path, "recursive": recursive},
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "delete",
+                {"path": path, "recursive": recursive},
+            )
         )
 
     @tool("list_files")
@@ -237,11 +245,13 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "ls",
-            {"path": path, "recursive": recursive, "limit": limit},
-            output_limit_chars,
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "ls",
+                {"path": path, "recursive": recursive, "limit": limit},
+                output_limit_chars,
+            )
         )
 
     @tool("glob_files")
@@ -290,11 +300,13 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "glob",
-            {"pattern": pattern, "root": root, "limit": limit},
-            output_limit_chars,
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "glob",
+                {"pattern": pattern, "root": root, "limit": limit},
+                output_limit_chars,
+            )
         )
 
     @tool("grep_files")
@@ -355,18 +367,20 @@ def create_filesystem_tools(
         session_id = session_id_resolver(runtime)
         if session_id is None:
             return _missing_thread_id()
-        return kernel.call_filesystem(
-            session_id,
-            "grep",
-            {
-                "query": query,
-                "root": root,
-                "pattern": pattern,
-                "regex": regex,
-                "case_sensitive": case_sensitive,
-                "limit": limit,
-            },
-            output_limit_chars,
+        return dict(
+            kernel.call_filesystem(
+                session_id,
+                "grep",
+                {
+                    "query": query,
+                    "root": root,
+                    "pattern": pattern,
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                    "limit": limit,
+                },
+                output_limit_chars,
+            )
         )
 
     return [

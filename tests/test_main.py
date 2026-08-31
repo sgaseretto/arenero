@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from webmonty import PersistentMontyKernel, SQLiteSessionStore
-from webmonty.cli import run_repl
+from arenero import PersistentMontyKernel, SQLiteSessionStore
+from arenero.cli import run_repl
 
 
 class ReplTests(unittest.TestCase):
@@ -44,6 +44,24 @@ class ReplTests(unittest.TestCase):
 
         self.assertIn("ZeroDivisionError: division by zero", stderr)
         self.assertIn("Out[2]: 42", stdout)
+
+    def test_notebook_shell_cells_share_the_python_session(self) -> None:
+        """Run single and multiline shell cells from the terminal REPL."""
+        stdout, stderr = self.run_session(
+            [
+                "x = 41",
+                "!python -c 'x + 1'",
+                "%%shell",
+                "echo one",
+                "echo two",
+                "",
+                "exit",
+            ]
+        )
+
+        self.assertIn("42", stdout)
+        self.assertIn("one\ntwo\n", stdout)
+        self.assertEqual(stderr, "")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -8,9 +9,11 @@ from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic_monty import MemoryFile, OSAccess
 
-from webmonty import (
+from arenero import (
+    AsyncPersistentMontyKernel,
     PersistentMontyKernel,
     SQLiteSessionStore,
+    create_async_python_repl_tools,
     create_python_repl_tools,
 )
 
@@ -67,10 +70,46 @@ class LangChainToolTests(unittest.TestCase):
 
     def test_schema_exposes_limit_but_hides_runtime(self) -> None:
         schema = self.tools[0].tool_call_schema.model_json_schema()
+        repl = self.tools[0]
 
         self.assertIn("code", schema["properties"])
         self.assertIn("output_limit_chars", schema["properties"])
+        self.assertIn("output_file", schema["properties"])
         self.assertNotIn("runtime", schema["properties"])
+        self.assertIn("! or start a multiline shell cell", repl.description)
+        self.assertIn("same session", repl.description)
+        self.assertIn("mode=shell", repl.description)
+        self.assertIn("output_file", repl.description)
+
+    def test_python_repl_runs_notebook_shell_cells(self) -> None:
+        """Use only the REPL tool for Python, shell, and shared virtual files."""
+        assigned = self.call_tool("python_repl", {"code": "value = 41"})
+        calculated = self.call_tool(
+            "python_repl",
+            {"code": "!python -c 'value + 1'"},
+        )
+        shell = self.call_tool(
+            "python_repl",
+            {"code": ("%%shell\nmkdir -p /work\ncd /work\necho hello > note.txt\npwd")},
+        )
+        read = self.call_tool(
+            "python_repl",
+            {"code": "from pathlib import Path\nPath('/work/note.txt').read_text()"},
+        )
+        invalid = self.call_tool(
+            "python_repl",
+            {"code": "!echo one\necho two"},
+        )
+
+        self.assertEqual(assigned["mode"], "python")
+        self.assertEqual(calculated["mode"], "shell")
+        self.assertEqual(calculated["output"], "42")
+        self.assertIn("truncation", calculated)
+        self.assertIn("retryable", calculated)
+        self.assertEqual(shell["output"], "/work\n")
+        self.assertEqual(read["result"], "hello\n")
+        self.assertEqual(invalid["exit_code"], 2)
+        self.assertIn("Use %%shell", invalid["output"])
 
     def test_execute_file_schema_exposes_file_and_follow_up_code(self) -> None:
         """Expose file inputs to the model but keep runtime hidden."""
@@ -82,7 +121,44 @@ class LangChainToolTests(unittest.TestCase):
         self.assertIn("file_path", schema["properties"])
         self.assertIn("code", schema["properties"])
         self.assertIn("output_limit_chars", schema["properties"])
+        self.assertIn("output_file", schema["properties"])
         self.assertNotIn("runtime", schema["properties"])
+
+    def test_virtual_shell_tool_uses_the_thread_session(self) -> None:
+        """Expose the virtual shell and keep its directory by thread ID."""
+        shell = next(tool for tool in self.tools if tool.name == "virtual_shell")
+        schema = shell.tool_call_schema.model_json_schema()
+
+        self.assertIn("command", schema["properties"])
+        self.assertIn("output_limit_chars", schema["properties"])
+        self.assertIn("output_file", schema["properties"])
+        self.assertNotIn("runtime", schema["properties"])
+        self.assertIn("not an operating-system shell", shell.description)
+        self.assertIn("grep is literal substring search, not regex", shell.description)
+        self.assertIn("Wildcards are never expanded", shell.description)
+        self.assertIn("Monty's limited Python", shell.description)
+        self.assertIn("allows public HTTP and HTTPS URLs by default", shell.description)
+        self.assertIn("Private, local, and reserved addresses", shell.description)
+        self.assertIn("Check truncated", shell.description)
+
+        made = self.call_tool("virtual_shell", {"command": "mkdir -p /work"})
+        changed = self.call_tool("virtual_shell", {"command": "cd /work"})
+        written = self.call_tool(
+            "virtual_shell",
+            {"command": "echo hello > note.txt"},
+        )
+        read = self.call_tool("virtual_shell", {"command": "cat note.txt"})
+        other = self.call_tool(
+            "virtual_shell",
+            {"command": "pwd"},
+            "thread-2",
+        )
+
+        self.assertEqual(made["exit_code"], 0)
+        self.assertEqual(changed["exit_code"], 0)
+        self.assertEqual(written["exit_code"], 0)
+        self.assertEqual(read["output"], "hello\n")
+        self.assertEqual(other["output"], "/\n")
 
     def test_adapter_exposes_all_filesystem_tools(self) -> None:
         """Create each bounded filesystem tool with hidden runtime data."""
@@ -206,6 +282,113 @@ class LangChainToolTests(unittest.TestCase):
         self.assertTrue(reset["ok"])
         self.assertFalse(missing["ok"])
         self.assertEqual(present["result"], 2)
+
+    def test_agent_can_offload_trimmed_output(self) -> None:
+        """Let the model preserve a larger bounded result in a virtual file."""
+        result = self.call_tool(
+            "python_repl",
+            {
+                "code": '"abcdefgh"',
+                "output_limit_chars": 3,
+                "output_file": "/outputs/result.json",
+            },
+        )
+        saved = self.call_tool(
+            "read_file",
+            {"path": "/outputs/result.json", "limit": 1_000},
+        )
+
+        self.assertEqual(result["output_file"], "/outputs/result.json")
+        self.assertTrue(result["truncation"]["result"])
+        self.assertIn("abcdefgh", saved["result"])
+
+
+class AsyncLangChainToolTests(unittest.IsolatedAsyncioTestCase):
+    """Test the small native async LangChain adapter."""
+
+    async def asyncSetUp(self) -> None:
+        """Create one open async kernel and graph."""
+        self.kernel = AsyncPersistentMontyKernel()
+        await self.kernel.open()
+        self.tools = create_async_python_repl_tools(self.kernel)
+        builder = StateGraph(MessagesState)
+        builder.add_node("tools", ToolNode(self.tools))
+        builder.set_entry_point("tools")
+        builder.add_edge("tools", END)
+        self.graph = builder.compile()
+
+    async def asyncTearDown(self) -> None:
+        """Close the async worker pool."""
+        await self.kernel.close()
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        thread_id: str = "thread-1",
+    ) -> dict:
+        """Invoke one async tool through a LangGraph tool node.
+
+        Args:
+            name: Tool name.
+            arguments: Model-visible tool arguments.
+            thread_id: Persistent agent session key.
+
+        Returns:
+            Parsed JSON tool response.
+        """
+        state = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": name,
+                            "args": arguments,
+                            "id": "test-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+        output = await self.graph.ainvoke(
+            state,
+            {"configurable": {"thread_id": thread_id}},
+        )
+        return json.loads(output["messages"][-1].content)
+
+    async def test_async_tools_persist_separate_agent_sessions(self) -> None:
+        """Run two agent sessions in batch and restore each value."""
+        first, second = await asyncio.gather(
+            self.call_tool("python_repl", {"code": "value = 20"}, "one"),
+            self.call_tool("python_repl", {"code": "value = 40"}, "two"),
+        )
+        one, two = await asyncio.gather(
+            self.call_tool("python_repl", {"code": "value + 1"}, "one"),
+            self.call_tool("python_repl", {"code": "value + 2"}, "two"),
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(one["result"], 21)
+        self.assertEqual(two["result"], 42)
+
+    async def test_async_tool_scope_is_explicit(self) -> None:
+        """Expose Python and file execution without claiming shell support."""
+        tools = {tool.name: tool for tool in self.tools}
+
+        self.assertEqual(
+            set(tools),
+            {"python_repl", "python_repl_execute_file", "reset_python_repl"},
+        )
+        self.assertIn(
+            "native asynchronous worker pool", tools["python_repl"].description
+        )
+        self.assertIn(
+            "!COMMAND and %%shell cells are not supported",
+            tools["python_repl"].description,
+        )
 
 
 if __name__ == "__main__":
