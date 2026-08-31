@@ -83,11 +83,11 @@ The stream callback has this framework-neutral shape:
 from collections.abc import AsyncIterator
 from arenero import RLMModelResponse
 
+
 async def model_stream(
     prompt: str,
     model: str | None,
-) -> AsyncIterator[str | RLMModelResponse]:
-    ...
+) -> AsyncIterator[str | RLMModelResponse]: ...
 ```
 
 Each item is a text delta. Usage values in `RLMModelResponse` must describe that
@@ -202,7 +202,9 @@ deterministic result can be claimed more than once.
 `RLMResult.usage.speculation` and `SpeculativeTurn.close()` report turns,
 dispatches, hits, misses, ready hits, failures, cancellations, waste, shadow
 executions, shadow errors, and real wait time. The event sink also receives
-`speculation` events for dispatch, claim, shadow, cleanup, and failures.
+`speculation` events for dispatch, claim, shadow, cleanup, and failures. Failed
+early calls emit `call_failed`. Cancelled early calls emit `call_cancelled`.
+Neither event includes arguments or results.
 
 These limits are in addition to RLM call, token, cost, response, concurrency, and
 wall-time limits. An early `llm_query` uses the same shared RLM ledger as a normal
@@ -218,7 +220,7 @@ summary = await llm_query(prompt="Summarize:\n" + part)
 
 results = []
 for start in range(0, 2000, 500):
-    result = await llm_query(prompt=context[start:start + 500])
+    result = await llm_query(prompt=context[start : start + 500])
     results.append(result)
 ```
 
@@ -227,6 +229,7 @@ The Monty shadow can resolve forms such as:
 ```python
 def make_prompt(text):
     return "Find names:\n" + text
+
 
 result = await llm_query(prompt=make_prompt(context[:2000]))
 ```

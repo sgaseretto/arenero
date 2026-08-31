@@ -80,6 +80,9 @@ arbitrary executables, or a real shell.
 - [Speculative programmatic tool calling](docs/speculative-tool-calling.md)
   explains streamed planning, Monty shadows, result claims, tool policies,
   statistics, limits, and standalone SpecTC-style integration.
+- [Testing](docs/testing.md) explains deterministic test layers, speculative
+  boundary coverage, LangChain fake models, LangGraph checkpointers, and the
+  rules for future opt-in live tests.
 - [Static virtual modules](docs/virtual-modules.md) explains module resolution,
   examples, limits, and differences from CPython imports.
 - [Quality-of-life APIs](docs/quality-of-life.md) explains capability reports,

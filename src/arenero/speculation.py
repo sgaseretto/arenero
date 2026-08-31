@@ -741,9 +741,23 @@ class SpeculativeTurn:
             async with self._slots:
                 return await _invoke_tool(tool, dict(arguments))
         except asyncio.CancelledError:
+            emit_event(
+                self.event_sink,
+                "speculation",
+                "call_cancelled",
+                turn_id=self.turn_id,
+                tool=tool.alias,
+            )
             raise
         except BaseException:
             self._usage.failed += 1
+            emit_event(
+                self.event_sink,
+                "speculation",
+                "call_failed",
+                turn_id=self.turn_id,
+                tool=tool.alias,
+            )
             raise
 
     def _existing_locked(self, key: SpeculationKey) -> _Speculation | None:
@@ -820,10 +834,11 @@ class SpeculativeTurn:
         for call in self._all:
             if call.claims:
                 continue
-            if call.task.done():
+            if call.task.cancelled():
+                self._usage.cancelled += 1
+            elif call.task.done():
                 self._usage.wasted += 1
-                if not call.task.cancelled():
-                    call.task.exception()
+                call.task.exception()
             elif self.config.cancel_unclaimed:
                 call.task.cancel()
                 pending.append(call.task)
