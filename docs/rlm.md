@@ -119,6 +119,25 @@ The adapter uses LangChain's public `ainvoke()` path. It reads token usage from
 `AIMessage.usage_metadata`. It reads cost only when the model puts a numeric
 `cost` value in response metadata.
 
+For speculative tool calls, also pass the public streaming adapter:
+
+```python
+from arenero import (
+    SpeculationConfig,
+    adapt_langchain_model,
+    adapt_langchain_model_stream,
+)
+
+rlm = RLM(
+    adapt_langchain_model(root_model),
+    model_stream=adapt_langchain_model_stream(root_model),
+    speculation_config=SpeculationConfig(mode="stream"),
+)
+```
+
+This adapter uses `BaseChatModel.astream()`. Without it, `stream` mode safely
+falls back to planning the complete response before real execution.
+
 ## Deep Agents use
 
 Pass the configured RLM to `AreneroInterpreterMiddleware`:
@@ -189,8 +208,9 @@ budgets are shared by all branches.
 | `timeout_seconds` | Wall time for the complete recursion tree. |
 
 `RLM.capabilities()` returns these active values, the five function names, and
-the main session and filesystem boundaries. `rlm_usage()` returns the live
-ledger to Monty code.
+the main session and filesystem boundaries. It also returns the active
+speculation mode, policies, and limits. `rlm_usage()` returns the live ledger to
+Monty code.
 
 Token and cost limits can enforce only values reported by the adapter. Keep a
 provider-side budget when hard billing control is required.
@@ -245,6 +265,21 @@ direct mount is disabled. Trusted `bootstrap_code` still runs.
   a truncated code block.
 - Model calls are not transactional. A provider call or inherited hosted tool
   can have an external effect even if later Monty code fails.
+
+## Speculative calls
+
+Arenero can start selected calls while controller code streams. It uses a safe
+host-side AST planner for known plain arguments and a forked Monty shadow for
+state-dependent arguments. Real code still runs only in Monty. Speculation is
+off by default and normal execution remains the fallback.
+
+The default policy includes only `llm_query` and `llm_query_batched`. It does
+not include recursive calls, filesystem, network, MCP, or application tools.
+`RLMResult.usage.speculation` reports early work and claim results.
+
+See [Speculative programmatic tool calling](speculative-tool-calling.md) for the
+standalone API, stream contract, policy rules, limits, failure behavior, and
+SpecTC-style integration.
 
 Stable RLM limit messages start with `RLMCallLimitExceeded`,
 `RLMTokenLimitExceeded`, `RLMCostLimitExceeded`, `RLMPromptTooLarge`,

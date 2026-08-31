@@ -64,6 +64,7 @@ flowchart TD
 | Static virtual modules | Top-level absolute and relative imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested, cyclic, or third-party imports. Generated feeds skip type checking. |
 | Deep Agents middleware | Async interpreter, dynamic catalog, PTC, subagent task bridge, three state modes, and private checkpoint snapshots | Nested calls bypass the parent ToolNode and its per-tool approvals. |
 | Recursive model calls | External context, plain calls, child RLM sessions, ordered batches, shared depth, call, token, cost, and time limits | Child sessions need free workers and use hosted file tools instead of direct kernel mounts. |
+| Speculative programmatic calls | Stream planning, safe static argument resolution, forked Monty shadows, result claims, fallback, cleanup, events, and statistics | Off by default. Only explicit non-sequential tools can run early. External effects are not transactional. |
 | Host functions | Explicit sync functions, or async functions with the native async kernel | They run with host authority and must validate untrusted input. |
 | Network | Host-side public HTTP and HTTPS through virtual `curl` | No direct Monty sockets or general network client. |
 | Binary and images | Upload, download, Base64 data URL, and LangChain image block | The host must create the model content block. |

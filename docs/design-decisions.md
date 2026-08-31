@@ -243,9 +243,30 @@ sessions because the parent owns the process-local filesystem lock. Explicitly
 inherited hosted file tools can still share files. This narrow rule avoids a
 reentrant filesystem lock and keeps the kernel's existing serialization model.
 
-The framework-neutral RLM accepts an async model callback. Provider adapters stay
-optional. The LangChain adapter uses public `ainvoke()` and reports only usage
-that the returned message supplies.
+The framework-neutral RLM accepts an async model callback and an optional async
+delta stream. Provider adapters stay optional. The LangChain adapter uses public
+`ainvoke()` and `astream()` and reports only usage that returned messages supply.
+
+## Speculative execution uses Monty for the shadow
+
+Arenero does not copy the reference CPython `exec` shadow used by some
+speculative tool-calling prototypes. Generated code must not gain a second,
+less-restricted runtime. A safe host evaluator resolves only a small expression
+allowlist. A forked Monty snapshot handles the remaining state-dependent
+statements. The shadow has no direct filesystem mount and is deleted after the
+turn.
+
+Only host-approved tool policies can run early. Nondeterministic identical calls
+keep FIFO multiplicity. Deterministic policies can reuse one result. Failed bets
+fall back to the original real call, and unused pending bets are cancelled. This
+keeps speculation an optional performance layer instead of a new result model.
+
+Sequential hosted tools are not eligible. They declare that calls must not
+overlap, which conflicts with early execution. Recursive RLM calls are also not
+in the default policy because a wrong-path recursive branch can use many model
+calls and Monty workers.
+
+See [Speculative programmatic tool calling](speculative-tool-calling.md).
 
 ## Static virtual modules are bounded source transformation
 

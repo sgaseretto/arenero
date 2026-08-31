@@ -4,7 +4,7 @@ from typing import Any
 from .async_kernel import AsyncPersistentMontyKernel
 from .hosted_tools import HostedToolConfig, HostedToolSet
 from .kernel import PersistentMontyKernel
-from .rlm import RLMModelCall
+from .rlm import RLMModelCall, RLMModelStreamCall
 
 
 def create_python_repl_tools(
@@ -178,6 +178,35 @@ def adapt_langchain_model(
             ) from exc
         raise
     return model_call_from_langchain(model, models=models)
+
+
+def adapt_langchain_model_stream(
+    model: Any,
+    *,
+    models: Mapping[str, Any] | None = None,
+) -> RLMModelStreamCall:
+    """Adapt LangChain streaming for speculative RLM planning.
+
+    Args:
+        model: Default LangChain chat model.
+        models: Optional mapping of selectable model names to chat models.
+
+    Returns:
+        Async framework-neutral RLM stream callback.
+
+    Raises:
+        ImportError: If the ``langchain`` extra is not installed.
+    """
+
+    try:
+        from .langchain_rlm import model_stream_from_langchain
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("langchain"):
+            raise ImportError(
+                "Install Arenero with the langchain extra: uv add 'arenero[langchain]'"
+            ) from exc
+        raise
+    return model_stream_from_langchain(model, models=models)
 
 
 def create_deepagents_middleware(**kwargs: Any) -> Any:

@@ -88,11 +88,12 @@ again.
 | Bound session | `session.py` | Keep one trusted session ID with execute, file, reset, info, and fork operations. |
 | Static virtual modules | `modules.py` | Resolve bounded top-level imports, build isolated module objects, and generate one Monty feed. |
 | Runtime owner | `runtime.py` | Close a kernel and its optional MCP hub in dependency order. |
-| Event records | `events.py` | Send safe execution, session, file, network, MCP, RLM, and runtime metadata to one callback. |
+| Event records | `events.py` | Send safe execution, session, file, network, MCP, RLM, speculation, and runtime metadata to one callback. |
 | Hosted tools | `hosted_tools.py` | Generate function catalogs, apply per-operation budgets and sequencing, convert boundary values, and record nested calls. |
 | Framework adapters | `langchain_hosted_tools.py` and `pydantic_ai_hosted_tools.py` | Keep public framework validation and callbacks, inject current runtime values, and document which parent dispatch middleware is bypassed. |
 | Recursive model runner | `rlm.py` | Keep context in Monty, run bounded root-model loops, expose plain and recursive model calls, isolate child sessions, and report shared usage. |
-| LangChain RLM adapter | `langchain_rlm.py` | Call chat models through `ainvoke()` and normalize text and reported usage. |
+| Speculative call coordinator | `speculation.py` | Inspect streamed code, run selected calls early, use a forked Monty shadow, and let real execution claim matching results. |
+| LangChain RLM adapter | `langchain_rlm.py` | Call or stream chat models through `ainvoke()` and `astream()`, then normalize text and reported usage. |
 | Doctor | `doctor.py` | Check Monty, worker startup, optional packages, workspace access, and MCP status. |
 | Persistent sync kernel | `kernel.py` | Restore, execute, limit, save, reset, and inspect Monty sessions. |
 | Persistent async kernel | `async_kernel.py` | Run persistent Python, virtual `fs_*` helpers, file transfer for resolution, `execute_file`, and `execute_module` on native `AsyncMonty` workers. |
@@ -248,6 +249,10 @@ subagent must enforce the required approval policy.
 ```mermaid
 flowchart TD
     Root["RLM root model"] --> Code["Generated Monty code"]
+    Root -. "optional text deltas" .-> Planner["Safe speculative planner"]
+    Planner --> Early["Selected early host calls"]
+    Planner --> Shadow["Forked Monty shadow"]
+    Shadow --> Early
     Code --> Context["Inspect external context variable"]
     Code --> Plain{"Subquery type"}
     Plain -->|llm_query| Model["Plain async model call"]
@@ -257,6 +262,7 @@ flowchart TD
     ChildRoot --> ChildCode["Child Monty code"]
     ChildCode --> Answer["Child answer text"]
     Model --> Answer
+    Early -. "matching result claim" .-> Code
     Answer --> Code
     Code --> Final["answer content and ready flag"]
     Final --> Cleanup["Delete root and child snapshots"]

@@ -26,6 +26,8 @@ flowchart LR
     Interface --> RLM["Recursive model runner"]
     RLM --> Kernel
     RLM --> Model["Configured async model adapter"]
+    Model --> Spec["Optional speculative planner and Monty shadow"]
+    Spec --> Kernel
 ```
 
 The kernel is the shared control point for limits, session state, and virtual
@@ -46,6 +48,7 @@ Arenero is a good fit when an agent needs a small, persistent computation space:
 - Call narrow application functions without giving Python ambient host access.
 - Discover and compose user-configured MCP tools from persistent Python.
 - Keep large model input in Monty and make bounded plain or recursive model calls.
+- Start selected model or hosted-tool calls while generated Monty code streams.
 
 Use a container, VM, or managed code sandbox when the work needs full CPython,
 third-party packages, Git, package installation, system test tools, compilers,
@@ -74,6 +77,9 @@ arbitrary executables, or a real shell.
 - [Recursive Language Models](docs/rlm.md) explains external context, plain and
   recursive model calls, child sessions, budgets, worker needs, adapters, and
   filesystem limits.
+- [Speculative programmatic tool calling](docs/speculative-tool-calling.md)
+  explains streamed planning, Monty shadows, result claims, tool policies,
+  statistics, limits, and standalone SpecTC-style integration.
 - [Static virtual modules](docs/virtual-modules.md) explains module resolution,
   examples, limits, and differences from CPython imports.
 - [Quality-of-life APIs](docs/quality-of-life.md) explains capability reports,

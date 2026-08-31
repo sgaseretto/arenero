@@ -170,6 +170,11 @@ the parent feed holds the shared filesystem lock. Child RLMs can use hosted file
 tools inherited through normal `ptc` selection. See
 [Recursive Language Models](rlm.md) for the full API and limits.
 
+The direct interpreter functions do not speculate because the parent agent owns
+model streaming. An application can use `SpeculativeTurn` in that outer stream,
+or use speculation in the separate `RLM.complete()` controller. See
+[Speculative programmatic tool calling](speculative-tool-calling.md).
+
 ## Subagent bridge
 
 When `subagents=True`, the middleware detects a live Deep Agents `task` tool with

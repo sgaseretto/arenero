@@ -7,13 +7,14 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .async_kernel import AsyncPersistentMontyKernel
 from .events import emit_event
 from .hosted_tools import HostedToolConfig, HostedToolSet
+from .speculation import SpeculationConfig, SpeculationUsage, SpeculativeTurn
 
 _CODE_BLOCK = re.compile(r"```(?:python|repl)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _BUDGET_PREFIXES = (
@@ -53,6 +54,7 @@ class RLMModelResponse:
 
 
 RLMModelCall = Callable[[str, str | None], Awaitable[str | RLMModelResponse]]
+RLMModelStreamCall = Callable[[str, str | None], AsyncIterator[str | RLMModelResponse]]
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,7 @@ class RLMUsage:
         cost: Total reported cost.
         deepest_level: Deepest RLM level started.
         wall_time_seconds: Total elapsed wall time.
+        speculation: Speculative dispatch, claim, and shadow statistics.
     """
 
     model_calls: int
@@ -139,6 +142,7 @@ class RLMUsage:
     cost: float
     deepest_level: int
     wall_time_seconds: float
+    speculation: SpeculationUsage = field(default_factory=SpeculationUsage)
 
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-compatible usage data.
@@ -187,6 +191,7 @@ class _RunState:
 
     model_call: RLMModelCall
     config: RLMConfig
+    model_stream: RLMModelStreamCall | None = None
     event_sink: Any = None
     started_at: float = field(default_factory=time.monotonic)
     model_calls: int = 0
@@ -195,6 +200,7 @@ class _RunState:
     output_tokens: int = 0
     cost: float = 0.0
     deepest_level: int = 0
+    speculation_turns: list[SpeculationUsage] = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _slots: asyncio.Semaphore = field(init=False)
 
@@ -227,16 +233,7 @@ class _RunState:
             Model response text.
         """
 
-        if len(prompt) > self.config.max_prompt_chars:
-            raise RuntimeError(
-                "RLMPromptTooLarge: model prompt exceeds max_prompt_chars"
-            )
-        async with self._lock:
-            if self.model_calls >= self.config.max_model_calls:
-                raise RuntimeError("RLMCallLimitExceeded: model call limit exceeded")
-            self.model_calls += 1
-            call_number = self.model_calls
-            self.deepest_level = max(self.deepest_level, depth)
+        call_number = await self._reserve_call(prompt, depth)
         emit_event(
             self.event_sink,
             "rlm",
@@ -260,6 +257,139 @@ class _RunState:
             raise RuntimeError(
                 "RLMResponseTooLarge: model response exceeds max_response_chars"
             )
+        await self._commit_usage(response)
+        emit_event(
+            self.event_sink,
+            "rlm",
+            "model_call_completed",
+            call_number=call_number,
+            depth=depth,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            cost=response.cost,
+        )
+        return response.content
+
+    async def stream(
+        self,
+        prompt: str,
+        model: str | None,
+        depth: int,
+        on_delta: Callable[[str], Awaitable[None]],
+    ) -> str:
+        """Stream one model response under shared limits.
+
+        Args:
+            prompt: Complete model input.
+            model: Optional adapter-defined model name.
+            depth: Current RLM depth.
+            on_delta: Async consumer called for each text delta.
+
+        Returns:
+            Complete model response text.
+        """
+
+        if self.model_stream is None:
+            response = await self.call(prompt, model, depth)
+            await on_delta(response)
+            return response
+        call_number = await self._reserve_call(prompt, depth)
+        emit_event(
+            self.event_sink,
+            "rlm",
+            "model_call_started",
+            call_number=call_number,
+            depth=depth,
+            model=model,
+            streaming=True,
+        )
+        parts: list[str] = []
+        input_tokens = 0
+        output_tokens = 0
+        cost = 0.0
+        response_chars = 0
+
+        async def consume() -> None:
+            """Consume and validate all adapter deltas."""
+
+            nonlocal input_tokens, output_tokens, cost, response_chars
+            assert self.model_stream is not None
+            async for raw in self.model_stream(prompt, model):
+                chunk = _normalize_response(raw)
+                if chunk.content:
+                    parts.append(chunk.content)
+                    response_chars += len(chunk.content)
+                    if response_chars > self.config.max_response_chars:
+                        raise RuntimeError(
+                            "RLMResponseTooLarge: model response exceeds "
+                            "max_response_chars"
+                        )
+                    await on_delta(chunk.content)
+                input_tokens += chunk.input_tokens
+                output_tokens += chunk.output_tokens
+                cost += chunk.cost
+
+        async with self._slots:
+            try:
+                await asyncio.wait_for(consume(), timeout=self.remaining_seconds())
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "RLMTimeout: recursive completion time limit exceeded"
+                ) from exc
+        usage = RLMModelResponse("", input_tokens, output_tokens, cost)
+        await self._commit_usage(usage)
+        emit_event(
+            self.event_sink,
+            "rlm",
+            "model_call_completed",
+            call_number=call_number,
+            depth=depth,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=cost,
+            streaming=True,
+        )
+        return "".join(parts)
+
+    async def add_speculation(self, usage: SpeculationUsage) -> None:
+        """Add one speculative turn report.
+
+        Args:
+            usage: Completed speculative turn statistics.
+        """
+
+        async with self._lock:
+            self.speculation_turns.append(usage)
+
+    async def _reserve_call(self, prompt: str, depth: int) -> int:
+        """Validate and reserve one shared model call.
+
+        Args:
+            prompt: Complete model input.
+            depth: Current RLM depth.
+
+        Returns:
+            Monotonic call number for events.
+        """
+
+        if len(prompt) > self.config.max_prompt_chars:
+            raise RuntimeError(
+                "RLMPromptTooLarge: model prompt exceeds max_prompt_chars"
+            )
+        async with self._lock:
+            if self.model_calls >= self.config.max_model_calls:
+                raise RuntimeError("RLMCallLimitExceeded: model call limit exceeded")
+            self.model_calls += 1
+            self.deepest_level = max(self.deepest_level, depth)
+            return self.model_calls
+
+    async def _commit_usage(self, response: RLMModelResponse) -> None:
+        """Commit one normalized call usage report.
+
+        Args:
+            response: Usage reported by one complete call or stream.
+        """
+
         async with self._lock:
             self.input_tokens += response.input_tokens
             self.output_tokens += response.output_tokens
@@ -274,17 +404,6 @@ class _RunState:
                 )
             if self.config.max_cost is not None and self.cost > self.config.max_cost:
                 raise RuntimeError("RLMCostLimitExceeded: reported cost limit exceeded")
-        emit_event(
-            self.event_sink,
-            "rlm",
-            "model_call_completed",
-            call_number=call_number,
-            depth=depth,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            cost=response.cost,
-        )
-        return response.content
 
     async def add_recursive_call(self, depth: int) -> None:
         """Record one child RLM call.
@@ -313,6 +432,7 @@ class _RunState:
             cost=self.cost,
             deepest_level=self.deepest_level,
             wall_time_seconds=time.monotonic() - self.started_at,
+            speculation=_sum_speculation(self.speculation_turns),
         )
 
 
@@ -321,7 +441,9 @@ class RLM:
 
     Args:
         model_call: Async adapter called as ``model_call(prompt, model_name)``.
+        model_stream: Optional async delta stream for early speculative planning.
         config: Optional recursive and model-call limits.
+        speculation_config: Optional speculative execution policy and limits.
         hosted_tool_config: Optional limits for calls made from one Monty feed.
     """
 
@@ -329,13 +451,17 @@ class RLM:
         self,
         model_call: RLMModelCall,
         *,
+        model_stream: RLMModelStreamCall | None = None,
         config: RLMConfig | None = None,
+        speculation_config: SpeculationConfig | None = None,
         hosted_tool_config: HostedToolConfig | None = None,
     ) -> None:
         """Create an RLM runner around one async model adapter."""
 
         self.model_call = model_call
+        self.model_stream = model_stream
         self.config = config or RLMConfig()
+        self.speculation_config = speculation_config or SpeculationConfig()
         self.hosted_tool_config = hosted_tool_config or HostedToolConfig(
             max_total_call_seconds=self.config.timeout_seconds,
             max_parallel_calls=self.config.max_parallel_calls,
@@ -364,7 +490,12 @@ class RLM:
         """
 
         self._validate_context(context)
-        state = _RunState(self.model_call, self.config, kernel.event_sink)
+        state = _RunState(
+            self.model_call,
+            self.config,
+            model_stream=self.model_stream,
+            event_sink=kernel.event_sink,
+        )
         session_id = _session_id(0)
         emit_event(
             kernel.event_sink,
@@ -423,7 +554,12 @@ class RLM:
             Operation-scoped RLM and application hosted tools.
         """
 
-        state = _RunState(self.model_call, self.config, kernel.event_sink)
+        state = _RunState(
+            self.model_call,
+            self.config,
+            model_stream=self.model_stream,
+            event_sink=kernel.event_sink,
+        )
         return self._toolset(
             kernel,
             parent_session_id,
@@ -448,7 +584,12 @@ class RLM:
             Python declarations and concise RLM behavior notes.
         """
 
-        state = _RunState(self.model_call, self.config, kernel.event_sink)
+        state = _RunState(
+            self.model_call,
+            self.config,
+            model_stream=self.model_stream,
+            event_sink=kernel.event_sink,
+        )
         toolset = self._toolset(
             kernel,
             "arenero-rlm-catalog",
@@ -461,7 +602,8 @@ class RLM:
             + "\nRLM notes: `llm_query` makes one plain model call. "
             "`rlm_query` gives the child its own temporary REPL until max_depth; "
             "at max_depth it becomes a plain model call. Batch forms can run in "
-            "parallel. Use `rlm_usage` to inspect the current shared budget."
+            "parallel. Use `rlm_usage` to inspect the current shared budget. "
+            "Speculation is a host optimization; code must not depend on it."
         )
 
     def capabilities(self) -> dict[str, Any]:
@@ -481,12 +623,16 @@ class RLM:
                 "rlm_usage",
             ],
             "limits": asdict(self.config),
+            "speculation": self.speculation_config.to_dict(),
             "boundaries": [
                 "recursive children use separate temporary Monty sessions",
                 "recursive child sessions do not mount the kernel filesystem",
                 "inherited hosted file tools can share files with children",
                 "the active parent interpreter never calls itself",
                 "token and cost limits require adapter-reported usage",
+                "speculative generated code runs only in a forked Monty session",
+                "speculative shadows have no direct filesystem mount",
+                "only tools named in the speculation policy can run early",
             ],
         }
 
@@ -551,43 +697,70 @@ class RLM:
                     transcript=transcript,
                     depth=depth,
                 )
-                response = await state.call(prompt, model, depth)
-                code_blocks = _code_blocks(response)
-                if not code_blocks:
-                    return _final_text(response), iteration
-                transcript.append(f"MODEL:\n{response}")
-                for code in code_blocks:
-                    execution = await kernel.execute(
+                turn: SpeculativeTurn | None = None
+                if self.speculation_config.mode != "off":
+                    turn = SpeculativeTurn(
+                        kernel,
                         session_id,
-                        code.rstrip() + "\nanswer",
-                        self.config.max_repl_output_chars,
-                        hosted_tools=toolset,
-                        filesystem=depth == 0,
+                        toolset,
+                        self.speculation_config,
+                        known_values={"context": context, "question": question},
+                        event_sink=kernel.event_sink,
                     )
-                    transcript.append(
-                        "REPL:\n"
-                        + json.dumps(execution, ensure_ascii=False, default=str)
-                    )
-                    if not execution["ok"]:
-                        message = _execution_error_message(execution)
-                        if any(prefix in message for prefix in _BUDGET_PREFIXES):
-                            raise RuntimeError(message)
-                        errors += 1
-                        if errors >= self.config.max_errors:
-                            raise RuntimeError(
-                                "RLMErrorLimitExceeded: consecutive REPL error "
-                                "limit exceeded"
-                            )
-                        break
-                    errors = 0
-                    if execution["truncated"]["result"]:
-                        raise RuntimeError(
-                            "RLMResultTooLarge: increase max_repl_output_chars "
-                            "or produce a smaller final answer"
+                    await turn.start()
+                try:
+                    if (
+                        turn is not None
+                        and self.speculation_config.mode == "stream"
+                        and state.model_stream is not None
+                    ):
+                        response = await state.stream(prompt, model, depth, turn.feed)
+                    else:
+                        response = await state.call(prompt, model, depth)
+                        if turn is not None:
+                            await turn.feed(response)
+                    if turn is not None:
+                        await turn.finish_generation()
+                    code_blocks = _code_blocks(response)
+                    if not code_blocks:
+                        return _final_text(response), iteration
+                    transcript.append(f"MODEL:\n{response}")
+                    execution_tools = turn.real_tools if turn is not None else toolset
+                    for code in code_blocks:
+                        execution = await kernel.execute(
+                            session_id,
+                            code.rstrip() + "\nanswer",
+                            self.config.max_repl_output_chars,
+                            hosted_tools=execution_tools,
+                            filesystem=depth == 0,
                         )
-                    answer = execution["result"]
-                    if isinstance(answer, dict) and answer.get("ready") is True:
-                        return str(answer.get("content", "")), iteration
+                        transcript.append(
+                            "REPL:\n"
+                            + json.dumps(execution, ensure_ascii=False, default=str)
+                        )
+                        if not execution["ok"]:
+                            message = _execution_error_message(execution)
+                            if any(prefix in message for prefix in _BUDGET_PREFIXES):
+                                raise RuntimeError(message)
+                            errors += 1
+                            if errors >= self.config.max_errors:
+                                raise RuntimeError(
+                                    "RLMErrorLimitExceeded: consecutive REPL error "
+                                    "limit exceeded"
+                                )
+                            break
+                        errors = 0
+                        if execution["truncated"]["result"]:
+                            raise RuntimeError(
+                                "RLMResultTooLarge: increase max_repl_output_chars "
+                                "or produce a smaller final answer"
+                            )
+                        answer = execution["result"]
+                        if isinstance(answer, dict) and answer.get("ready") is True:
+                            return str(answer.get("content", "")), iteration
+                finally:
+                    if turn is not None:
+                        await state.add_speculation(await turn.close())
                 transcript = _trim_transcript(
                     transcript, self.config.max_transcript_chars
                 )
@@ -776,6 +949,12 @@ You can also return direct text without a code block when no REPL work is needed
 
 Direct kernel filesystem access is available only at depth 0. Recursive child
 REPLs can still use explicitly inherited hosted file tools.
+Eligible plain model calls can run speculatively. Their generated statements
+still run only in an isolated Monty shadow. Write normal correct code; early
+work is an optimization and does not change call results.
+Active speculation: {json.dumps(self.speculation_config.to_dict(), ensure_ascii=False)}
+Wrong-path calls can still consume provider capacity. Only the listed tool
+policies are eligible.
 
 {kernel.instructions()}
 
@@ -895,3 +1074,18 @@ def _session_id(depth: int) -> str:
     """
 
     return f"arenero-rlm-{depth}-{uuid.uuid4().hex}"
+
+
+def _sum_speculation(items: list[SpeculationUsage]) -> SpeculationUsage:
+    """Add completed speculative turn reports.
+
+    Args:
+        items: Per-turn speculative statistics.
+
+    Returns:
+        One aggregate report for the complete RLM tree.
+    """
+
+    fields = SpeculationUsage.__dataclass_fields__
+    values = {name: sum(getattr(item, name) for item in items) for name in fields}
+    return SpeculationUsage(**values)

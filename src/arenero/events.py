@@ -15,6 +15,7 @@ EventCategory = Literal[
     "mcp",
     "hosted_tool",
     "rlm",
+    "speculation",
     "runtime",
 ]
 

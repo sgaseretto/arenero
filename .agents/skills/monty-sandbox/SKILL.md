@@ -57,6 +57,17 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 - Recursive RLM child sessions disable direct kernel mounts and filesystem
   callbacks because the parent feed holds the filesystem lock. Give children
   explicit hosted file tools when they must share files.
+- Keep speculative execution optional and host-approved. Parse streamed source
+  only to inspect it. Run state-dependent generated statements in a forked
+  Monty session, never with CPython `exec`, `eval`, or `compile`.
+- Disable direct filesystem access in a speculative shadow. Reattach only the
+  hosted tools named in the speculation policy. Do not speculate sequential
+  tools. Prefer read-only or idempotent calls because wrong-path work cannot be
+  rolled back.
+- Preserve call multiplicity for nondeterministic speculative tools. Reuse one
+  matching result only when the host marks the tool deterministic. A failed bet
+  must fall back to normal execution, and pending unused work must have bounded
+  cleanup.
 - Materialize MCP binary blocks only after the active Monty checkout ends. Scan
   the final returned value or use an explicit host-side MCP result. Intermediate
   results and data removed by MCP result limits are unavailable.
@@ -107,6 +118,8 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 - Put RLM depth, call, context, prompt, response, transcript, token, cost,
   concurrency, wall-time, and worker rules in model instructions. Token and cost
   limits enforce only usage reported by the model adapter.
+- Put the active speculation mode, eligible tool names, call limits, shadow
+  rules, and non-transactional side-effect warning in model instructions.
 - Tell the model to write small direct snippets, use `pathlib`, use `readlines()` instead of iterating a file, and avoid unavailable imports.
 - For Deep Agents, use `AreneroInterpreterMiddleware` with `ainvoke()` or
   `astream()`. Treat its PTC calls as nested calls that bypass the parent

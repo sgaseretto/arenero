@@ -228,7 +228,7 @@ kernel = PersistentMontyKernel(event_sink=events.append)
 ```
 
 The callback receives immutable `AreneroEvent` records for execution, session,
-filesystem, network, MCP, RLM, and runtime actions. Events contain metadata such as
+filesystem, network, MCP, RLM, speculation, and runtime actions. Events contain metadata such as
 IDs, sizes, status, and timing. They do not contain executed code, file content,
 HTTP headers or bodies, MCP arguments or results, or credentials. Event callback
 errors are ignored, so an observer cannot change an execution result.

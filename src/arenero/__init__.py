@@ -7,6 +7,7 @@ from .filesystem import FilesystemConfig
 from .hosted_tools import HostedTool, HostedToolConfig, HostedToolSet
 from .integrations import (
     adapt_langchain_model,
+    adapt_langchain_model_stream,
     adapt_langchain_tools,
     adapt_pydantic_ai_tools,
     create_async_python_repl_tools,
@@ -28,7 +29,15 @@ from .modules import (
     VirtualModuleResolver,
 )
 from .network import NetworkConfig
-from .rlm import RLM, RLMConfig, RLMModelCall, RLMModelResponse, RLMResult, RLMUsage
+from .rlm import (
+    RLM,
+    RLMConfig,
+    RLMModelCall,
+    RLMModelResponse,
+    RLMModelStreamCall,
+    RLMResult,
+    RLMUsage,
+)
 from .runtime import AreneroRuntime, AsyncAreneroRuntime
 from .sandbox import (
     MONTY_SANDBOX_INSTRUCTIONS,
@@ -42,6 +51,13 @@ from .sandbox import (
     SandboxSearchResult,
 )
 from .session import AsyncSessionHandle, SessionHandle
+from .speculation import (
+    SpeculationConfig,
+    SpeculationMode,
+    SpeculationUsage,
+    SpeculativeToolPolicy,
+    SpeculativeTurn,
+)
 from .store import (
     InMemorySessionStore,
     SessionInfo,
@@ -80,6 +96,7 @@ __all__ = [
     "RLMConfig",
     "RLMModelCall",
     "RLMModelResponse",
+    "RLMModelStreamCall",
     "RLMResult",
     "RLMUsage",
     "SQLiteSessionStore",
@@ -90,6 +107,11 @@ __all__ = [
     "SessionHandle",
     "SessionInfo",
     "SessionStore",
+    "SpeculationConfig",
+    "SpeculationMode",
+    "SpeculationUsage",
+    "SpeculativeToolPolicy",
+    "SpeculativeTurn",
     "StatePolicy",
     "StatelessSessionStore",
     "VirtualModuleConfig",
@@ -97,6 +119,7 @@ __all__ = [
     "VirtualModuleResolver",
     "WorkspaceConfig",
     "adapt_langchain_model",
+    "adapt_langchain_model_stream",
     "adapt_langchain_tools",
     "adapt_pydantic_ai_tools",
     "capability_report",

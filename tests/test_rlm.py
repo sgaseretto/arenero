@@ -14,6 +14,7 @@ from arenero import (
     RLMConfig,
     RLMModelResponse,
     adapt_langchain_model,
+    adapt_langchain_model_stream,
 )
 
 
@@ -209,3 +210,18 @@ answer['ready'] = True
         self.assertEqual(response.content, "adapter result")
         self.assertEqual(response.input_tokens, 3)
         self.assertEqual(response.output_tokens, 4)
+
+    async def test_langchain_stream_adapter_yields_text_deltas(self) -> None:
+        """Convert LangChain streamed chunks into RLM response deltas."""
+
+        model = FakeMessagesListChatModel(
+            responses=[AIMessage(content="streamed result")]
+        )
+        stream = adapt_langchain_model_stream(model)
+
+        chunks = [chunk async for chunk in stream("prompt", None)]
+
+        text = "".join(
+            chunk if isinstance(chunk, str) else chunk.content for chunk in chunks
+        )
+        self.assertEqual(text, "streamed result")

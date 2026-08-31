@@ -113,6 +113,16 @@ filesystem callbacks, and `bootstrap_files` to avoid the parent's filesystem
 lock. Trusted `bootstrap_code` and explicitly inherited hosted file tools remain
 available.
 
+Arenero speculative programmatic tool calling uses the same snapshot property
+for a temporary shadow of the real session. Host-side `ast` processing only
+inspects syntax and evaluates a fixed side-effect-free expression allowlist. It
+must never execute generated source in CPython. The forked Monty shadow has no
+direct mount or filesystem callbacks. Its state is discarded. Only explicitly
+named hosted tools can run early, and `sequential=True` tools are excluded.
+Nondeterministic identical calls need separate FIFO entries. Deterministic reuse
+requires an explicit host policy. Failed or unused work can still consume an
+external provider request, so speculate read-only or idempotent functions.
+
 ## Type checking pattern
 
 Enable `type_check=True` and define host tools in `type_check_stubs`. Give the model the same declarations. Successful snippets accumulate into the type-checking context; failed snippets do not execute or accumulate. Type checking is a strong retry signal for model-generated code, but documented runtime gaps still require tests.
