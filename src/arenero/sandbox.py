@@ -6,7 +6,9 @@ from typing import Any
 from pydantic_monty import MontyError
 
 from .cell import execute_repl_cell
-from .kernel import ExecutionResult, PersistentMontyKernel
+from .hosted_tools import HostedToolSet
+from .kernel import ExecutionResult, PersistentMontyKernel, StatePolicy
+from .modules import VirtualModuleConfig
 from .shell import ShellResult, VirtualShell, shell_result_from_execution
 
 VIRTUAL_SHELL_TOOL_DESCRIPTION = """Run a small allowlisted shell over the
@@ -229,6 +231,9 @@ class AreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
     ) -> SandboxExecuteResult:
         """Execute Monty-compatible Python directly.
 
@@ -236,6 +241,9 @@ class AreneroSandbox:
             code: Monty-compatible Python source.
             output_limit_chars: Optional output limit below the hard maximum.
             output_file: Optional absolute virtual path used when output is trimmed.
+            state_policy: State save policy for this operation.
+            restart: Reset state before execution when true.
+            hosted_tools: Optional tools for this operation only.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -246,6 +254,9 @@ class AreneroSandbox:
                 code,
                 output_limit_chars,
                 output_file=output_file,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools,
             )
         )
 
@@ -255,6 +266,9 @@ class AreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
     ) -> dict[str, Any]:
         """Execute one Python or notebook-style shell cell.
 
@@ -262,6 +276,9 @@ class AreneroSandbox:
             code: Monty Python, one ``!command``, or a ``%%shell`` cell.
             output_limit_chars: Optional result limit below the hard maximum.
             output_file: Optional absolute virtual path used when output is trimmed.
+            state_policy: State save policy for Python and ``%run`` execution.
+            restart: Reset state before an executable cell when true.
+            hosted_tools: Optional tools for this operation only.
 
         Returns:
             A result with ``mode=python`` or ``mode=shell``.
@@ -272,6 +289,9 @@ class AreneroSandbox:
             code,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
         )
 
     def execute_file(
@@ -280,6 +300,7 @@ class AreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
     ) -> SandboxExecuteResult:
         """Execute one virtual Python file in the persistent session.
 
@@ -287,6 +308,7 @@ class AreneroSandbox:
             path: Absolute virtual Python file path.
             output_limit_chars: Optional output limit below the hard maximum.
             output_file: Optional absolute virtual path used when output is trimmed.
+            state_policy: State save policy for this operation.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -297,6 +319,40 @@ class AreneroSandbox:
                 path,
                 output_limit_chars=output_limit_chars,
                 output_file=output_file,
+                state_policy=state_policy,
+            )
+        )
+
+    def execute_module(
+        self,
+        entry_path: str,
+        code: str | None = None,
+        output_limit_chars: int | None = None,
+        *,
+        module_config: VirtualModuleConfig | None = None,
+        state_policy: StatePolicy = "always",
+    ) -> SandboxExecuteResult:
+        """Resolve and execute a static virtual module graph.
+
+        Args:
+            entry_path: Absolute virtual entry ``.py`` file.
+            code: Optional follow-up code.
+            output_limit_chars: Optional output limit below the hard maximum.
+            module_config: Optional module roots, aliases, and limits.
+            state_policy: State save policy for this operation.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+
+        return _execution_response(
+            self.kernel.execute_module(
+                self.session_id,
+                entry_path,
+                code,
+                output_limit_chars,
+                module_config=module_config,
+                state_policy=state_policy,
             )
         )
 
@@ -636,6 +692,7 @@ class AsyncAreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
     ) -> SandboxExecuteResult:
         """Execute Monty Python without blocking the event loop.
 
@@ -643,6 +700,7 @@ class AsyncAreneroSandbox:
             code: Monty-compatible Python source.
             output_limit_chars: Optional output limit.
             output_file: Optional virtual path used when output is trimmed.
+            state_policy: State save policy for this operation.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -652,6 +710,7 @@ class AsyncAreneroSandbox:
             code,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
         )
 
     async def execute_cell(
@@ -660,6 +719,7 @@ class AsyncAreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
     ) -> dict[str, Any]:
         """Execute one Python or shell cell without blocking the event loop.
 
@@ -667,6 +727,7 @@ class AsyncAreneroSandbox:
             code: Monty Python, one ``!command``, or a ``%%shell`` cell.
             output_limit_chars: Optional result limit.
             output_file: Optional virtual path used when output is trimmed.
+            state_policy: State save policy for Python and ``%run`` execution.
 
         Returns:
             Stable Python or shell cell result.
@@ -676,6 +737,7 @@ class AsyncAreneroSandbox:
             code,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
         )
 
     async def execute_file(
@@ -684,6 +746,7 @@ class AsyncAreneroSandbox:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
     ) -> SandboxExecuteResult:
         """Execute one virtual Python file without blocking the event loop.
 
@@ -691,6 +754,7 @@ class AsyncAreneroSandbox:
             path: Absolute virtual Python file path.
             output_limit_chars: Optional output limit.
             output_file: Optional virtual path used when output is trimmed.
+            state_policy: State save policy for this operation.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -700,6 +764,38 @@ class AsyncAreneroSandbox:
             path,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
+        )
+
+    async def execute_module(
+        self,
+        entry_path: str,
+        code: str | None = None,
+        output_limit_chars: int | None = None,
+        *,
+        module_config: VirtualModuleConfig | None = None,
+        state_policy: StatePolicy = "always",
+    ) -> SandboxExecuteResult:
+        """Resolve and execute static virtual modules without blocking.
+
+        Args:
+            entry_path: Absolute virtual entry ``.py`` file.
+            code: Optional follow-up code.
+            output_limit_chars: Optional output limit.
+            module_config: Optional module roots, aliases, and limits.
+            state_policy: State save policy for this operation.
+
+        Returns:
+            Combined output, exit code, and truncation state.
+        """
+
+        return await asyncio.to_thread(
+            self.sync.execute_module,
+            entry_path,
+            code,
+            output_limit_chars,
+            module_config=module_config,
+            state_policy=state_policy,
         )
 
     async def read(

@@ -11,15 +11,27 @@ dependencies = [
 
 [project.optional-dependencies]
 langchain = ["langchain>=1.3.18"]
+deepagents = [
+    "deepagents>=0.7,<0.8",
+    "langchain>=1.3.18",
+]
 mcp = [
     "httpx2>=2.12,<3",
     "mcp>=2,<3",
 ]
+pydantic-ai = [
+    "pydantic-ai-slim>=2.33.0",
+]
+observability = [
+    "opentelemetry-api>=1.37.0",
+]
 
 [dependency-groups]
 dev = [
+    "deepagents>=0.7,<0.8",
     "langchain>=1.3.18",
     "mcp>=2,<3",
+    "pydantic-ai-slim>=2.33.0",
     "ruff>=0.16.5,<0.17",
     "ty>=0.0.75,<0.0.76",
 ]

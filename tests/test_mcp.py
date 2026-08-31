@@ -80,6 +80,23 @@ class McpHubTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn('"sum": 7', result["content"][0]["text"])
 
+    def test_mcp_event_sink_gets_safe_call_metadata(self) -> None:
+        """Observe MCP call identity and status without arguments or results."""
+        events = []
+        with McpHub(
+            [McpServerConfig.in_process("demo", self.make_server())],
+            event_sink=events.append,
+        ) as hub:
+            result = hub.call("demo__add", {"a": 2, "b": 3})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [event.action for event in events],
+            ["call_started", "call_finished"],
+        )
+        self.assertNotIn("arguments", events[0].data)
+        self.assertNotIn("result", events[1].data)
+
     def test_monty_can_compose_calls_and_persist_a_helper(self) -> None:
         """Keep a function that calls MCP across persistent Monty feeds."""
         with (
@@ -250,6 +267,34 @@ second["error"]["type"]
         repl = next(tool for tool in tools if tool.name == "python_repl")
         self.assertIn("mcp_search(query)", repl.description)
         self.assertIn("mcp_call(name, arguments)", repl.description)
+
+    def test_promoted_tool_uses_restart_for_a_saved_typed_session(self) -> None:
+        """Restart a saved typed session before its first promoted tool call."""
+
+        with (
+            McpHub([McpServerConfig.in_process("demo", self.make_server())]) as hub,
+            PersistentMontyKernel(
+                config=KernelConfig(type_check=True),
+                mcp_hub=hub,
+            ) as kernel,
+        ):
+            promoted = kernel.execute("thread", 'mcp_promote("demo__add")')
+            report = kernel.capabilities()
+            unresolved = kernel.execute("thread", "demo__add(a=20, b=22)")
+            called = kernel.execute(
+                "thread",
+                "demo__add(a=20, b=22)",
+                restart=True,
+            )
+
+        self.assertTrue(promoted["result"]["ok"])
+        self.assertEqual(promoted["result"]["available"], "next_execution")
+        self.assertIn("demo__add", report["hosted_tools"]["functions"])
+        self.assertIn("def demo__add", report["hosted_tools"]["catalog"])
+        self.assertEqual(unresolved["error"]["code"], "unresolved_reference")
+        self.assertEqual(called["result"]["value"], {"sum": 42})
+        self.assertEqual(called["host_calls"]["count"], 1)
+        self.assertTrue(called["session_restarted"])
 
     def test_configuration_and_name_collisions_are_rejected(self) -> None:
         """Reject unsafe ambiguity before a Monty operation starts."""

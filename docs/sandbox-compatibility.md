@@ -2,8 +2,9 @@
 
 This report compares Arenero with the utilities described in the LangChain
 [Deep Agents sandbox documentation](https://docs.langchain.com/oss/python/deepagents/sandboxes).
-Arenero does not implement a Deep Agents backend. It provides the independent
-parts needed to build an adapter later.
+Arenero does not implement the Deep Agents `BaseSandbox` backend contract. It
+provides the independent sandbox utilities and an optional async interpreter
+middleware for Deep Agents.
 
 ```mermaid
 flowchart TD
@@ -47,6 +48,8 @@ executables.
 | Type checking | Optional Monty checking rejects invalid user feeds before execution and accepts host-function stubs. |
 | Async facade | `AsyncAreneroSandbox` runs the synchronous facade through worker threads while keeping the same locks and state. |
 | Native async Python | `AsyncPersistentMontyKernel` runs independent session IDs on a shared `AsyncMonty` pool. Its small agent adapter does not include the virtual shell. |
+| Deep Agents interpreter | `AreneroInterpreterMiddleware` adds async code and static-module tools, live capability instructions, PTC, subagent dispatch, state modes, and optional private checkpoint snapshots. It is middleware, not a `BaseSandbox`. |
+| Static virtual modules | `execute_module` resolves a bounded graph of top-level virtual imports. It is not CPython importlib and generated feeds skip type checking. |
 | Session administration | Stores and kernels list safe session metadata and delete expired sessions without exposing snapshot bytes. |
 | Stable sandbox identifier | `AreneroSandbox.id` is available. |
 | Secrets outside execution | Narrow host functions can use credentials without exposing them to Monty. |
@@ -86,8 +89,7 @@ These additions are practical if direct Deep Agents compatibility becomes useful
 
 | Addition | Difficulty | Notes |
 | --- | --- | --- |
-| Deep Agents result conversion | Low | Convert Arenero result dataclasses to the matching Deep Agents classes. |
-| Deep Agents tool names and schemas | Low | Wrap the existing facade methods without changing filesystem behavior. |
+| Deep Agents `BaseSandbox` facade | Low to medium | Wrap existing file and limited-execute methods while stating that execute is not an arbitrary shell. |
 | File metadata | Low to medium | Add byte size and timestamps where the selected filesystem backend can supply them. |
 | Per-call lower timeout | Medium | Requires a new disposable checkout policy or a worker request deadline per call. It must not restore unsafe state. |
 | More complete glob rules | Medium | Add brace expansion and the exact hidden-file rules used by Deep Agents. |

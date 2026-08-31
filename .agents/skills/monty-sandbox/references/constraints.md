@@ -22,6 +22,13 @@ It rejects or omits:
 - Function metadata such as `fn.__name__`, `fn.__doc__`, and `fn.__dict__`.
 - A real module namespace, packages, relative imports, `sys.path`, and site-packages.
 
+Arenero's optional `execute_module()` does not change this Monty limitation. The
+host parses and rewrites a bounded static file graph into one normal Monty feed.
+It gives each file a simple generated object, but it does not provide importlib,
+reload, a module cache, dynamic imports, or third-party packages. Generated
+module feeds disable type checking because the simple objects need dynamic
+attributes.
+
 Generator expressions and `enumerate`, `zip`, `map`, `filter`, and `reversed` are eager lists. Avoid them on large or unbounded inputs.
 
 ## Standard library
@@ -98,6 +105,13 @@ Monty can dump an idle session or a suspended mid-feed snapshot to opaque bytes.
 - Store the Monty version with every dump and reject or reset incompatible state.
 - Apply a comparable memory limit while restoring large dumps.
 - Files in host memory or host storage have a separate lifecycle from the interpreter dump unless the application stores them together.
+
+Arenero RLM recursion uses a new temporary snapshot for each child. It does not
+copy the parent namespace. The parent checkout stays active during the child, so
+each active depth needs another worker. Recursive children omit direct mounts,
+filesystem callbacks, and `bootstrap_files` to avoid the parent's filesystem
+lock. Trusted `bootstrap_code` and explicitly inherited hosted file tools remain
+available.
 
 ## Type checking pattern
 

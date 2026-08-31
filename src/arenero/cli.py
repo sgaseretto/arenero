@@ -1,6 +1,7 @@
 import argparse
 import ast
 import codeop
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -87,7 +88,7 @@ def run_repl(
 
     print("Arenero -- a Python REPL powered by Monty", file=stdout)
     print(
-        "Use !command or %%shell for the virtual shell. "
+        "Use !command or %%shell for the virtual shell. Use %limits for active capabilities. "
         "Type exit or quit, or press Ctrl-D to leave.",
         file=stdout,
     )
@@ -135,6 +136,12 @@ def run_repl(
 def main() -> None:
     """Parse command-line options and run or administer REPL sessions."""
     parser = argparse.ArgumentParser(description="Run the Arenero REPL")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("doctor",),
+        help="Optional administrative command",
+    )
     parser.add_argument(
         "--store",
         choices=("memory", "sqlite", "none"),
@@ -187,6 +194,11 @@ def main() -> None:
         action="store_true",
         help="Delete expired sessions and exit",
     )
+    actions.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Check the configured runtime and exit",
+    )
     args = parser.parse_args()
 
     store = _create_store(args.store, args.db)
@@ -207,6 +219,14 @@ def main() -> None:
             return
         if args.prune_sessions:
             print(f"Deleted {kernel.delete_expired()} expired session(s).")
+            return
+        if args.doctor or args.command == "doctor":
+            from .doctor import run_doctor
+
+            report = run_doctor(kernel)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            if not report["ok"]:
+                raise SystemExit(1)
             return
         run_repl(
             kernel,

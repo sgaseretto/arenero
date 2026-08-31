@@ -30,6 +30,20 @@ class AsyncKernelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(isolated["ok"])
         self.assertFalse(isolated["state_restored"])
 
+    async def test_plain_feed_inputs_can_be_saved_in_session_state(self) -> None:
+        """Bind a large host value without placing it in generated source."""
+
+        async with AsyncPersistentMontyKernel() as kernel:
+            initial = await kernel.execute(
+                "thread",
+                "context = supplied_context\nlen(context)",
+                inputs={"supplied_context": "external text"},
+            )
+            restored = await kernel.execute("thread", "context.upper()")
+
+        self.assertEqual(initial["result"], 13)
+        self.assertEqual(restored["result"], "EXTERNAL TEXT")
+
     async def test_shared_store_survives_async_kernel_restart(self) -> None:
         """Restore state after replacing the native async kernel."""
         store = InMemorySessionStore()
@@ -229,6 +243,41 @@ class AsyncKernelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn('"sum": 42', result["result"])
+
+    async def test_async_mcp_promotion_becomes_an_awaitable_function(self) -> None:
+        """Promote one MCP tool and await it on the next async operation."""
+
+        server = MCPServer("async-promotion")
+
+        @server.tool(description="Add two integers")
+        async def add(a: int, b: int) -> dict[str, int]:
+            """Add two integers after yielding to the event loop."""
+
+            await asyncio.sleep(0)
+            return {"sum": a + b}
+
+        hub = McpHub([McpServerConfig.in_process("demo", server)])
+        try:
+            async with AsyncPersistentMontyKernel(
+                config=KernelConfig(type_check=True),
+                mcp_hub=hub,
+            ) as kernel:
+                promoted = await kernel.execute(
+                    "mcp-promotion",
+                    'await mcp_promote("demo__add")',
+                )
+                called = await kernel.execute(
+                    "mcp-promotion",
+                    "await demo__add(a=20, b=22)",
+                    restart=True,
+                )
+        finally:
+            await asyncio.to_thread(hub.close)
+
+        self.assertTrue(promoted["result"]["ok"])
+        self.assertEqual(called["result"]["value"], {"sum": 42})
+        self.assertEqual(called["host_calls"]["count"], 1)
+        self.assertTrue(called["session_restarted"])
 
     def test_invalid_worker_pool_configuration_is_rejected(self) -> None:
         """Reject inconsistent worker pool sizes before startup."""

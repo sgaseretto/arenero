@@ -10,12 +10,15 @@ Monty is experimental, so run the project tests before a Monty version update.
 | --- | --- |
 | Direct persistent Python cells | `PersistentMontyKernel.execute()` |
 | One virtual helper file and follow-up code | `PersistentMontyKernel.execute_file()` |
+| Small static graph of virtual Python files | `execute_module()` or an agent module tool |
 | Python, `!COMMAND`, and `%%shell` cells | `execute_repl_cell()` or `AreneroSandbox.execute_cell()` |
 | Framework-neutral execution and file methods | `AreneroSandbox` |
 | Full sandbox API in an async web service | `AsyncAreneroSandbox` |
 | Concurrent async Python agents | `AsyncPersistentMontyKernel` |
 | LangChain or LangGraph tools | `create_python_repl_tools()` with the `langchain` extra |
 | Native async LangChain or LangGraph Python tools | `create_async_python_repl_tools()` |
+| Deep Agents code-mode interpreter | `AreneroInterpreterMiddleware` with the `deepagents` extra |
+| Large external context with recursive model calls | `RLM` with `AsyncPersistentMontyKernel` |
 | Durable Python state | `SQLiteSessionStore` |
 | Durable files and Python state | `SQLiteSessionStore` plus `WorkspaceConfig` |
 | Process-only Python state | Default `InMemorySessionStore` |
@@ -41,6 +44,8 @@ flowchart TD
     Kernel --> Durable
     Need --> MCP{"Call configured MCP tools?"}
     MCP -->|Yes| Hub["McpHub plus either persistent kernel"]
+    Need --> RLMNeed{"Keep large context outside the model?"}
+    RLMNeed -->|Yes| RLM["RLM plus AsyncPersistentMontyKernel"]
     Durable -->|Python state only| SQLite["SQLiteSessionStore"]
     Durable -->|Python state and files| Workspace["SQLiteSessionStore plus WorkspaceConfig"]
     Durable -->|No| Memory["InMemorySessionStore or StatelessSessionStore"]
@@ -55,7 +60,10 @@ flowchart TD
 | Files | UTF-8 text, bytes, in-memory files, confined mounts, persistent workspaces, and bounded structured operations | No ambient host paths or live file descriptors. |
 | Virtual shell | Fixed file and text commands, pipes, redirection, conditional lists, Monty Python, and bounded `curl` | No operating-system process or automatic expansion. |
 | Persistence | Memory, SQLite, or stateless snapshots selected by `session_id` | Files have a separate lifecycle. Snapshots are Monty-version-specific. |
-| Agent tools | Full sync tools, or a small native async Python, helper-file, and reset set | LangChain is optional and the runtime thread selects the session. |
+| Agent tools | Full sync tools, or a small native async Python, file, module, and reset set | LangChain is optional and the runtime thread selects the session. |
+| Static virtual modules | Top-level absolute and relative imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested, cyclic, or third-party imports. Generated feeds skip type checking. |
+| Deep Agents middleware | Async interpreter, dynamic catalog, PTC, subagent task bridge, three state modes, and private checkpoint snapshots | Nested calls bypass the parent ToolNode and its per-tool approvals. |
+| Recursive model calls | External context, plain calls, child RLM sessions, ordered batches, shared depth, call, token, cost, and time limits | Child sessions need free workers and use hosted file tools instead of direct kernel mounts. |
 | Host functions | Explicit sync functions, or async functions with the native async kernel | They run with host authority and must validate untrusted input. |
 | Network | Host-side public HTTP and HTTPS through virtual `curl` | No direct Monty sockets or general network client. |
 | Binary and images | Upload, download, Base64 data URL, and LangChain image block | The host must create the model content block. |
@@ -118,12 +126,13 @@ return a retryable error instead of waiting without a deadline when the pool is
 full.
 
 Use `create_async_python_repl_tools(kernel)` for LangChain or LangGraph. It
-returns `python_repl`, `python_repl_execute_file`, and `reset_python_repl`.
+returns `python_repl`, `python_repl_execute_file`,
+`python_repl_execute_module`, and `reset_python_repl`.
 Shell cells are not accepted by this adapter. Async host functions and native
 async MCP functions must use `await` in Monty code. The native kernel has no
-host upload, download, session listing, or output-file offloading methods. Use
-virtual `fs_*` helpers from Python, or select the full sync facade when those host
-operations are required.
+host upload, session listing, or output-file offloading methods. It has bounded
+download support for module resolution. Use virtual `fs_*` helpers from Python,
+or select the full sync facade when broader host operations are required.
 
 ## Working examples
 
@@ -202,6 +211,82 @@ with PersistentMontyKernel(os_handler=filesystem) as kernel:
 
 The helper's names enter the session. This has no module namespace, import cache,
 relative import behavior, or package behavior.
+
+### Resolve a small virtual module graph
+
+Use `execute_module()` when helper files import each other:
+
+```python
+from pydantic_monty import MemoryFile, OSAccess
+
+from arenero import PersistentMontyKernel
+
+filesystem = OSAccess(
+    files=[
+        MemoryFile("/helper.py", "def double(x):\n    return x * 2\n"),
+        MemoryFile("/main.py", "from helper import double\nANSWER = double(21)\n"),
+    ]
+)
+
+with PersistentMontyKernel(os_handler=filesystem) as kernel:
+    result = kernel.execute_module("conversation-42", "/main.py", "ANSWER")
+    assert result["result"] == 42
+```
+
+This is a bounded host-side source resolver, not CPython import. See
+[Static virtual modules](virtual-modules.md) for supported forms and all limits.
+
+### Give Deep Agents one persistent interpreter
+
+```python
+from arenero import create_deepagents_middleware
+from deepagents import create_deep_agent
+
+interpreter = create_deepagents_middleware(
+    mode="thread",
+    ptc=("search",),
+)
+agent = create_deep_agent(
+    model="openai:gpt-5.5",
+    tools=[search],
+    middleware=[interpreter],
+)
+
+answer = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "Search, filter, and summarize."}]},
+    {"configurable": {"thread_id": "conversation-42"}},
+)
+await interpreter.aclose()
+```
+
+The prompt includes live async signatures and active limits. Selected tools can
+be awaited from Monty. These nested calls bypass the parent ToolNode, so parent
+per-tool approval does not run. See
+[Deep Agents interpreter middleware](deepagents.md).
+
+### Keep large context outside the model
+
+```python
+from arenero import RLM, RLMConfig, adapt_langchain_model
+
+rlm = RLM(
+    adapt_langchain_model(chat_model),
+    config=RLMConfig(max_depth=1, max_model_calls=32),
+)
+
+async with async_kernel:
+    result = await rlm.complete(
+        async_kernel,
+        long_text,
+        "Compare all claims and report conflicts.",
+    )
+
+print(result.response)
+```
+
+The root model writes Monty code that inspects `context`. It can await
+`llm_query` for a plain subquery or `rlm_query` for a child with its own temporary
+REPL. See [Recursive Language Models](rlm.md).
 
 ### Use Python and virtual shell cells through one API
 
@@ -373,8 +458,10 @@ narrow host function, or choose a container when the package itself is required.
 kernel.execute("thread-1", "import helper")
 ```
 
-Use `execute_file("thread-1", "/helper.py", code="...")`. Arenero feeds the
-source into the current session; it does not create a module.
+Use `execute_file("thread-1", "/helper.py", code="...")` for one flat helper.
+Use `execute_module("thread-1", "/main.py", code="...")` when a bounded static
+graph needs supported imports. Direct `kernel.execute(..., "import helper")`
+still cannot load virtual files.
 
 ### Dynamic execution and namespace inspection
 
@@ -501,10 +588,18 @@ UTF-8. The first Monty read caches the complete file in that file object.
 
 ## Agent tool guidance
 
+Agent integrations can also expose selected application, LangChain, Pydantic AI,
+or promoted MCP tools as keyword-only functions inside the REPL. The generated
+catalog gives the model exact aliases and common argument types. Per-operation
+limits and `host_calls` records cover nested calls. Code-execution and control
+tools are excluded by default. See
+[Hosted tools and code-mode composition](hosted-tools.md).
+
 The optional adapter returns these tools:
 
 - `python_repl`
 - `python_repl_execute_file`
+- `python_repl_execute_module`
 - `virtual_shell`
 - `read_file`
 - `write_file`
@@ -524,8 +619,10 @@ A useful model instruction is:
 ```text
 Use python_repl for small calculations and plain-data transforms. It runs Monty's
 Python subset, not CPython. State remains available in later calls in this thread.
-Use python_repl_execute_file for a known virtual .py helper file; do not import the
-file. Use !COMMAND or %%shell only for the documented Arenero virtual shell. It
+Use python_repl_execute_file for one known flat virtual .py helper file. Use
+python_repl_execute_module for a small bounded graph with supported static
+imports. Direct Monty imports cannot load virtual files. Use !COMMAND or %%shell
+only for the documented Arenero virtual shell. It
 does not run host executables, Git, package tools, environment expansion, command
 substitution, or automatic globs. Use file tools for structured file results. Use
 small output_limit_chars values when full output is not needed, and use an
@@ -543,11 +640,16 @@ Kernel results separate:
 - `stdout`
 - `stderr`
 - `error`
+- stable `error.code`, `error.hint`, and `error.recovery`
 - per-field `truncated` values
 - state save and restore status
+- requested `state_policy`
 - session revision
 - retry guidance
 - output-file status
+- execution ID, timing, state sizes, and original output sizes in `stats`
+- materialized MCP paths in `mcp_artifacts`
+- bounded nested hosted-tool records in `host_calls`
 
 Cell results add common `mode`, `output`, `exit_code`, and `truncation` fields for
 Python and shell calls. Applications should check `ok` or `exit_code` before they
@@ -556,6 +658,15 @@ use output. They must check truncation before they treat output as complete.
 An error marked `retryable` can be corrected by the caller. A terminal resource
 failure resets the saved session. A normal code error can preserve changes made
 before the error.
+
+Use `kernel.capabilities()` to get exact active commands, limits, persistence,
+network, MCP, bootstrap, and sync or async rules. Use `kernel.instructions()` to
+generate prompt-ready text from the same report. See
+[Quality-of-life APIs](quality-of-life.md) for bound sessions, state policies,
+forking, bootstrap, REPL commands, runtime ownership, doctor, events, and MCP
+artifact materialization.
+See [Hosted tools and code-mode composition](hosted-tools.md) for tool catalogs,
+framework adapters, MCP promotion, budgets, restart behavior, and telemetry.
 
 ## Production checklist
 
@@ -566,6 +677,9 @@ before the error.
   output, shell, and network limits for the workload.
 - Enable type checking and provide exact stubs when model retry quality matters.
 - Keep host functions narrow, bounded, and free of returned secrets.
+- Set hosted call, wall-time, concurrency, record, and preview limits.
+- For RLMs, set depth, model-call, context, prompt, response, transcript, token,
+  cost, concurrency, and wall-time limits. Provide enough Monty workers.
 - Restrict or disable `curl` when the agent can access sensitive data.
 - Give the model the exact shell and Monty limits.
 - Check error, retry, and truncation fields in every adapter.
@@ -581,4 +695,6 @@ before the error.
 - [Virtual shell reference](virtual-shell.md)
 - [Sandbox compatibility](sandbox-compatibility.md)
 - [MCP tools inside the REPL](mcp.md)
+- [Hosted tools and code-mode composition](hosted-tools.md)
+- [Recursive Language Models](rlm.md)
 - [Design decisions](design-decisions.md)

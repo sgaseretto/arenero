@@ -1,14 +1,16 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
 from .async_kernel import AsyncPersistentMontyKernel
+from .hosted_tools import HostedToolConfig
 from .kernel import PersistentMontyKernel
 from .langchain_filesystem_tools import create_filesystem_tools
+from .langchain_hosted_tools import hosted_tools_from_langchain
 from .sandbox import VIRTUAL_SHELL_TOOL_DESCRIPTION, AreneroSandbox
 
 SessionIdResolver = Callable[[ToolRuntime], str | None]
@@ -37,15 +39,30 @@ available in later calls with the same agent thread ID. This tool accepts Monty'
 limited Python subset only; !COMMAND and %%shell cells are not supported. Use
 fs_read, fs_write, fs_edit, fs_mkdir, fs_delete, fs_ls, fs_glob, and fs_grep for
 virtual files. Await application async host functions. When MCP is configured,
-also await mcp_servers(), mcp_search(), mcp_describe(), mcp_refresh(), and
-mcp_call(). Check ok, error, and truncated before using a result. This small
+also await mcp_servers(), mcp_search(), mcp_describe(), mcp_promote(),
+mcp_refresh(), and mcp_call(). Check ok, error, error.recovery, truncated, and
+host_calls before using a result. This small
 native async adapter does not support output-file offloading.
+"""
+
+VIRTUAL_MODULE_TOOL_DESCRIPTION = """Resolve and run a limited static Python
+module graph from the shared virtual filesystem. This is not CPython importlib.
+It supports absolute or relative top-level imports of .py files, package entry
+files named __init__.py, normal Monty standard-library imports, and optional
+follow-up code in the same call. Public entry names remain in the persistent REPL.
+It rejects wildcard imports, imports inside functions or control-flow blocks,
+circular imports, dynamic imports, site-packages, native extensions, and paths
+outside configured virtual roots. The default limits are 32 files, depth 8, and
+1,000,000 combined UTF-8 source bytes. Generated module support code is not type
+checked. File and hosted-tool side effects are not rolled back with Python state.
 """
 
 
 def create_python_repl_tools(
     kernel: PersistentMontyKernel,
     session_id_resolver: SessionIdResolver | None = None,
+    hosted_tools: Sequence[BaseTool] = (),
+    hosted_tool_config: HostedToolConfig | None = None,
 ) -> list[BaseTool]:
     """Create persistent Python tools for LangChain or LangGraph.
 
@@ -53,14 +70,21 @@ def create_python_repl_tools(
         kernel: Kernel used by every generated tool.
         session_id_resolver: Optional function that maps tool runtime data to a
             kernel session ID.
+        hosted_tools: LangChain tools callable from inside the REPL.
+        hosted_tool_config: Optional nested-call and record limits.
 
     Returns:
         Execute-code, execute-file, virtual-shell, filesystem, and reset tools.
     """
     resolve_session_id = session_id_resolver or _default_session_id
-    repl_description = PYTHON_REPL_TOOL_DESCRIPTION
+    repl_description = f"{PYTHON_REPL_TOOL_DESCRIPTION}\n\n{kernel.instructions()}"
     if kernel.mcp_hub is not None:
         repl_description = f"{repl_description}\n\n{kernel.mcp_hub.instructions}"
+    hosted_catalog = hosted_tools_from_langchain(
+        hosted_tools, limits=hosted_tool_config
+    ).catalog(async_mode=False)
+    if hosted_catalog:
+        repl_description = f"{repl_description}\n\n{hosted_catalog}"
 
     @tool("python_repl", description=repl_description)
     def python_repl(
@@ -95,6 +119,20 @@ def create_python_repl_tools(
                 )
             ),
         ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(
+                description=(
+                    "State save policy. always keeps changes before errors; "
+                    "success saves only successful cells; never does not save "
+                    "Python state. File changes are never rolled back."
+                )
+            ),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this cell when true."),
+        ] = False,
     ) -> dict[str, Any]:
         """Run one persistent Python or notebook-style shell cell.
 
@@ -103,6 +141,8 @@ def create_python_repl_tools(
             runtime: LangChain runtime that identifies the current thread.
             output_limit_chars: Optional output limit requested by the model.
             output_file: Optional virtual path for larger bounded output.
+            state_policy: State save policy for Python execution.
+            restart: Reset Python state before this cell when true.
 
         Returns:
             A result with ``mode=python`` or ``mode=shell``.
@@ -114,6 +154,14 @@ def create_python_repl_tools(
             code,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools_from_langchain(
+                hosted_tools,
+                config=runtime.config,
+                runtime=runtime,
+                limits=hosted_tool_config,
+            ),
         )
 
     @tool("python_repl_execute_file")
@@ -159,6 +207,14 @@ def create_python_repl_tools(
                 )
             ),
         ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(description="State save policy for this file execution."),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this file when true."),
+        ] = False,
     ) -> dict[str, Any]:
         """Run a virtual Python file and optional follow-up code.
 
@@ -168,6 +224,8 @@ def create_python_repl_tools(
             code: Optional code that runs after the file succeeds.
             output_limit_chars: Optional output limit requested by the model.
             output_file: Optional virtual path for larger bounded output.
+            state_policy: State save policy for this operation.
+            restart: Reset Python state before this file when true.
 
         Returns:
             A structured result for the final code that ran.
@@ -182,6 +240,72 @@ def create_python_repl_tools(
                 code,
                 output_limit_chars,
                 output_file=output_file,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools_from_langchain(
+                    hosted_tools,
+                    config=runtime.config,
+                    runtime=runtime,
+                    limits=hosted_tool_config,
+                ),
+            )
+        )
+
+    @tool("python_repl_execute_module", description=VIRTUAL_MODULE_TOOL_DESCRIPTION)
+    def python_repl_execute_module(
+        entry_path: Annotated[
+            str,
+            Field(min_length=1, description="Absolute virtual entry .py file."),
+        ],
+        runtime: ToolRuntime,
+        code: Annotated[
+            str | None,
+            Field(description="Optional follow-up code that can use public exports."),
+        ] = None,
+        output_limit_chars: Annotated[
+            int | None,
+            Field(ge=0, description="Optional maximum characters per output field."),
+        ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(description="State save policy for this module execution."),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this module when true."),
+        ] = False,
+    ) -> dict[str, Any]:
+        """Resolve and run a limited static virtual module graph.
+
+        Args:
+            entry_path: Absolute virtual entry ``.py`` file.
+            runtime: LangChain runtime that identifies the current thread.
+            code: Optional follow-up code.
+            output_limit_chars: Optional caller output limit.
+            state_policy: State save policy for this operation.
+            restart: Reset Python state before the module when true.
+
+        Returns:
+            Structured module execution result.
+        """
+
+        session_id = resolve_session_id(runtime)
+        if session_id is None:
+            return _missing_thread_id()
+        return dict(
+            kernel.execute_module(
+                session_id,
+                entry_path,
+                code,
+                output_limit_chars,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools_from_langchain(
+                    hosted_tools,
+                    config=runtime.config,
+                    runtime=runtime,
+                    limits=hosted_tool_config,
+                ),
             )
         )
 
@@ -265,6 +389,7 @@ def create_python_repl_tools(
     return [
         python_repl,
         python_repl_execute_file,
+        python_repl_execute_module,
         virtual_shell,
         *filesystem_tools,
         reset_python_repl,
@@ -274,20 +399,31 @@ def create_python_repl_tools(
 def create_async_python_repl_tools(
     kernel: AsyncPersistentMontyKernel,
     session_id_resolver: SessionIdResolver | None = None,
+    hosted_tools: Sequence[BaseTool] = (),
+    hosted_tool_config: HostedToolConfig | None = None,
 ) -> list[BaseTool]:
     """Create native async Python tools for LangChain or LangGraph.
 
     Args:
         kernel: Native async kernel used by every generated tool.
         session_id_resolver: Optional runtime-to-session mapping function.
+        hosted_tools: LangChain tools callable from inside the REPL.
+        hosted_tool_config: Optional nested-call and record limits.
 
     Returns:
-        Async execute-code, execute-file, and reset tools.
+        Async execute-code, execute-file, execute-module, and reset tools.
     """
     resolve_session_id = session_id_resolver or _default_session_id
-    repl_description = ASYNC_PYTHON_REPL_TOOL_DESCRIPTION
+    repl_description = (
+        f"{ASYNC_PYTHON_REPL_TOOL_DESCRIPTION}\n\n{kernel.instructions()}"
+    )
     if kernel.mcp_hub is not None:
         repl_description = f"{repl_description}\n\n{kernel.mcp_hub.async_instructions}"
+    hosted_catalog = hosted_tools_from_langchain(
+        hosted_tools, limits=hosted_tool_config
+    ).catalog(async_mode=True)
+    if hosted_catalog:
+        repl_description = f"{repl_description}\n\n{hosted_catalog}"
 
     @tool("python_repl", description=repl_description)
     async def python_repl(
@@ -300,6 +436,14 @@ def create_async_python_repl_tools(
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
         ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(description="State save policy for this execution."),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this cell when true."),
+        ] = False,
     ) -> dict[str, Any]:
         """Run one persistent Monty cell.
 
@@ -307,6 +451,8 @@ def create_async_python_repl_tools(
             code: Monty-compatible Python source.
             runtime: LangChain runtime that identifies the current thread.
             output_limit_chars: Optional caller output limit.
+            state_policy: State save policy for this operation.
+            restart: Reset Python state before this cell when true.
 
         Returns:
             Structured kernel execution data.
@@ -319,6 +465,14 @@ def create_async_python_repl_tools(
                 session_id,
                 code,
                 output_limit_chars,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools_from_langchain(
+                    hosted_tools,
+                    config=runtime.config,
+                    runtime=runtime,
+                    limits=hosted_tool_config,
+                ),
             )
         )
 
@@ -337,6 +491,14 @@ def create_async_python_repl_tools(
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
         ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(description="State save policy for this file execution."),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this file when true."),
+        ] = False,
     ) -> dict[str, Any]:
         """Run a virtual Python file and optional follow-up code.
 
@@ -345,6 +507,8 @@ def create_async_python_repl_tools(
             runtime: LangChain runtime that identifies the current thread.
             code: Optional follow-up code.
             output_limit_chars: Optional caller output limit.
+            state_policy: State save policy for this operation.
+            restart: Reset Python state before this file when true.
 
         Returns:
             Structured result for the final code that ran.
@@ -358,6 +522,72 @@ def create_async_python_repl_tools(
                 file_path,
                 code,
                 output_limit_chars,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools_from_langchain(
+                    hosted_tools,
+                    config=runtime.config,
+                    runtime=runtime,
+                    limits=hosted_tool_config,
+                ),
+            )
+        )
+
+    @tool("python_repl_execute_module", description=VIRTUAL_MODULE_TOOL_DESCRIPTION)
+    async def python_repl_execute_module(
+        entry_path: Annotated[
+            str,
+            Field(min_length=1, description="Absolute virtual entry .py file."),
+        ],
+        runtime: ToolRuntime,
+        code: Annotated[
+            str | None,
+            Field(description="Optional follow-up code that can use public exports."),
+        ] = None,
+        output_limit_chars: Annotated[
+            int | None,
+            Field(ge=0, description="Optional maximum characters per output field."),
+        ] = None,
+        state_policy: Annotated[
+            Literal["always", "success", "never"],
+            Field(description="State save policy for this module execution."),
+        ] = "always",
+        restart: Annotated[
+            bool,
+            Field(description="Reset Python state before this module when true."),
+        ] = False,
+    ) -> dict[str, Any]:
+        """Resolve and run a limited static virtual module graph.
+
+        Args:
+            entry_path: Absolute virtual entry ``.py`` file.
+            runtime: LangChain runtime that identifies the current thread.
+            code: Optional follow-up code.
+            output_limit_chars: Optional caller output limit.
+            state_policy: State save policy for this operation.
+            restart: Reset Python state before the module when true.
+
+        Returns:
+            Structured module execution result.
+        """
+
+        session_id = resolve_session_id(runtime)
+        if session_id is None:
+            return _missing_thread_id()
+        return dict(
+            await kernel.execute_module(
+                session_id,
+                entry_path,
+                code,
+                output_limit_chars,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools_from_langchain(
+                    hosted_tools,
+                    config=runtime.config,
+                    runtime=runtime,
+                    limits=hosted_tool_config,
+                ),
             )
         )
 
@@ -381,7 +611,12 @@ def create_async_python_repl_tools(
             "message": "The Python session was reset.",
         }
 
-    return [python_repl, python_repl_execute_file, reset_python_repl]
+    return [
+        python_repl,
+        python_repl_execute_file,
+        python_repl_execute_module,
+        reset_python_repl,
+    ]
 
 
 def _default_session_id(runtime: ToolRuntime) -> str | None:
@@ -411,7 +646,10 @@ def _missing_thread_id() -> dict[str, Any]:
         "ok": False,
         "error": {
             "type": "MissingThreadId",
+            "code": "missing_thread_id",
             "message": "The graph call must include a thread_id.",
+            "hint": "Set configurable.thread_id on the graph call.",
             "retryable": False,
+            "recovery": "stop",
         },
     }

@@ -1,8 +1,9 @@
 # Arenero
 
 Arenero is a persistent Python tool built on
-[Monty](https://github.com/pydantic/monty). It can run as a terminal REPL or as a
-LangChain and LangGraph tool.
+[Monty](https://github.com/pydantic/monty). It can run as a terminal REPL, a
+LangChain and LangGraph tool, or the external environment for a Recursive
+Language Model (RLM).
 
 Each session can use in-memory, SQLite, or stateless storage. In-memory storage is
 the default kernel mode. It keeps variables and functions across agent loops and
@@ -19,6 +20,12 @@ flowchart LR
     Kernel <--> Store["Memory, SQLite, or stateless session store"]
     Kernel <--> Files["Virtual files or persistent workspace"]
     Kernel --> MCP["Optional configured MCP tools"]
+    Kernel --> Hosted["Selected application and framework tools"]
+    Kernel --> Modules["Bounded static virtual modules"]
+    Kernel --> QoL["Capabilities, events, statistics, and bound sessions"]
+    Interface --> RLM["Recursive model runner"]
+    RLM --> Kernel
+    RLM --> Model["Configured async model adapter"]
 ```
 
 The kernel is the shared control point for limits, session state, and virtual
@@ -33,10 +40,12 @@ Arenero is a good fit when an agent needs a small, persistent computation space:
 - Calculate, filter, join, and transform plain Python values.
 - Read and change bounded virtual files.
 - Reuse a virtual Python helper file with `execute_file()`.
+- Resolve a small static graph of virtual Python files with `execute_module()`.
 - Run short allowlisted text pipelines.
 - Fetch bounded public HTTP or HTTPS data through virtual `curl`.
 - Call narrow application functions without giving Python ambient host access.
 - Discover and compose user-configured MCP tools from persistent Python.
+- Keep large model input in Monty and make bounded plain or recursive model calls.
 
 Use a container, VM, or managed code sandbox when the work needs full CPython,
 third-party packages, Git, package installation, system test tools, compilers,
@@ -56,6 +65,20 @@ arbitrary executables, or a real shell.
   utilities expected by Deep Agents sandboxes.
 - [MCP tools inside the REPL](docs/mcp.md) explains configured servers,
   progressive discovery, composition, persistence, limits, and security.
+- [Hosted tools and code-mode composition](docs/hosted-tools.md) explains plain
+  callables, LangChain, Pydantic AI, MCP promotion, budgets, catalogs, records,
+  restart behavior, and OpenTelemetry events.
+- [Deep Agents interpreter middleware](docs/deepagents.md) explains async agent
+  integration, dynamic tool discovery, programmatic composition, session modes,
+  subagents, and checkpoint snapshots.
+- [Recursive Language Models](docs/rlm.md) explains external context, plain and
+  recursive model calls, child sessions, budgets, worker needs, adapters, and
+  filesystem limits.
+- [Static virtual modules](docs/virtual-modules.md) explains module resolution,
+  examples, limits, and differences from CPython imports.
+- [Quality-of-life APIs](docs/quality-of-life.md) explains capability reports,
+  bound sessions, state policies, forks, bootstrap, runtime ownership, doctor,
+  events, statistics, REPL commands, and MCP artifacts.
 - [Design decisions](docs/design-decisions.md) records why persistence, typing,
   output, async, locking, and dependencies work as they do.
 
@@ -72,7 +95,10 @@ optional integrations that an application needs:
 ```console
 uv add arenero
 uv add "arenero[langchain]"
+uv add "arenero[deepagents]"
 uv add "arenero[mcp]"
+uv add "arenero[pydantic-ai]"
+uv add "arenero[observability]"
 ```
 
 ## Terminal REPL
@@ -94,6 +120,8 @@ uv run arenero --type-check
 uv run arenero --list-sessions
 uv run arenero --prune-sessions
 uv run arenero --session research --reset
+uv run arenero doctor
+uv run arenero --doctor
 ```
 
 `--workspace` mounts a persistent host directory at `/workspace` and starts new
@@ -169,6 +197,83 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Deep Agents interpreter middleware
+
+The `deepagents` extra provides an async middleware with live tool declarations,
+programmatic tool composition, three state lifetimes, optional checkpoint-backed
+snapshots, and a limited virtual-module tool:
+
+```python
+from arenero import create_deepagents_middleware
+from deepagents import create_deep_agent
+
+interpreter = create_deepagents_middleware(
+    mode="thread",
+    ptc=("search", "lookup_customer"),
+)
+agent = create_deep_agent(
+    model="openai:gpt-5.5",
+    tools=[search, lookup_customer],
+    middleware=[interpreter],
+)
+
+result = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "Analyze these results."}]},
+    {"configurable": {"thread_id": "conversation-42"}},
+)
+await interpreter.aclose()
+```
+
+Use `ainvoke()` or `astream()`. Programmatic calls run inside the approved outer
+interpreter call, so they do not pass through the parent ToolNode or its per-tool
+approval middleware. See [Deep Agents interpreter middleware](docs/deepagents.md)
+before enabling tools with side effects.
+
+### Recursive Language Models
+
+`RLM` keeps the full input in Monty and lets generated code make bounded plain
+or recursive model calls. Every recursive child gets a separate temporary REPL:
+
+```python
+from langchain.chat_models import init_chat_model
+
+from arenero import (
+    AsyncPersistentMontyKernel,
+    KernelConfig,
+    RLM,
+    RLMConfig,
+    adapt_langchain_model,
+)
+
+model = init_chat_model("openai:gpt-5.5")
+rlm = RLM(
+    adapt_langchain_model(model),
+    config=RLMConfig(max_depth=1, max_model_calls=32),
+)
+kernel = AsyncPersistentMontyKernel(
+    config=KernelConfig(
+        max_worker_processes=4,
+        worker_checkout_timeout_seconds=5,
+    )
+)
+
+async with kernel:
+    answer = await rlm.complete(
+        kernel,
+        long_text,
+        "Find and explain the conflicting claims.",
+    )
+
+print(answer.response)
+print(answer.usage.to_dict())
+```
+
+Pass `rlm=rlm` to `create_deepagents_middleware()` to expose `llm_query`,
+`llm_query_batched`, `rlm_query`, `rlm_query_batched`, and `rlm_usage` inside the
+agent interpreter. Recursive children need free Monty workers. They use inherited
+hosted file tools for shared files because direct kernel filesystem mounts are
+disabled in child sessions. See [Recursive Language Models](docs/rlm.md).
+
 Monty's worker pool is the backpressure control. When no worker becomes free
 before `worker_checkout_timeout_seconds`, Arenero returns a retryable
 `WorkerCheckoutTimeout` result. Do not add an application semaphore unless the
@@ -177,7 +282,7 @@ application needs a lower limit than the Monty pool.
 Async host functions must be called with `await` in Monty code. The async kernel
 also exposes `await mcp_call(...)` when it has an `McpHub`.
 
-The optional native async agent adapter contains three tools:
+The optional native async agent adapter contains four tools:
 
 ```python
 from arenero import create_async_python_repl_tools
@@ -187,14 +292,16 @@ tools = create_async_python_repl_tools(kernel)
 
 - `python_repl`
 - `python_repl_execute_file`
+- `python_repl_execute_module`
 - `reset_python_repl`
 
 This small adapter does not claim virtual shell support. Use
 `AsyncAreneroSandbox` when an async application needs the full synchronous
-sandbox API through worker threads. The native async kernel also omits host-side
-upload, download, session listing, and output-file offloading methods. Agents can
-still use the virtual `fs_*` functions inside Python and can run a helper with
-`execute_file()`.
+sandbox API through worker threads. The native async kernel has bounded host-side
+download support for static module resolution. It still omits upload, session
+listing, and output-file offloading methods. Agents can use virtual `fs_*`
+functions inside Python, run one helper with `execute_file()`, or run a bounded
+static graph with `execute_module()`.
 
 The kernel uses `InMemorySessionStore` when no store is given. Select another mode
 with an explicit store:
@@ -238,8 +345,39 @@ stateless_kernel = PersistentMontyKernel(StatelessSessionStore())
     },
     "state_saved": True,
     "state_restored": True,
+    "session_restarted": False,
+    "stats": {"execution_id": "...", "wall_time_seconds": 0.01},
+    "host_calls": {"count": 0, "items": [], "truncated": False},
 }
 ```
+
+Errors also include stable `code`, `hint`, `retryable`, and `recovery` fields.
+See [Quality-of-life APIs](docs/quality-of-life.md) for the full result contract.
+
+## Hosted tools inside Python
+
+Arenero can expose selected plain functions, LangChain tools, Pydantic AI tools,
+and promoted MCP tools as guarded keyword-only functions inside the REPL. It
+generates a live catalog, applies per-operation call and wall-time limits, and
+returns bounded `host_calls` records.
+
+```python
+from arenero import HostedToolSet, PersistentMontyKernel
+
+
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers."""
+
+    return a * b
+
+
+hosted = HostedToolSet.from_callables([multiply])
+with PersistentMontyKernel(hosted_tools=hosted) as kernel:
+    print(kernel.execute("agent-1", "multiply(a=6, b=7)")["result"])
+```
+
+See [Hosted tools and code-mode composition](docs/hosted-tools.md) for framework
+adapters, selection, budgets, type-check limits, MCP promotion, and telemetry.
 
 ## LangChain and LangGraph
 
@@ -249,6 +387,8 @@ The adapter creates these tools:
   current graph thread.
 - `python_repl_execute_file` runs a virtual Python file and optional follow-up
   code in one tool call.
+- `python_repl_execute_module` resolves a bounded static virtual module graph and
+  optional follow-up code in one tool call.
 - `virtual_shell` runs allowlisted commands against the virtual filesystem.
 - `reset_python_repl` removes that thread's Python state.
 
@@ -307,6 +447,8 @@ agent = create_agent(
         "Use python_repl for calculations, temporary data, and !COMMAND or "
         "%%shell virtual shell cells. Use "
         "python_repl_execute_file when a known virtual Python file must be loaded. "
+        "Use python_repl_execute_module when a small set of virtual .py files "
+        "uses supported static imports. "
         "Use virtual_shell for short virtual file pipelines. Use the file tools "
         "when a structured result is easier to use."
     ),
@@ -334,9 +476,10 @@ The application controls two limits:
 - `default_output_limit_chars` is used when a tool call does not request a limit.
 - `max_output_limit_chars` is the hard maximum that a tool call cannot exceed.
 
-The `python_repl`, `python_repl_execute_file`, and `virtual_shell` tools expose
-`output_limit_chars` to the model. The model can use a smaller value when it only
-needs a short answer:
+The `python_repl`, `python_repl_execute_file`,
+`python_repl_execute_module`, and `virtual_shell` tools expose
+`output_limit_chars` to the model. The model can use a smaller value when it
+only needs a short answer:
 
 ```json
 {
@@ -554,6 +697,26 @@ result = kernel.call_filesystem(
 )
 ```
 
+Bind a session when one application flow uses the same ID many times:
+
+```python
+with PersistentMontyKernel(config=config) as kernel:
+    session = kernel.session("agent-1")
+    session.execute("values = [10, 20, 30]")
+    result = session.execute("sum(values)", state_policy="success")
+    experiment = session.fork("agent-1-experiment")
+
+    capabilities = kernel.capabilities()
+    model_text = kernel.instructions()
+```
+
+Kernel errors include stable `error.code`, `error.hint`, and `error.recovery`
+fields. Python results include an execution ID, wall time, worker checkout wait,
+state sizes, original output sizes in `stats`, and nested tool records in
+`host_calls`. See the
+[quality-of-life API reference](docs/quality-of-life.md) for full behavior and
+limitations.
+
 `edit_file` uses exact text replacement. By default, the old text must occur once.
 Set `replace_all=true` to replace every occurrence. Recursive deletion is off by
 default, and the virtual root `/` cannot be deleted.
@@ -630,6 +793,11 @@ Agents receive the same feature as `python_repl_execute_file`:
 The file source stays between Arenero and Monty. It is not returned to the model,
 and the output limit does not shorten it. This is file execution, not normal Python
 module importing. Names defined by the file enter the current REPL namespace.
+
+For supported static imports between several virtual files, use
+`execute_module()` or `python_repl_execute_module`. See
+[Static virtual modules](docs/virtual-modules.md). Direct Monty code still cannot
+import a virtual file.
 
 ## Persistence and recovery
 

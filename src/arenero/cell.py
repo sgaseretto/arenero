@@ -1,7 +1,10 @@
 import json
+import shlex
+from dataclasses import asdict
 from typing import Any
 
-from .kernel import PersistentMontyKernel
+from .hosted_tools import HostedToolSet
+from .kernel import PersistentMontyKernel, StatePolicy
 from .shell import ShellResult, VirtualShell
 
 
@@ -12,6 +15,9 @@ def execute_repl_cell(
     output_limit_chars: int | None = None,
     *,
     output_file: str | None = None,
+    state_policy: StatePolicy = "always",
+    restart: bool = False,
+    hosted_tools: HostedToolSet | None = None,
 ) -> dict[str, Any]:
     """Execute one Python or notebook-style shell cell.
 
@@ -21,21 +27,41 @@ def execute_repl_cell(
         code: Monty Python, one ``!command``, or a ``%%shell`` cell.
         output_limit_chars: Optional result limit below the application hard cap.
         output_file: Optional absolute virtual path used when output is trimmed.
+        state_policy: State save policy for Python and ``%run`` execution.
+        restart: Reset Python state before an executable cell when true.
+        hosted_tools: Optional tools for this operation only.
 
     Returns:
         Python execution fields with ``mode=python``, or shell execution fields
         with ``mode=shell``.
     """
+    magic = _magic_command(
+        kernel,
+        session_id,
+        code,
+        output_limit_chars,
+        output_file,
+        state_policy,
+        restart,
+        hosted_tools,
+    )
+    if magic is not None:
+        return magic
+
     command, error = _shell_command(code)
     if error is not None:
         return _shell_result(kernel, ShellResult(error, 2), output_limit_chars)
     if command is not None:
+        if restart:
+            kernel.reset(session_id)
         result = VirtualShell(kernel, session_id).execute(
             command,
             output_limit_chars,
             output_file=output_file,
         )
-        return _shell_result(kernel, result, output_limit_chars)
+        shell_result = _shell_result(kernel, result, output_limit_chars)
+        shell_result["session_restarted"] = restart
+        return shell_result
 
     execution: dict[str, Any] = dict(
         kernel.execute(
@@ -43,6 +69,9 @@ def execute_repl_cell(
             code,
             output_limit_chars,
             output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
         )
     )
     execution["mode"] = "python"
@@ -53,6 +82,180 @@ def execute_repl_cell(
         "output": any(execution["truncated"].values()),
     }
     return execution
+
+
+def _magic_command(
+    kernel: PersistentMontyKernel,
+    session_id: str,
+    code: str,
+    output_limit_chars: int | None,
+    output_file: str | None,
+    state_policy: StatePolicy,
+    restart: bool,
+    hosted_tools: HostedToolSet | None,
+) -> dict[str, Any] | None:
+    """Dispatch one supported single-line percent command.
+
+    Args:
+        kernel: Kernel that owns the session.
+        session_id: Current bound session ID.
+        code: Raw REPL cell source.
+        output_limit_chars: Optional caller output limit.
+        output_file: Optional virtual path for trimmed execution output.
+        state_policy: State save policy for ``%run``.
+        restart: Reset state before ``%run`` when true.
+        hosted_tools: Optional tools for ``%run``.
+
+    Returns:
+        Command result, or ``None`` when this is not a percent command.
+    """
+    if not code.startswith("%") or code.startswith("%%"):
+        return None
+    if "\n" in code:
+        return _command_result(
+            False,
+            None,
+            "Percent commands must use one line.",
+            "invalid_repl_command",
+            "Use one of %run, %reset, %limits, %sessions, or %mcp.",
+        )
+    try:
+        arguments = shlex.split(code[1:])
+    except ValueError as exc:
+        return _command_result(
+            False,
+            None,
+            str(exc),
+            "invalid_repl_command",
+            "Check the command quoting and try again.",
+        )
+    if not arguments:
+        return _command_result(
+            False,
+            None,
+            "Missing percent command.",
+            "invalid_repl_command",
+            "Use one of %run, %reset, %limits, %sessions, or %mcp.",
+        )
+    name, values = arguments[0], arguments[1:]
+    if name == "run" and len(values) == 1:
+        execution: dict[str, Any] = dict(
+            kernel.execute_file(
+                session_id,
+                values[0],
+                output_limit_chars=output_limit_chars,
+                output_file=output_file,
+                state_policy=state_policy,
+                restart=restart,
+                hosted_tools=hosted_tools,
+            )
+        )
+        execution["mode"] = "command"
+        execution["exit_code"] = 0 if execution["ok"] else 1
+        execution["output"] = _python_output(execution)
+        execution["truncation"] = {
+            **execution["truncated"],
+            "output": any(execution["truncated"].values()),
+        }
+        return execution
+    if name == "reset" and not values:
+        existed = kernel.reset(session_id)
+        return _command_result(True, {"reset": existed})
+    if name == "limits" and not values:
+        return _command_result(True, kernel.capabilities())
+    if name == "sessions" and not values:
+        info = kernel.get_session_info(session_id)
+        return _command_result(
+            True,
+            {"current_session": asdict(info) if info is not None else None},
+        )
+    if name == "mcp" and not values:
+        if kernel.mcp_hub is None:
+            return _command_result(
+                False,
+                None,
+                "No MCP hub is configured.",
+                "mcp_unavailable",
+                "Configure an McpHub on the kernel before you use %mcp.",
+            )
+        return _command_result(True, kernel.mcp_hub.servers())
+    return _command_result(
+        False,
+        None,
+        f"Unsupported percent command or arguments: %{name}",
+        "invalid_repl_command",
+        "Use %run FILE, %reset, %limits, %sessions, or %mcp.",
+    )
+
+
+def _command_result(
+    ok: bool,
+    value: Any,
+    message: str | None = None,
+    code: str = "repl_command_error",
+    hint: str = "Check the command and try again.",
+) -> dict[str, Any]:
+    """Build one stable small REPL command result.
+
+    Args:
+        ok: Whether the command succeeded.
+        value: Command result value.
+        message: Optional error message.
+        code: Stable error code.
+        hint: Recovery guidance.
+
+    Returns:
+        Common REPL result fields.
+    """
+    output = "" if value is None else json.dumps(value, ensure_ascii=False)
+    if message is not None:
+        output = message
+    error = None
+    if not ok:
+        error = {
+            "type": "ReplCommandError",
+            "code": code,
+            "message": message or "REPL command failed",
+            "hint": hint,
+            "retryable": False,
+            "recovery": "revise_code",
+        }
+    return {
+        "mode": "command",
+        "ok": ok,
+        "result": value,
+        "output": output,
+        "stdout": output if ok else "",
+        "stderr": "" if ok else output,
+        "error": error,
+        "exit_code": 0 if ok else 1,
+        "truncated": {
+            "result": False,
+            "stdout": False,
+            "stderr": False,
+            "error": False,
+        },
+        "truncation": {
+            "result": False,
+            "output": False,
+            "stdout": False,
+            "stderr": False,
+            "error": False,
+        },
+        "output_limit_chars": 0,
+        "limit_was_capped": False,
+        "state_saved": False,
+        "state_restored": False,
+        "session_revision": None,
+        "retryable": False,
+        "output_file": None,
+        "output_file_error": None,
+        "state_policy": "never",
+        "session_restarted": False,
+        "stats": None,
+        "mcp_artifacts": [],
+        "host_calls": {"count": 0, "items": [], "truncated": False},
+    }
 
 
 def _shell_command(code: str) -> tuple[str | None, str | None]:
@@ -96,7 +299,9 @@ def _shell_result(
     if not ok:
         error = {
             "type": "ShellError",
+            "code": "shell_error",
             "message": result.output,
+            "hint": "Use only commands and syntax listed by the virtual shell help command.",
             "retryable": False,
         }
     return {
@@ -124,6 +329,9 @@ def _shell_result(
         "retryable": False,
         "output_file": result.output_file,
         "output_file_error": result.output_file_error,
+        "state_policy": "never",
+        "stats": None,
+        "mcp_artifacts": [],
     }
 
 

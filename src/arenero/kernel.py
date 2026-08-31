@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
 import threading
+import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Self, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict
 
 from pydantic_monty import (
     CollectStreams,
@@ -22,6 +25,7 @@ from pydantic_monty import (
     TypeCheckFormat,
 )
 
+from .events import EventSink, emit_event
 from .filesystem import (
     FILESYSTEM_TYPE_CHECK_STUBS,
     FilesystemConfig,
@@ -30,6 +34,9 @@ from .filesystem import (
     build_filesystem_call,
     build_filesystem_prelude,
 )
+from .hosted_tools import HostedToolScope, HostedToolSet
+from .mcp_artifacts import materialize_mcp_artifacts
+from .modules import VirtualModuleConfig, VirtualModuleResolver
 from .network import NetworkConfig
 from .store import (
     ConcurrentSessionUpdate,
@@ -41,14 +48,34 @@ from .workspace import WorkspaceConfig
 
 if TYPE_CHECKING:
     from .mcp import McpHub
+    from .session import SessionHandle
+
+StatePolicy = Literal["always", "success", "never"]
+RecoveryAction = Literal[
+    "none", "retry_same_call", "revise_code", "restart_session", "retry_later", "stop"
+]
 
 
 class ExecutionError(TypedDict):
     """Describe an execution error returned to a caller."""
 
     type: str
+    code: str
     message: str
+    hint: str
     retryable: bool
+    recovery: RecoveryAction
+
+
+class ExecutionStatistics(TypedDict):
+    """Describe timing, state, and original output sizes."""
+
+    execution_id: str
+    wall_time_seconds: float
+    checkout_wait_seconds: float
+    state_before_bytes: int
+    state_after_bytes: int
+    original_output_chars: dict[str, int]
 
 
 class TruncationInfo(TypedDict):
@@ -77,6 +104,33 @@ class ExecutionResult(TypedDict):
     retryable: bool
     output_file: str | None
     output_file_error: str | None
+    state_policy: StatePolicy
+    session_restarted: bool
+    stats: ExecutionStatistics
+    mcp_artifacts: list[str]
+    host_calls: dict[str, Any]
+
+
+@dataclass
+class _ExecutionMetrics:
+    """Collect mutable metrics while one kernel operation runs.
+
+    Attributes:
+        execution_id: Unique host-generated operation ID.
+        started_at: Monotonic operation start time.
+        checkout_wait_seconds: Time spent waiting for a Monty worker.
+        state_before_bytes: Loaded snapshot size.
+        state_after_bytes: New snapshot size, or zero when not dumped.
+        session_restarted: Whether saved state was reset for this operation.
+    """
+
+    execution_id: str
+    started_at: float
+    checkout_wait_seconds: float = 0.0
+    state_before_bytes: int = 0
+    state_after_bytes: int = 0
+    session_restarted: bool = False
+    hosted_scope: HostedToolScope | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +239,11 @@ class PersistentMontyKernel:
         network_config: NetworkConfig | None = None,
         workspace: WorkspaceConfig | None = None,
         mcp_hub: McpHub | None = None,
+        hosted_tools: HostedToolSet | None = None,
+        bootstrap_code: str | None = None,
+        bootstrap_files: tuple[str, ...] = (),
+        event_sink: EventSink | None = None,
+        mcp_artifact_directory: str | None = None,
     ) -> None:
         """Create a persistent Monty kernel.
 
@@ -200,6 +259,12 @@ class PersistentMontyKernel:
             workspace: Optional persistent directory mounted at a virtual path.
             mcp_hub: Optional configured MCP client hub. The caller owns its
                 lifecycle and must close it after the kernel.
+            hosted_tools: Optional schema-aware host functions for Monty code.
+            bootstrap_code: Trusted code run once when a new session starts.
+            bootstrap_files: Virtual Python files run once for each new session.
+            event_sink: Optional observer for safe execution and session metadata.
+            mcp_artifact_directory: Optional virtual directory for binary MCP
+                content returned as the final Python value.
         """
 
         self.store = store if store is not None else InMemorySessionStore()
@@ -210,11 +275,27 @@ class PersistentMontyKernel:
         self.network_config = network_config or NetworkConfig()
         self.workspace = workspace
         self.mcp_hub = mcp_hub
+        self.hosted_tools = hosted_tools or HostedToolSet()
+        self.bootstrap_code = bootstrap_code
+        self.bootstrap_files = tuple(bootstrap_files)
+        self.event_sink = event_sink
+        self.mcp_artifact_directory = mcp_artifact_directory
+        if any(not path.startswith("/") for path in self.bootstrap_files):
+            raise ValueError("bootstrap file paths must be absolute virtual paths")
+        if mcp_artifact_directory is not None and not mcp_artifact_directory.startswith(
+            "/"
+        ):
+            raise ValueError("mcp_artifact_directory must be an absolute virtual path")
         if mcp_hub is not None:
             collisions = self.external_lookup.keys() & mcp_hub.host_functions().keys()
             if collisions:
                 names = ", ".join(sorted(collisions))
                 raise ValueError(f"external_lookup uses reserved MCP names: {names}")
+        hosted_names = {tool.alias for tool in self.hosted_tools.tools}
+        collisions = self.external_lookup.keys() & hosted_names
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise ValueError(f"external_lookup uses hosted tool names: {names}")
         self._owned_mount: MountDir | None = None
         configured_mounts = _mount_list(mounts)
         if workspace is not None:
@@ -230,7 +311,8 @@ class PersistentMontyKernel:
             host_stubs = "\n".join(
                 value for value in (host_stubs, mcp_hub.type_check_stubs) if value
             )
-        self._type_check_stubs = _type_check_stubs(host_stubs)
+        self._base_type_check_stubs = host_stubs
+        self._type_check_stubs = self._operation_type_check_stubs(self.hosted_tools)
         self.monty_version = importlib.metadata.version("pydantic-monty")
         try:
             self._pool_context = Monty(
@@ -287,7 +369,123 @@ class PersistentMontyKernel:
             ``True`` when saved state existed.
         """
         with self._lock_for(session_id), self.filesystem_guard():
-            return self.store.delete(session_id)
+            deleted = self.store.delete(session_id)
+        emit_event(
+            self.event_sink,
+            "session",
+            "reset",
+            session_id=session_id,
+            existed=deleted,
+        )
+        return deleted
+
+    def session(self, session_id: str) -> SessionHandle:
+        """Bind this kernel to one session ID.
+
+        Args:
+            session_id: Session key with 1 to 255 characters.
+
+        Returns:
+            A bound ``SessionHandle``.
+        """
+        from .session import SessionHandle
+
+        return SessionHandle(self, session_id)
+
+    def capabilities(self) -> dict[str, Any]:
+        """Return active limits and integration capabilities.
+
+        Returns:
+            JSON-compatible capability data without secrets.
+        """
+        from .capabilities import capability_report
+
+        return capability_report(self)
+
+    def instructions(self) -> str:
+        """Generate model instructions from the active configuration.
+
+        Returns:
+            Plain model instructions with the capability report.
+        """
+        from .capabilities import model_instructions
+
+        return model_instructions(self)
+
+    def fork_session(self, source_id: str, target_id: str) -> SessionInfo:
+        """Copy one saved Python snapshot to a new session.
+
+        Args:
+            source_id: Existing session to copy.
+            target_id: New session that receives the snapshot.
+
+        Returns:
+            Metadata for the new session.
+
+        Raises:
+            ValueError: If IDs are invalid, equal, missing, or already used.
+            RuntimeError: If the configured store does not save state.
+        """
+        _validate_session_id(source_id)
+        _validate_session_id(target_id)
+        if source_id == target_id:
+            raise ValueError("source and target session IDs must differ")
+        if not self.store.stores_state:
+            raise RuntimeError("the configured store does not save session state")
+        with ExitStack() as stack:
+            for session_id in sorted((source_id, target_id)):
+                stack.enter_context(self._lock_for(session_id))
+            source = self.store.load(
+                source_id,
+                max_age_seconds=self.config.session_ttl_seconds,
+            )
+            if source is None:
+                raise ValueError(f"source session does not exist: {source_id}")
+            if source.monty_version != self.monty_version:
+                raise ValueError("source session uses a different Monty version")
+            if self.store.load(target_id) is not None:
+                raise ValueError(f"target session already exists: {target_id}")
+            revision = self.store.save(
+                target_id,
+                source.state,
+                source.monty_version,
+                expected_revision=None,
+            )
+        assert revision is not None
+        info = self.get_session_info(target_id)
+        assert info is not None
+        emit_event(
+            self.event_sink,
+            "session",
+            "forked",
+            source_session_id=source_id,
+            target_session_id=target_id,
+            state_size_bytes=len(source.state),
+        )
+        return info
+
+    def materialize_mcp_artifacts(
+        self,
+        value: Any,
+        directory: str = "/mcp-artifacts",
+    ) -> tuple[Any, list[str]]:
+        """Write binary MCP result blocks to the virtual filesystem.
+
+        Args:
+            value: Normalized MCP result or a value that contains one.
+            directory: Absolute virtual destination directory.
+
+        Returns:
+            Copied value with virtual paths and the written path list.
+        """
+        materialized, paths = materialize_mcp_artifacts(
+            value,
+            self.upload_file,
+            directory,
+        )
+        for path in paths:
+            emit_event(self.event_sink, "filesystem", "artifact_written", path=path)
+        return materialized, paths
 
     def delete_expired(self) -> int:
         """Delete sessions older than the configured lifetime.
@@ -332,6 +530,9 @@ class PersistentMontyKernel:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
         """Execute one code snippet in a persistent session.
 
@@ -340,6 +541,9 @@ class PersistentMontyKernel:
             code: Monty-compatible Python code to execute.
             output_limit_chars: Optional output limit requested by the caller.
             output_file: Optional absolute virtual path used when output is trimmed.
+            state_policy: Save state ``always``, only on ``success``, or ``never``.
+            restart: Reset state before this execution when true.
+            hosted_tools: Optional tools available for this operation only.
 
         Returns:
             A structured execution result.
@@ -350,6 +554,9 @@ class PersistentMontyKernel:
             output_limit_chars,
             file_path=None,
             output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
         )
 
     def execute_file(
@@ -360,6 +567,9 @@ class PersistentMontyKernel:
         output_limit_chars: int | None = None,
         *,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
         """Execute a virtual Python file and optional follow-up code.
 
@@ -370,6 +580,9 @@ class PersistentMontyKernel:
                 defined by the file.
             output_limit_chars: Optional output limit requested by the caller.
             output_file: Optional absolute virtual path used when output is trimmed.
+            state_policy: Save state ``always``, only on ``success``, or ``never``.
+            restart: Reset state before this execution when true.
+            hosted_tools: Optional tools available for this operation only.
 
         Returns:
             A structured result for the file or the follow-up code when supplied.
@@ -380,6 +593,9 @@ class PersistentMontyKernel:
             output_limit_chars,
             file_path=file_path,
             output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
         )
 
     def download_file(
@@ -414,7 +630,78 @@ class PersistentMontyKernel:
         result = self._run_isolated(source)
         if not isinstance(result, bytes):
             raise TypeError("the virtual file did not return binary content")
+        emit_event(
+            self.event_sink,
+            "filesystem",
+            "downloaded",
+            path=path,
+            size_bytes=len(result),
+        )
         return result
+
+    def execute_module(
+        self,
+        session_id: str,
+        entry_path: str,
+        code: str | None = None,
+        output_limit_chars: int | None = None,
+        *,
+        module_config: VirtualModuleConfig | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
+    ) -> ExecutionResult:
+        """Resolve and execute a static virtual module graph.
+
+        Args:
+            session_id: Session key with 1 to 255 characters.
+            entry_path: Absolute virtual entry ``.py`` file.
+            code: Optional follow-up code in the same feed.
+            output_limit_chars: Optional caller output limit.
+            module_config: Optional module roots, aliases, and limits.
+            state_policy: State save policy for this operation.
+            restart: Reset saved Python state before execution when true.
+            hosted_tools: Optional tools for this operation only.
+
+        Returns:
+            Structured result for the bundle or follow-up code.
+        """
+
+        def load(path: str) -> str | None:
+            """Read one candidate virtual module as UTF-8 text.
+
+            Args:
+                path: Absolute candidate file path.
+
+            Returns:
+                Source text, or ``None`` when the file is not readable.
+            """
+
+            try:
+                return self.download_file(path).decode()
+            except MontyError:
+                return None
+
+        try:
+            bundle = VirtualModuleResolver(load, module_config).bundle(entry_path, code)
+        except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
+            return self._error_result(
+                "VirtualModuleError",
+                str(exc),
+                output_limit_chars,
+                state_policy=state_policy,
+            )
+        return self._execute(
+            session_id,
+            bundle.code,
+            output_limit_chars,
+            file_path=None,
+            output_file=None,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
+            skip_type_check=True,
+        )
 
     def upload_file(
         self,
@@ -458,6 +745,13 @@ class PersistentMontyKernel:
         )
         if not isinstance(result, int):
             raise TypeError("the virtual file write did not return a byte count")
+        emit_event(
+            self.event_sink,
+            "filesystem",
+            "uploaded",
+            path=path,
+            size_bytes=result,
+        )
         return result
 
     def call_filesystem(
@@ -480,7 +774,16 @@ class PersistentMontyKernel:
             A structured execution result.
         """
         code = build_filesystem_call(operation, arguments)
-        return self.execute(session_id, code, output_limit_chars)
+        result = self.execute(session_id, code, output_limit_chars)
+        emit_event(
+            self.event_sink,
+            "filesystem",
+            "operation",
+            session_id=session_id,
+            operation=operation,
+            ok=result["ok"],
+        )
+        return result
 
     def _execute(
         self,
@@ -490,6 +793,88 @@ class PersistentMontyKernel:
         *,
         file_path: str | None,
         output_file: str | None,
+        state_policy: StatePolicy,
+        restart: bool,
+        hosted_tools: HostedToolSet | None,
+        skip_type_check: bool = False,
+    ) -> ExecutionResult:
+        """Run one measured kernel operation.
+
+        Args:
+            session_id: Session key used to load, lock, and save state.
+            code: Code to execute directly or after a virtual file.
+            output_limit_chars: Optional output limit requested by the caller.
+            file_path: Optional virtual Python file to execute first.
+            output_file: Optional virtual path for bounded untrimmed output.
+            state_policy: State save policy for this operation.
+            restart: Whether to reset state before this operation.
+            hosted_tools: Optional operation-only hosted tools.
+            skip_type_check: Disable checking for generated support code.
+
+        Returns:
+            A structured execution result with stable statistics.
+        """
+        metrics = _ExecutionMetrics(uuid.uuid4().hex, time.monotonic())
+        emit_event(
+            self.event_sink,
+            "execution",
+            "started",
+            execution_id=metrics.execution_id,
+            session_id=session_id,
+            state_policy=state_policy,
+            source="file" if file_path is not None else "code",
+        )
+        result = self._execute_operation(
+            session_id,
+            code,
+            output_limit_chars,
+            file_path=file_path,
+            output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
+            skip_type_check=skip_type_check,
+            metrics=metrics,
+        )
+        result["session_restarted"] = metrics.session_restarted
+        result["host_calls"] = (
+            metrics.hosted_scope.summary()
+            if metrics.hosted_scope is not None
+            else {"count": 0, "items": [], "truncated": False}
+        )
+        stats = result["stats"]
+        stats["execution_id"] = metrics.execution_id
+        stats["wall_time_seconds"] = time.monotonic() - metrics.started_at
+        stats["checkout_wait_seconds"] = metrics.checkout_wait_seconds
+        stats["state_before_bytes"] = metrics.state_before_bytes
+        stats["state_after_bytes"] = metrics.state_after_bytes
+        emit_event(
+            self.event_sink,
+            "execution",
+            "finished",
+            execution_id=metrics.execution_id,
+            session_id=session_id,
+            ok=result["ok"],
+            error_code=result["error"]["code"] if result["error"] else None,
+            wall_time_seconds=stats["wall_time_seconds"],
+            checkout_wait_seconds=stats["checkout_wait_seconds"],
+            state_saved=result["state_saved"],
+        )
+        return result
+
+    def _execute_operation(
+        self,
+        session_id: str,
+        code: str | None,
+        output_limit_chars: int | None,
+        *,
+        file_path: str | None,
+        output_file: str | None,
+        state_policy: StatePolicy,
+        restart: bool,
+        hosted_tools: HostedToolSet | None,
+        skip_type_check: bool,
+        metrics: _ExecutionMetrics,
     ) -> ExecutionResult:
         """Run feeds and save their final state once.
 
@@ -499,26 +884,51 @@ class PersistentMontyKernel:
             output_limit_chars: Optional output limit requested by the caller.
             file_path: Optional virtual Python file to execute first.
             output_file: Optional virtual path for bounded untrimmed output.
+            state_policy: State save policy for this operation.
+            restart: Whether to delete saved state before loading.
+            hosted_tools: Optional operation-only hosted tools.
+            skip_type_check: Disable checking for generated support code.
+            metrics: Mutable execution statistics.
 
         Returns:
             A structured execution result.
         """
         if self._closed:
             raise RuntimeError("the kernel is closed")
+        if state_policy not in {"always", "success", "never"}:
+            return self._error_result(
+                "InvalidStatePolicy",
+                "state_policy must be 'always', 'success', or 'never'",
+                output_limit_chars,
+                state_policy="never",
+            )
         if not session_id or len(session_id) > 255:
             return self._error_result(
                 "InvalidSessionId",
                 "session_id must contain 1 to 255 characters",
                 output_limit_chars,
+                state_policy=state_policy,
             )
 
         limit, limit_was_capped = self._output_limit(output_limit_chars)
         with self._lock_for(session_id), self.filesystem_guard():
+            if restart:
+                existed = self.store.delete(session_id)
+                metrics.session_restarted = True
+                emit_event(
+                    self.event_sink,
+                    "session",
+                    "reset",
+                    session_id=session_id,
+                    existed=existed,
+                    execution_id=metrics.execution_id,
+                )
             stored = self.store.load(
                 session_id,
                 max_age_seconds=self.config.session_ttl_seconds,
             )
             restored = stored is not None
+            metrics.state_before_bytes = len(stored.state) if stored else 0
 
             if stored is not None and stored.monty_version != self.monty_version:
                 return self._error_result(
@@ -529,41 +939,84 @@ class PersistentMontyKernel:
                     ),
                     output_limit_chars,
                     state_restored=True,
+                    state_policy=state_policy,
                 )
 
             streams = CollectStreams(max_bytes=self.config.max_stream_bytes)
             result: Any = None
             execution_error: MontyError | None = None
+            error_type_override: str | None = None
             terminal_resource_error = False
+            bootstrap_failed = False
             state: bytes | None = None
+            try:
+                operation_tools = self._operation_hosted_tools(hosted_tools)
+                external_lookup = self._operation_external_lookup(
+                    metrics, operation_tools
+                )
+            except (TypeError, ValueError) as exc:
+                return self._result(
+                    result=None,
+                    streams=streams,
+                    error_type="HostedToolConfigurationError",
+                    error_message=str(exc),
+                    retryable=False,
+                    limit=limit,
+                    limit_was_capped=limit_was_capped,
+                    state_saved=False,
+                    state_restored=restored,
+                    revision=stored.revision if stored else None,
+                    output_file=output_file,
+                    state_policy=state_policy,
+                )
 
             try:
+                checkout_started = time.monotonic()
                 with self._pool.checkout(
                     script_name=f"<arenero:{session_id}>",
                     limits=self._resource_limits(),
-                    type_check=self.config.type_check,
-                    type_check_stubs=self._type_check_stubs,
+                    type_check=(
+                        False
+                        if skip_type_check
+                        else self._operation_type_check_enabled(operation_tools)
+                    ),
+                    type_check_stubs=self._operation_type_check_stubs(operation_tools),
                     type_check_format=self.config.type_check_format,
                 ) as session:
+                    metrics.checkout_wait_seconds = time.monotonic() - checkout_started
                     if stored is not None:
                         session.load_session(stored.state)
 
+                    phase = "bootstrap"
                     try:
-                        result = self._run(
+                        self._prepare_session(
                             session,
                             streams,
-                            code,
-                            file_path,
-                            self._operation_external_lookup(),
+                            external_lookup,
+                            new_session=stored is None,
+                        )
+                        phase = "execution"
+                        result = self._run(
+                            session, streams, code, file_path, external_lookup
                         )
                     except InfrastructureErrors:
                         raise
                     except MontyError as exc:
                         execution_error = exc
                         terminal_resource_error = _is_terminal_resource_error(exc)
+                        if phase == "bootstrap":
+                            bootstrap_failed = True
+                            error_type_override = "SessionBootstrapError"
 
-                    if self.store.stores_state and not terminal_resource_error:
+                    if (
+                        self.store.stores_state
+                        and not terminal_resource_error
+                        and not bootstrap_failed
+                        and state_policy != "never"
+                        and (state_policy == "always" or execution_error is None)
+                    ):
                         state = session.dump()
+                        metrics.state_after_bytes = len(state)
             except InfrastructureErrors as exc:
                 if isinstance(exc, MontyCrashedError):
                     self.store.delete(session_id)
@@ -579,8 +1032,10 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
             except TimeoutError as exc:
+                metrics.checkout_wait_seconds = time.monotonic() - checkout_started
                 return self._result(
                     result=None,
                     streams=streams,
@@ -593,6 +1048,7 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
             except MontyError as exc:
                 return self._result(
@@ -607,6 +1063,7 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
 
             if terminal_resource_error:
@@ -623,6 +1080,7 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
 
             if state is None:
@@ -630,16 +1088,18 @@ class PersistentMontyKernel:
                     result=result,
                     streams=streams,
                     error_type=(
-                        type(execution_error).__name__ if execution_error else None
+                        error_type_override
+                        or (type(execution_error).__name__ if execution_error else None)
                     ),
                     error_message=str(execution_error) if execution_error else None,
                     retryable=False,
                     limit=limit,
                     limit_was_capped=limit_was_capped,
                     state_saved=False,
-                    state_restored=False,
-                    revision=None,
+                    state_restored=restored,
+                    revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
 
             if len(state) > self.config.max_state_bytes:
@@ -659,6 +1119,7 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
 
             try:
@@ -683,6 +1144,7 @@ class PersistentMontyKernel:
                     state_restored=restored,
                     revision=stored.revision if stored else None,
                     output_file=output_file,
+                    state_policy=state_policy,
                 )
 
             return self._result(
@@ -697,7 +1159,44 @@ class PersistentMontyKernel:
                 state_restored=restored,
                 revision=revision,
                 output_file=output_file,
+                state_policy=state_policy,
             )
+
+    def _prepare_session(
+        self,
+        session: MontySession,
+        streams: CollectStreams,
+        external_lookup: dict[str, Any] | None,
+        *,
+        new_session: bool,
+    ) -> None:
+        """Install helpers and run configured startup sources for a new session.
+
+        Args:
+            session: Active Monty session.
+            streams: Output collector shared by all feeds.
+            external_lookup: Host functions for the operation.
+            new_session: Whether no saved snapshot was loaded.
+        """
+        self._feed(
+            session,
+            streams,
+            self._filesystem_prelude,
+            external_lookup,
+            skip_type_check=True,
+        )
+        if not new_session:
+            return
+        for path in self.bootstrap_files:
+            source = self._feed(
+                session,
+                streams,
+                f"open({json.dumps(path)}).read()",
+                external_lookup,
+            )
+            self._feed(session, streams, source, external_lookup)
+        if self.bootstrap_code:
+            self._feed(session, streams, self.bootstrap_code, external_lookup)
 
     def _run(
         self,
@@ -719,13 +1218,6 @@ class PersistentMontyKernel:
         Returns:
             The value of the last feed that ran.
         """
-        self._feed(
-            session,
-            streams,
-            self._filesystem_prelude,
-            external_lookup,
-            skip_type_check=True,
-        )
         if file_path is None:
             return self._feed(session, streams, code or "", external_lookup)
 
@@ -770,18 +1262,81 @@ class PersistentMontyKernel:
             skip_type_check=skip_type_check,
         )
 
+    def _operation_hosted_tools(
+        self, operation_tools: HostedToolSet | None
+    ) -> HostedToolSet:
+        """Combine configured, promoted MCP, and operation-only tools.
+
+        Args:
+            operation_tools: Optional tools supplied by one framework call.
+
+        Returns:
+            Complete hosted tool set for one execution.
+        """
+
+        promoted = self.mcp_hub.promoted_toolset() if self.mcp_hub is not None else None
+        return self.hosted_tools.merged(promoted, operation_tools)
+
     def _operation_external_lookup(
         self,
+        metrics: _ExecutionMetrics,
+        hosted_tools: HostedToolSet,
     ) -> dict[str, Any] | None:
-        """Build host functions with a fresh MCP call budget.
+        """Build host functions with fresh MCP and hosted-tool budgets.
+
+        Args:
+            metrics: Current execution statistics.
+            hosted_tools: Tools selected for this operation.
 
         Returns:
             Host functions for one complete kernel operation, or ``None``.
         """
+
         lookup = dict(self.external_lookup)
         if self.mcp_hub is not None:
             lookup.update(self.mcp_hub.host_functions())
+        if hosted_tools.tools:
+            scope = hosted_tools.sync_scope(metrics.execution_id, self.event_sink)
+            hosted_lookup = scope.sync_lookup()
+            collisions = lookup.keys() & hosted_lookup.keys()
+            if collisions:
+                names = ", ".join(sorted(collisions))
+                raise ValueError(
+                    f"hosted tool names conflict with host functions: {names}"
+                )
+            lookup.update(hosted_lookup)
+            metrics.hosted_scope = scope
         return lookup or None
+
+    def _operation_type_check_stubs(self, hosted_tools: HostedToolSet) -> str:
+        """Build type stubs for one operation's exact host functions.
+
+        Args:
+            hosted_tools: Tools selected for this operation.
+
+        Returns:
+            Filesystem, MCP, application, and hosted-tool declarations.
+        """
+
+        hosted_stubs = hosted_tools.type_check_stubs(async_mode=False)
+        host_stubs = "\n".join(
+            value for value in (self._base_type_check_stubs, hosted_stubs) if value
+        )
+        return _type_check_stubs(host_stubs)
+
+    def _operation_type_check_enabled(self, hosted_tools: HostedToolSet) -> bool:
+        """Disable checking when an operation adds functions to a saved session.
+
+        Args:
+            hosted_tools: Complete hosted tool set for this operation.
+
+        Returns:
+            ``True`` when the session's stable stub set covers all hosted tools.
+        """
+
+        configured = {tool.alias for tool in self.hosted_tools.tools}
+        active = {tool.alias for tool in hosted_tools.tools}
+        return self.config.type_check and active <= configured
 
     def _run_isolated(
         self,
@@ -888,6 +1443,7 @@ class PersistentMontyKernel:
         message: str,
         requested_limit: int | None,
         state_restored: bool = False,
+        state_policy: StatePolicy = "always",
     ) -> ExecutionResult:
         """Build a result for an error outside normal code execution.
 
@@ -896,6 +1452,7 @@ class PersistentMontyKernel:
             message: Human-readable error details.
             requested_limit: Output limit requested by the caller.
             state_restored: Whether saved state was loaded before the error.
+            state_policy: State save policy requested by the caller.
 
         Returns:
             A structured failed execution result.
@@ -913,6 +1470,7 @@ class PersistentMontyKernel:
             state_saved=False,
             state_restored=state_restored,
             revision=None,
+            state_policy=state_policy,
         )
 
     def _result(
@@ -929,6 +1487,7 @@ class PersistentMontyKernel:
         state_restored: bool,
         revision: int | None,
         output_file: str | None = None,
+        state_policy: StatePolicy = "always",
     ) -> ExecutionResult:
         """Build and trim the public execution result.
 
@@ -944,10 +1503,17 @@ class PersistentMontyKernel:
             state_restored: Whether this operation loaded Python state.
             revision: Saved session revision, when available.
             output_file: Optional virtual path for bounded untrimmed output.
+            state_policy: State save policy for this operation.
 
         Returns:
             A structured execution result.
         """
+        artifacts: list[str] = []
+        if self.mcp_artifact_directory is not None and result is not None:
+            result, artifacts = self.materialize_mcp_artifacts(
+                result,
+                self.mcp_artifact_directory,
+            )
         public_result, payload = _prepare_execution_result(
             result=result,
             streams=streams,
@@ -960,7 +1526,9 @@ class PersistentMontyKernel:
             state_restored=state_restored,
             revision=revision,
             output_file=output_file,
+            state_policy=state_policy,
         )
+        public_result["mcp_artifacts"] = artifacts
         if payload is not None and output_file is not None:
             try:
                 self.upload_file(output_file, payload)
@@ -984,6 +1552,7 @@ def _prepare_execution_result(
     state_restored: bool,
     revision: int | None,
     output_file: str | None,
+    state_policy: StatePolicy = "always",
 ) -> tuple[ExecutionResult, bytes | None]:
     """Build one public result and optional untrimmed output payload.
 
@@ -999,6 +1568,7 @@ def _prepare_execution_result(
         state_restored: Whether this operation loaded Python state.
         revision: Saved session revision, when available.
         output_file: Optional virtual path for bounded untrimmed output.
+        state_policy: State save policy for this operation.
 
     Returns:
         Public result and an output payload when trimmed data must be saved.
@@ -1013,16 +1583,25 @@ def _prepare_execution_result(
     full_error: ExecutionError | None = None
     error_trimmed = False
     if error_type is not None and error_message is not None:
+        error_code = _error_code(error_type, error_message)
+        error_hint = _error_hint(error_type, error_message, retryable)
+        recovery = _recovery_action(error_type, error_message, retryable)
         full_error = {
             "type": error_type,
+            "code": error_code,
             "message": error_message,
+            "hint": error_hint,
             "retryable": retryable,
+            "recovery": recovery,
         }
         short_error, error_trimmed = _trim(error_message, limit)
         error = {
             "type": error_type,
+            "code": error_code,
             "message": short_error,
+            "hint": error_hint,
             "retryable": retryable,
+            "recovery": recovery,
         }
 
     was_trimmed = result_trimmed or stdout_trimmed or stderr_trimmed or error_trimmed
@@ -1060,6 +1639,23 @@ def _prepare_execution_result(
             "retryable": retryable,
             "output_file": None,
             "output_file_error": None,
+            "state_policy": state_policy,
+            "session_restarted": False,
+            "stats": {
+                "execution_id": "",
+                "wall_time_seconds": 0.0,
+                "checkout_wait_seconds": 0.0,
+                "state_before_bytes": 0,
+                "state_after_bytes": 0,
+                "original_output_chars": {
+                    "result": _result_length(result),
+                    "stdout": len(full_stdout),
+                    "stderr": len(full_stderr),
+                    "error": len(error_message or ""),
+                },
+            },
+            "mcp_artifacts": [],
+            "host_calls": {"count": 0, "items": [], "truncated": False},
         },
         payload,
     )
@@ -1130,6 +1726,147 @@ def _json_value(value: Any) -> Any:
     except (TypeError, ValueError):
         return repr(value)
     return value
+
+
+def _result_length(value: Any) -> int:
+    """Measure the original serialized result length.
+
+    Args:
+        value: Raw Monty result value.
+
+    Returns:
+        JSON character length, or representation length for custom values.
+    """
+    if value is None:
+        return 0
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return len(repr(value))
+
+
+def _error_code(error_type: str, message: str) -> str:
+    """Return a stable machine error code.
+
+    Args:
+        error_type: Public error class name.
+        message: Human-readable error details.
+
+    Returns:
+        Lowercase snake-case error code.
+    """
+    if error_type == "VirtualModuleError":
+        return "virtual_module_error"
+    lowered = message.lower()
+    if "hosted tool call limit" in lowered:
+        return "hosted_tool_call_limit"
+    if "hosted tool" in lowered and "time limit" in lowered:
+        return "hosted_tool_time_limit"
+    if "unresolved-reference" in lowered:
+        return "unresolved_reference"
+    if "import" in lowered or "no module" in lowered:
+        return "unsupported_import"
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", error_type).lower()
+
+
+def _error_hint(error_type: str, message: str, retryable: bool) -> str:
+    """Return short recovery guidance for one execution error.
+
+    Args:
+        error_type: Public error class name.
+        message: Human-readable error details.
+        retryable: Whether a retry can succeed without changing code.
+
+    Returns:
+        Stable plain-language recovery hint.
+    """
+    if error_type == "HostedToolConfigurationError" and "async-only" in message:
+        return "Use AsyncPersistentMontyKernel for this async-only hosted tool."
+    hints = {
+        "InvalidSessionId": "Use a session ID with 1 to 255 characters.",
+        "InvalidStatePolicy": "Use state_policy='always', 'success', or 'never'.",
+        "SessionVersionError": "Reset the session, then run the code again.",
+        "WorkerCheckoutTimeout": "Retry later or increase the worker pool size.",
+        "SessionRestoreError": "Reset the session before you run more code.",
+        "SessionStateTooLarge": "Reduce saved values or reset the session.",
+        "ConcurrentSessionUpdate": "Retry this operation once.",
+        "SessionBootstrapError": "Check the trusted bootstrap code and files.",
+        "HostedToolConfigurationError": (
+            "Fix hosted tool names, schemas, or sync and async configuration."
+        ),
+        "VirtualModuleError": (
+            "Use a readable .py file and only supported static virtual imports."
+        ),
+    }
+    if error_type in hints:
+        return hints[error_type]
+    lowered = message.lower()
+    if "hosted tool call limit" in lowered:
+        return "Use fewer hosted calls or split the work across executions."
+    if "hosted tool" in lowered and "time limit" in lowered:
+        return "Use less hosted work or split the work across executions."
+    if "unresolved-reference" in lowered:
+        return (
+            "Define the name. If it is a newly added hosted tool, use restart=True "
+            "or configure it before this type-checked session starts."
+        )
+    if "import" in lowered or "no module" in lowered:
+        return "Use execute_file or %run for virtual Python files; packages are unavailable."
+    if "nameerror" in lowered or "not defined" in lowered:
+        return "Define the name or run its helper file before this code."
+    if retryable:
+        return "Retry the operation without changing the session ID."
+    return "Change the code to fit the Monty subset and the active capability report."
+
+
+def _recovery_action(error_type: str, message: str, retryable: bool) -> RecoveryAction:
+    """Return the next useful action for an execution error.
+
+    Args:
+        error_type: Public error class name.
+        message: Human-readable error details.
+        retryable: Whether the same operation can be retried.
+
+    Returns:
+        Stable recovery action for agents and framework adapters.
+    """
+
+    if error_type in {"WorkerCheckoutTimeout", "MontyDisconnectError", "MontyShutdown"}:
+        return "retry_later"
+    if error_type == "ConcurrentSessionUpdate":
+        return "retry_same_call"
+    if error_type in {"SessionVersionError", "SessionRestoreError"}:
+        return "restart_session"
+    lowered = message.lower()
+    if "hosted tool" in lowered and (
+        "call limit" in lowered or "time limit" in lowered
+    ):
+        return "revise_code"
+    if "time limit" in lowered or "memory" in lowered:
+        return "restart_session"
+    if error_type in {
+        "InvalidSessionId",
+        "InvalidStatePolicy",
+        "SessionBootstrapError",
+        "HostedToolConfigurationError",
+    }:
+        return "stop"
+    if retryable:
+        return "retry_same_call"
+    return "revise_code"
+
+
+def _validate_session_id(session_id: str) -> None:
+    """Validate one public session ID.
+
+    Args:
+        session_id: Session key to validate.
+
+    Raises:
+        ValueError: If the ID does not contain 1 to 255 characters.
+    """
+    if not session_id or len(session_id) > 255:
+        raise ValueError("session_id must contain 1 to 255 characters")
 
 
 def _is_terminal_resource_error(error: MontyError) -> bool:

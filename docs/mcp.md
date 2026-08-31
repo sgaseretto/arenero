@@ -77,7 +77,7 @@ async def call_tool() -> dict:
             )
 ```
 
-Use `await` with all five MCP functions in the native async kernel. The hub keeps
+Use `await` with all six MCP functions in the native async kernel. The hub keeps
 its clients on one private event loop and the kernel awaits submitted calls. One
 slow MCP call therefore does not block other async kernel sessions. Hub limits,
 allowlists, result envelopes, and per-operation budgets are the same in both
@@ -90,6 +90,7 @@ modes.
 | `mcp_servers()` | Server status and tool counts | Check which configured servers connected. |
 | `mcp_search(query, server=None, limit=20)` | Small ranked tool summaries | Discover only relevant tools. An empty query lists tools. |
 | `mcp_describe(name)` | One bounded input schema | Read exact arguments before a call. |
+| `mcp_promote(name, python_name=None)` | A direct-call declaration | Add one selected tool as a Python function on the next operation. |
 | `mcp_call(name, arguments=None)` | Bounded result envelope | Call one tool from Python. |
 | `mcp_refresh(server=None)` | Updated server and catalog status | Reconnect and reload tool lists. |
 
@@ -100,6 +101,30 @@ the matching qualified names.
 The LangChain and LangGraph `python_repl` description includes the correct sync
 or async forms when its kernel has an MCP hub. Other agent adapters can give
 `mcp.instructions` or `mcp.async_instructions` to the model.
+
+### Promote a selected tool
+
+After discovery, an agent can promote one tool instead of keeping the generic
+name-and-dictionary call form:
+
+```python
+mcp_promote("crm__find_customer", python_name="find_customer")
+```
+
+The result contains the exact sync and async declarations. The new function is
+available on the next `execute()` operation:
+
+```python
+customer = find_customer(email="person@example.com")
+```
+
+The function still returns the normal MCP result envelope and still uses all MCP
+limits. Promotion fails when the selected JSON Schema cannot become a valid
+keyword-only Python signature. Promoted names live in the host process and must
+be recreated after a process restart. Arenero does not predeclare the full MCP
+catalog. When a saved type-checked session does not know the new alias, run its
+first call with `restart=True`, or use a fresh or forked session. See
+[Hosted tools and code-mode composition](hosted-tools.md#mcp-promotion).
 
 ## Progressive discovery and composition
 
@@ -144,9 +169,10 @@ def customer_summary(customer_id):
 A later human turn can call `customer_summary(...)` with the same `session_id`.
 Arenero reattaches fresh MCP host functions when it restores the Monty snapshot.
 
-The agent can also write the helper to a virtual `.py` file and load it with
-`execute_file()`. This is a small skill-building pattern, but it is not a package
-or module system. There is no dynamic import, `eval`, or `exec` inside Monty.
+The agent can also write one flat helper to a virtual `.py` file and load it with
+`execute_file()`. For a small static helper graph, it can use `execute_module()`.
+This remains host-side bounded source resolution, not Monty importlib. There is
+no dynamic import, `eval`, or `exec` inside Monty.
 
 Live MCP connections are not in the snapshot. Keep the `McpHub` active for later
 turns. After an application restart, create a new hub with the same configured
@@ -167,7 +193,7 @@ sequenceDiagram
     H-->>M: Bounded summaries
     M->>H: mcp_describe(server__tool)
     H-->>M: One bounded schema
-    M->>H: mcp_call(server__tool, arguments)
+    M->>H: mcp_call(...) or a promoted function
     H->>S: MCP tools/call
     S-->>H: MCP content and structured content
     H-->>M: Plain bounded envelope
@@ -199,8 +225,20 @@ copying their Base64 data a second time. The original Base64 data stays in its
 content block when the complete result fits the limit.
 
 If a result is too large, Arenero removes large structured values and binary data
-and keeps a small text preview when possible. Always check `truncated`. Arenero
-does not yet write an MCP blob to the virtual filesystem automatically.
+and keeps a small text preview when possible. Always check `truncated`.
+
+The synchronous kernel can write image, audio, and embedded-resource Base64 blocks
+to virtual files. Use `kernel.materialize_mcp_artifacts(result, directory)` for a
+host-side MCP result. Set `mcp_artifact_directory="/mcp-artifacts"` on the kernel
+to materialize supported blocks that become the final Python result. Written
+blocks contain `virtual_path` and `size_bytes`, and the execution result contains
+`mcp_artifacts`.
+
+Automatic materialization happens after the Monty checkout ends. It does not
+re-enter an active persistent session. It scans only the final Python value, not
+intermediate MCP calls. Data already removed by the MCP result limit cannot be
+written. The filesystem transfer limit also applies. See
+[Quality-of-life APIs](quality-of-life.md#mcp-artifact-materialization).
 
 MCP tool errors use `ok=False` and `error.type="McpToolError"`. Lookup, argument,
 limit, timeout, and transport failures also return structured errors. A host wall

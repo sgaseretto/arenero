@@ -35,9 +35,31 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
   non-global address blocking, redirect checks, and hard byte limits.
 - Put ordinary input values in `inputs`. Put tools and lazy values in `external_lookup`.
 - A callable in `external_lookup` runs in the host process with full host authority. Validate every argument as untrusted input.
+- Use `HostedToolSet` when tools need generated signatures, selection, per-operation
+  call limits, sequencing, value conversion, and a bounded `host_calls` ledger.
+- Hosted tools accept keyword arguments only. Their JSON Schema property names
+  must be valid Python identifiers. Missing schema types become `Any`.
+- Keep framework calls on their public path: `BaseTool.invoke` or `ainvoke` for
+  LangChain, the current `ToolManager` for Pydantic AI, and bounded hub calls for
+  promoted MCP tools.
+- Do not persist framework run contexts or tool callbacks in Monty. Reattach them
+  for each operation. Tool errors can hide completed side effects; do not retry
+  non-idempotent work without deduplication.
+- Monty snapshots can keep type-check state. Configure stable hosted tools before
+  a session starts. A newly added tool can require `restart=True` before an older
+  type-checked snapshot knows its name.
 - Do not make a hosted shell function re-enter the active persistent session. For
   notebook behavior, dispatch `!command` or `%%shell` before starting the Monty
   feed, then run Python or the virtual shell with the same session ID.
+- For Arenero RLMs, use `llm_query` for a plain model call and `rlm_query` for a
+  new temporary child session. Never call the active interpreter tool from
+  itself. A recursive chain needs at least one free worker per active level.
+- Recursive RLM child sessions disable direct kernel mounts and filesystem
+  callbacks because the parent feed holds the filesystem lock. Give children
+  explicit hosted file tools when they must share files.
+- Materialize MCP binary blocks only after the active Monty checkout ends. Scan
+  the final returned value or use an explicit host-side MCP result. Intermediate
+  results and data removed by MCP result limits are unavailable.
 - Prefer narrow domain tools such as `read_customer(id)` over broad primitives such as `read_file(path)`, `fetch(url)`, or `run(command)`.
 - Prefer `MountDir` for host-directory access because it provides descriptor-based confinement and path checks. Use `OSAccess` with `MemoryFile` for an in-memory virtual filesystem.
 - Use Arenero's `WorkspaceConfig` for a kernel-owned persistent read-write mount.
@@ -54,6 +76,13 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 - Compilation is outside the duration budget. Use the subprocess-backed Python or native JavaScript pool for crash isolation.
 - Treat `MemoryError`, `TimeoutError`, and worker crashes as terminal for that session. Delete its saved state and start a fresh session. `RecursionError` is not terminal.
 - Keep one execution at a time per persistent session. Use an optimistic revision check as a second guard when state is shared across processes.
+- Use `state_policy="always"` to keep valid changes before normal errors,
+  `"success"` to save only successful code, and `"never"` for temporary Python
+  state. None of these policies rolls back files or external side effects.
+- A session fork copies the opaque Monty snapshot and its remaining cumulative
+  duration budget. It does not copy files, mounts, host functions, or connections.
+- Run bootstrap files as source feeds for new sessions only. They are not imports.
+  Do not save a partly completed bootstrap.
 - Arenero serializes filesystem-capable calls across sessions in one kernel. This
   does not coordinate separate processes that share one host directory.
 - Do not restore snapshots from untrusted sources into a worker you cannot discard.
@@ -62,6 +91,11 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 
 - Expect only Monty's documented modules and partial APIs. There is no `sys.path`, site-packages, package system, or dynamic import.
 - `eval`, `exec`, `compile`, and `__import__` do not exist. To run a virtual `.py` file, read its text on the host or through the virtual filesystem, then submit that text as a new host-driven feed.
+- In Arenero, use `execute_module()` only for a small static virtual graph. It is
+  host-side AST rewriting, not a new Monty import system. It supports top-level
+  `.py` and `__init__.py` imports, relative imports, roots, and aliases. It rejects
+  dynamic, wildcard, nested, circular, and third-party imports. The generated
+  module feed skips Monty type checking.
 - Simple classes work. Inheritance, method decorators, descriptors, `super()`, and user-defined exception classes do not.
 - Generators, `match`, `del`, `async with`, `async for`, exception groups, wildcard imports, complex literals, and several other constructs do not run.
 - Some familiar operations are eager. In particular, `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions materialize lists and can consume large memory.
@@ -70,7 +104,15 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 ## Make model use effective
 
 - Put the exact supported tool signatures and Monty limits in the model instructions.
+- Put RLM depth, call, context, prompt, response, transcript, token, cost,
+  concurrency, wall-time, and worker rules in model instructions. Token and cost
+  limits enforce only usage reported by the model adapter.
 - Tell the model to write small direct snippets, use `pathlib`, use `readlines()` instead of iterating a file, and avoid unavailable imports.
+- For Deep Agents, use `AreneroInterpreterMiddleware` with `ainvoke()` or
+  `astream()`. Treat its PTC calls as nested calls that bypass the parent
+  ToolNode. Parent per-tool approval and `Command.update` handling do not apply.
+  Use its `thread`, `turn`, or `call` mode for Python state only; virtual files
+  keep their separate lifecycle.
 - Provide type-check stubs for every host function and give the same signatures to the model.
 - Enable `KernelConfig.type_check` when early agent feedback is worth the extra
   check. Put host declarations in `type_check_stubs`; Arenero supplies filesystem

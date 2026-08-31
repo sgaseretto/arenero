@@ -43,7 +43,7 @@ The core package does not import the MCP SDK. Applications import
 `McpHub` owns a private async event-loop thread so each client has one stable
 event loop for its complete lifetime. The sync kernel waits for calls on that
 loop. The native async kernel wraps the same submitted future and awaits it
-without blocking its caller event loop. Monty receives only five plain host
+without blocking its caller event loop. Monty receives only six plain host
 functions. It never receives a client, transport, credential, or async object.
 
 The kernel asks the hub for a fresh function set for each outer operation. This
@@ -65,8 +65,39 @@ flowchart TB
     Loop --> Clients["Persistent MCP clients"]
     Clients --> Servers["Configured stdio, HTTP, or in-process servers"]
     Snapshot["Monty snapshot"] -. stores helper that names mcp_call .-> Kernel
-    Snapshot -. does not store .-> Hub
+Snapshot -. does not store .-> Hub
 ```
+
+## Hosted tools keep framework execution paths
+
+Arenero uses one framework-neutral `HostedTool` shape instead of teaching the
+kernel about each agent framework. LangChain adapters call `BaseTool.invoke()` or
+`ainvoke()`. They also inject the state, store, context, and call identity that
+ToolNode normally supplies. Pydantic AI adapters call the current `ToolManager`.
+MCP promotion uses the existing bounded hub call. This keeps validation,
+callbacks, and tool-specific policy in their source framework.
+
+A LangChain call made from Monty still bypasses the parent ToolNode. Parent
+middleware that wraps ToolNode dispatch, including per-call human approval, does
+not run. The application must approve the outer interpreter call, put approval in
+the tool or subagent, or exclude the tool. Arenero states this in the generated
+model instructions instead of claiming that nested calls are normal graph calls.
+
+Each outer kernel operation creates new wrappers, budgets, and records. It does
+not persist a framework context or callback in Monty. Operation tool sets are
+merged with configured tools by using the lowest limits. Code-execution and
+control tools are excluded from normal selection to avoid accidental recursive
+execution.
+
+Monty type-check state is part of a saved session. Arenero predeclares configured
+tools. It does not load every MCP schema because that would defeat progressive
+discovery. A promoted MCP tool or operation tool can need `restart=True` before
+an older type-checked snapshot knows the new name. Arenero does not rebuild or
+edit opaque Monty snapshots.
+
+The call ledger is bounded and omits values by default. A tool error is marked as
+possibly having side effects because the host can fail after it completed work.
+Arenero does not automatically retry such calls.
 
 ## Type checking is explicit
 
@@ -75,8 +106,9 @@ feed before execution. Arenero supplies declarations for its `fs_*` helpers. The
 application supplies declarations for hosted functions through
 `type_check_stubs`.
 
-Generated filesystem support code skips checking. User code and virtual Python
-files do not skip it.
+Generated filesystem support code skips checking. Normal user code and flat
+virtual Python files do not skip it. A generated static module bundle also skips
+checking because its simple module objects need dynamic attributes.
 
 ## Cell results add common fields without removing detailed fields
 
@@ -113,11 +145,15 @@ time and supplies checkout backpressure. The session store remains synchronous,
 so the async kernel moves its short store calls to worker threads.
 
 The native async LangChain adapter stays small. It exposes Python execution,
-Python-file execution, and reset. It does not duplicate the virtual shell or all
-host-side filesystem tools. Monty code can use the existing `fs_*` helpers. This
-keeps one shell implementation and makes the smaller tool scope explicit. The
-native kernel also omits host upload, download, session listing, and output-file
-offloading methods. The full sync facade remains the one complete sandbox API.
+flat Python-file execution, static module execution, and reset. It does not
+duplicate the virtual shell or all host-side filesystem tools. Monty code can use
+the existing `fs_*` helpers. This keeps one shell implementation and makes the
+smaller tool scope explicit. The native kernel includes bounded download for
+module resolution. It still omits host upload, full session listing, output-file
+offloading, the virtual shell, and automatic MCP artifact materialization. It
+supports bound sessions, current-session info, forking, bootstrap, state policies,
+capability reports, statistics, and events. The full sync facade remains the one
+complete sandbox API.
 
 ```mermaid
 flowchart TB
@@ -146,6 +182,86 @@ experimental, and session snapshots are version-specific. A new Monty release
 must pass the unit tests, static type check, clean build, and clean core install
 before the dependency range changes.
 
+## Control APIs stay outside Monty
+
+Capability reports, percent commands, state policies, session forks, bootstrap,
+doctor checks, runtime ownership, event delivery, and artifact materialization
+are host control features. They are not new Monty language features. The cell
+dispatcher handles percent commands before a feed. Artifact materialization runs
+after a checkout ends, so it does not re-enter the active persistent session.
+
+The event sink receives metadata only and cannot change an operation result. A
+failed observer call is ignored. This keeps logging and audit integration small
+without creating a plugin lifecycle or giving model code access to the sink.
+
+## Deep Agents uses async middleware and explicit state modes
+
+The Deep Agents integration uses `AsyncPersistentMontyKernel`. An interpreter
+cell can await application tools without blocking the agent event loop, and
+independent graph threads can use the shared worker pool. The integration does
+not duplicate a synchronous execution path. A sync call returns direct guidance
+to use `ainvoke()` or `astream()`.
+
+`thread`, `turn`, and `call` modes only change Python snapshot lifetime. They do
+not change virtual-file ownership. Optional checkpoint state stores full Monty
+bytes in private graph state. Full snapshots are simpler and easier to verify
+than a custom delta format. An optional HMAC binds bytes to one stable thread
+session. This provides integrity, not confidentiality.
+
+The middleware builds its prompt from the current model request tool list. It
+does not cache a broad startup catalog because upstream middleware can filter
+tools. Explicit PTC selection is therefore checked again at execution time.
+Nested interpreter and control tools are excluded.
+
+## RLM recursion uses new sessions, not interpreter re-entry
+
+`llm_query` calls one configured async model on the host. `rlm_query` creates a
+new temporary Monty session and runs another bounded root-model loop. It does not
+call the active interpreter tool. This keeps parent Python state stable and avoids
+waiting on the parent's per-session lock.
+
+All recursive branches share one model-call ledger. Depth, calls, overlap,
+reported tokens, reported cost, prompt size, response size, transcript size, and
+wall time have explicit limits. At the depth limit, `rlm_query` becomes a plain
+model call. This gives every recursive path a fixed end condition without a
+second control system.
+
+```mermaid
+flowchart LR
+    Parent["Active parent session"] --> Hosted["await rlm_query"]
+    Hosted --> Child["New child session"]
+    Child --> ChildModel["Child root model"]
+    ChildModel --> ChildCode["Child Monty code"]
+    ChildCode --> Result["Text result"]
+    Result --> Parent
+    Parent -. "Python state is not copied" .-> Child
+```
+
+A recursive call starts while the parent Monty checkout is suspended. It needs
+another worker. Direct kernel filesystem access is disabled for recursive child
+sessions because the parent owns the process-local filesystem lock. Explicitly
+inherited hosted file tools can still share files. This narrow rule avoids a
+reentrant filesystem lock and keeps the kernel's existing serialization model.
+
+The framework-neutral RLM accepts an async model callback. Provider adapters stay
+optional. The LangChain adapter uses public `ainvoke()` and reports only usage
+that the returned message supplies.
+
+## Static virtual modules are bounded source transformation
+
+Arenero does not emulate `importlib`, `sys.path`, or site-packages. The host parses
+user source with `ast`, resolves only configured virtual roots, rejects dynamic
+or cyclic forms, and writes one dependency-first Monty feed. Each file runs in a
+loader function and exports public names through a simple object. Functions keep
+their file-local closure values instead of sharing one flat global namespace.
+
+This design adds useful helper modules without placing CPython execution in the
+sandbox or writing an import runtime in Monty. The tradeoff is an explicit small
+feature set: no wildcard or nested imports, reload, namespace packages, third-
+party packages, or type checking of the generated feed. File reads remain under
+the existing filesystem transfer limit, plus module count, depth, source-byte,
+root, and cycle checks.
+
 ## Related references
 
 - [Architecture and components](architecture.md)
@@ -153,3 +269,8 @@ before the dependency range changes.
 - [Virtual shell reference](virtual-shell.md)
 - [Sandbox compatibility](sandbox-compatibility.md)
 - [MCP tools inside the REPL](mcp.md)
+- [Hosted tools and code-mode composition](hosted-tools.md)
+- [Quality-of-life APIs](quality-of-life.md)
+- [Deep Agents interpreter middleware](deepagents.md)
+- [Recursive Language Models](rlm.md)
+- [Static virtual modules](virtual-modules.md)

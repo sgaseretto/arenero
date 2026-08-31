@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic_monty import MemoryFile, OSAccess
@@ -75,6 +76,7 @@ class LangChainToolTests(unittest.TestCase):
         self.assertIn("code", schema["properties"])
         self.assertIn("output_limit_chars", schema["properties"])
         self.assertIn("output_file", schema["properties"])
+        self.assertIn("restart", schema["properties"])
         self.assertNotIn("runtime", schema["properties"])
         self.assertIn("! or start a multiline shell cell", repl.description)
         self.assertIn("same session", repl.description)
@@ -204,6 +206,61 @@ class LangChainToolTests(unittest.TestCase):
         self.assertTrue(loaded["ok"])
         self.assertEqual(loaded["result"], 42)
         self.assertEqual(reused["result"], 10)
+
+    def test_agent_can_execute_a_static_virtual_module_graph(self) -> None:
+        """Resolve a virtual import and follow-up code in one agent call."""
+
+        self.call_tool(
+            "write_file",
+            {"path": "/main.py", "content": "from helper import double\n"},
+        )
+
+        loaded = self.call_tool(
+            "python_repl_execute_module",
+            {"entry_path": "/main.py", "code": "double(21)"},
+        )
+        reused = self.call_tool("python_repl", {"code": "double(5)"})
+
+        self.assertEqual(loaded["result"], 42)
+        self.assertEqual(reused["result"], 10)
+
+    def test_repl_can_compose_a_supplied_langchain_tool(self) -> None:
+        """Run a normal LangChain tool from code with the current runtime."""
+
+        @tool
+        def multiply(a: int, b: int) -> int:
+            """Multiply two integers."""
+
+            return a * b
+
+        tools = create_python_repl_tools(self.kernel, hosted_tools=(multiply,))
+        builder = StateGraph(MessagesState)
+        builder.add_node("tools", ToolNode(tools))
+        builder.set_entry_point("tools")
+        builder.add_edge("tools", END)
+        graph = builder.compile()
+        output = graph.invoke(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "python_repl",
+                                "args": {"code": "multiply(a=6, b=7)"},
+                                "id": "hosted-call",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            },
+            {"configurable": {"thread_id": "hosted-thread"}},
+        )
+        result = json.loads(output["messages"][-1].content)
+
+        self.assertEqual(result["result"], 42)
+        self.assertEqual(result["host_calls"]["count"], 1)
 
     def test_agent_filesystem_tools_share_files_between_threads(self) -> None:
         """Use every filesystem tool across two agent thread IDs."""
@@ -375,12 +432,17 @@ class AsyncLangChainToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(two["result"], 42)
 
     async def test_async_tool_scope_is_explicit(self) -> None:
-        """Expose Python and file execution without claiming shell support."""
+        """Expose Python, file, and module execution without shell support."""
         tools = {tool.name: tool for tool in self.tools}
 
         self.assertEqual(
             set(tools),
-            {"python_repl", "python_repl_execute_file", "reset_python_repl"},
+            {
+                "python_repl",
+                "python_repl_execute_file",
+                "python_repl_execute_module",
+                "reset_python_repl",
+            },
         )
         self.assertIn(
             "native asynchronous worker pool", tools["python_repl"].description
@@ -389,6 +451,8 @@ class AsyncLangChainToolTests(unittest.IsolatedAsyncioTestCase):
             "!COMMAND and %%shell cells are not supported",
             tools["python_repl"].description,
         )
+        module_schema = tools["python_repl_execute_module"].tool_call_schema
+        self.assertIn("entry_path", module_schema.model_json_schema()["properties"])
 
 
 if __name__ == "__main__":

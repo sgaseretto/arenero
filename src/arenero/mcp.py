@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import keyword
 import re
 import threading
 import time
@@ -12,6 +13,14 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Self
+
+from .events import EventSink, emit_event
+from .hosted_tools import (
+    HostedTool,
+    HostedToolConfig,
+    HostedToolSet,
+    python_identifier,
+)
 
 try:
     import httpx2
@@ -33,6 +42,7 @@ def mcp_search(
     limit: int = 20,
 ) -> dict[str, Any]: ...
 def mcp_describe(name: str) -> dict[str, Any]: ...
+def mcp_promote(name: str, python_name: str | None = None) -> dict[str, Any]: ...
 def mcp_refresh(server: str | None = None) -> dict[str, Any]: ...
 def mcp_call(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]: ...
 """
@@ -47,6 +57,10 @@ async def mcp_search(
     limit: int = 20,
 ) -> dict[str, Any]: ...
 async def mcp_describe(name: str) -> dict[str, Any]: ...
+async def mcp_promote(
+    name: str,
+    python_name: str | None = None,
+) -> dict[str, Any]: ...
 async def mcp_refresh(server: str | None = None) -> dict[str, Any]: ...
 async def mcp_call(
     name: str,
@@ -56,8 +70,9 @@ async def mcp_call(
 
 MCP_REPL_INSTRUCTIONS = """Configured MCP tools are available from Python.
 Use mcp_servers() to inspect server status, mcp_search(query) to discover tools,
-mcp_describe(name) to read one input schema, and mcp_call(name, arguments) to
-call it. Use the qualified server__tool name returned by search. You can call
+mcp_describe(name) to read one input schema, mcp_promote(name) to make a
+discovered tool a direct Python function on the next REPL execution, and
+mcp_call(name, arguments) to call it. Use the qualified server__tool name returned by search. You can call
 tools in loops and pass one tool result to another without returning intermediate
 data to the model. mcp_refresh() reconnects configured servers and reloads the
 catalog. The application chooses servers, credentials, limits, and allowlists.
@@ -68,7 +83,8 @@ are plain bounded dictionaries. Check ok, error, and truncated before use.
 ASYNC_MCP_REPL_INSTRUCTIONS = """Configured MCP tools are available as async
 Python functions. Use await mcp_servers() to inspect server status, await
 mcp_search(query) to discover tools, await mcp_describe(name) to read one input
-schema, and await mcp_call(name, arguments) to call it. Use qualified server__tool
+schema, await mcp_promote(name) to make it a direct function on the next REPL
+execution, and await mcp_call(name, arguments) to call it. Use qualified server__tool
 names. Await mcp_refresh() to reconnect servers. Calls return plain bounded
 dictionaries. Check ok, error, and truncated before use.
 """
@@ -309,32 +325,36 @@ class _ToolEntry:
 class McpHub:
     """Manage configured MCP clients for sync and async Monty host calls."""
 
-    type_check_stubs = MCP_TYPE_CHECK_STUBS
-    async_type_check_stubs = ASYNC_MCP_TYPE_CHECK_STUBS
     instructions = MCP_REPL_INSTRUCTIONS
     async_instructions = ASYNC_MCP_REPL_INSTRUCTIONS
+    type_check_stubs = MCP_TYPE_CHECK_STUBS
+    async_type_check_stubs = ASYNC_MCP_TYPE_CHECK_STUBS
 
     def __init__(
         self,
         servers: Sequence[McpServerConfig],
         config: McpHubConfig | None = None,
+        event_sink: EventSink | None = None,
     ) -> None:
         """Create an MCP hub without opening its connections.
 
         Args:
             servers: User-configured MCP servers. Names must be unique.
             config: Discovery, call, concurrency, and transfer limits.
+            event_sink: Optional observer for safe MCP metadata.
         """
         server_list = list(servers)
         names = [server.name for server in server_list]
         if len(names) != len(set(names)):
             raise ValueError("MCP server names must be unique")
         self.config = config or McpHubConfig()
+        self.event_sink = event_sink
         self._states = {
             server.name: _ServerState(config=server) for server in server_list
         }
         self._tools: dict[str, _ToolEntry] = {}
         self._catalog_truncated = False
+        self._promoted: dict[str, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._loop_ready = threading.Event()
@@ -421,6 +441,11 @@ class McpHub:
             """Get the bounded schema for one MCP tool."""
             return self.describe(name)
 
+        def mcp_promote(name: str, python_name: str | None = None) -> dict[str, Any]:
+            """Promote one discovered MCP tool for the next REPL execution."""
+
+            return self.promote(name, python_name=python_name)
+
         def mcp_refresh(server: str | None = None) -> dict[str, Any]:
             """Reconnect and refresh one server or the full catalog."""
             return self.refresh(server)
@@ -459,6 +484,7 @@ class McpHub:
             "mcp_servers": mcp_servers,
             "mcp_search": mcp_search,
             "mcp_describe": mcp_describe,
+            "mcp_promote": mcp_promote,
             "mcp_refresh": mcp_refresh,
             "mcp_call": mcp_call,
         }
@@ -487,6 +513,13 @@ class McpHub:
         async def mcp_describe(name: str) -> dict[str, Any]:
             """Get the bounded schema for one MCP tool."""
             return await self.async_describe(name)
+
+        async def mcp_promote(
+            name: str, python_name: str | None = None
+        ) -> dict[str, Any]:
+            """Promote one discovered MCP tool for the next REPL execution."""
+
+            return await self.async_promote(name, python_name=python_name)
 
         async def mcp_refresh(server: str | None = None) -> dict[str, Any]:
             """Reconnect and refresh one server or the full catalog."""
@@ -526,6 +559,7 @@ class McpHub:
             "mcp_servers": mcp_servers,
             "mcp_search": mcp_search,
             "mcp_describe": mcp_describe,
+            "mcp_promote": mcp_promote,
             "mcp_refresh": mcp_refresh,
             "mcp_call": mcp_call,
         }
@@ -583,6 +617,24 @@ class McpHub:
         await asyncio.to_thread(self.open)
         return await self._asubmit(
             self._describe_data(name), self.config.connect_timeout_seconds
+        )
+
+    async def async_promote(
+        self, name: str, *, python_name: str | None = None
+    ) -> dict[str, Any]:
+        """Promote one MCP tool without blocking the caller event loop.
+
+        Args:
+            name: Qualified or unambiguous MCP tool name.
+            python_name: Optional explicit Python alias.
+
+        Returns:
+            Promotion result with the next-call function declaration.
+        """
+
+        await asyncio.to_thread(self.open)
+        return await self._asubmit(
+            self._promote_data(name, python_name), self.config.connect_timeout_seconds
         )
 
     async def async_refresh(self, server: str | None = None) -> dict[str, Any]:
@@ -720,6 +772,78 @@ class McpHub:
         self.open()
         return self._submit(
             self._describe_data(name), self.config.connect_timeout_seconds
+        )
+
+    def promote(self, name: str, *, python_name: str | None = None) -> dict[str, Any]:
+        """Expose one discovered MCP tool as a direct hosted function.
+
+        Args:
+            name: Qualified or unambiguous MCP tool name.
+            python_name: Optional explicit Python alias.
+
+        Returns:
+            Promotion result with the next-call function declaration.
+        """
+
+        self.open()
+        return self._submit(
+            self._promote_data(name, python_name), self.config.connect_timeout_seconds
+        )
+
+    def promoted_toolset(self) -> HostedToolSet:
+        """Build hosted tools for all current MCP promotions.
+
+        Returns:
+            Promoted tools with synchronous and asynchronous invokers.
+        """
+
+        tools: list[HostedTool] = []
+        for qualified_name, alias in list(self._promoted.items()):
+            entry = self._tools.get(qualified_name)
+            if entry is None:
+                continue
+            tools.append(self._hosted_tool(entry, alias))
+        return HostedToolSet(tuple(tools), self._hosted_tool_config())
+
+    def _hosted_tool(self, entry: _ToolEntry, alias: str) -> HostedTool:
+        """Create one direct-call wrapper from a discovered MCP tool.
+
+        Args:
+            entry: Discovered MCP catalog entry.
+            alias: Python name used inside Monty.
+
+        Returns:
+            Hosted tool with sync and async MCP invokers.
+        """
+
+        def invoke(arguments: dict[str, Any]) -> Any:
+            """Call this MCP tool synchronously."""
+
+            return self.call(entry.qualified_name, arguments)
+
+        async def ainvoke(arguments: dict[str, Any]) -> Any:
+            """Call this MCP tool asynchronously."""
+
+            return await self.async_call(entry.qualified_name, arguments)
+
+        return HostedTool(
+            name=entry.qualified_name,
+            description=entry.description,
+            input_schema=entry.input_schema,
+            output_schema=entry.output_schema,
+            invoke=invoke,
+            ainvoke=ainvoke,
+            python_name=alias,
+            metadata={"mcp": True, "server": entry.server},
+        )
+
+    def _hosted_tool_config(self) -> HostedToolConfig:
+        """Return hosted-call limits derived from the MCP hub limits."""
+
+        return HostedToolConfig(
+            max_calls_per_operation=self.config.max_calls_per_operation,
+            max_total_call_seconds=self.config.max_total_call_seconds_per_operation,
+            max_parallel_calls=self.config.max_concurrent_calls,
         )
 
     def refresh(self, server: str | None = None) -> dict[str, Any]:
@@ -1070,6 +1194,63 @@ class McpHub:
         assert tool is not None
         return {"ok": True, "tool": tool.description_data()}
 
+    async def _promote_data(self, name: str, python_name: str | None) -> dict[str, Any]:
+        """Record one promotion on the MCP event-loop thread.
+
+        Args:
+            name: Qualified or short MCP tool name.
+            python_name: Optional explicit Python alias.
+
+        Returns:
+            Promotion result or structured lookup error.
+        """
+
+        tool, error = self._resolve_tool(name)
+        if error is not None:
+            return error
+        assert tool is not None
+        alias = python_name or python_identifier(tool.qualified_name)
+        if not alias.isidentifier() or keyword.iskeyword(alias):
+            return _error_result(
+                "InvalidMcpPythonName",
+                f"Invalid Python function name: {alias}",
+                tool=tool.qualified_name,
+            )
+        other = next(
+            (
+                qualified
+                for qualified, existing_alias in self._promoted.items()
+                if existing_alias == alias and qualified != tool.qualified_name
+            ),
+            None,
+        )
+        if other is not None:
+            return _error_result(
+                "McpPythonNameCollision",
+                f"Python name {alias!r} is already used by {other!r}.",
+                tool=tool.qualified_name,
+            )
+        try:
+            promoted_tool = self._hosted_tool(tool, alias)
+        except (TypeError, ValueError) as exc:
+            return _error_result(
+                "McpToolNotPromotable",
+                str(exc),
+                tool=tool.qualified_name,
+            )
+        self._promoted[tool.qualified_name] = alias
+        hosted = HostedToolSet((promoted_tool,), self._hosted_tool_config())
+        return {
+            "ok": True,
+            "tool": tool.qualified_name,
+            "python_name": alias,
+            "available": "next_execution",
+            "catalog": {
+                "sync": hosted.catalog(async_mode=False),
+                "async": hosted.catalog(async_mode=True),
+            },
+        }
+
     async def _refresh_data(self, server: str | None) -> dict[str, Any]:
         """Reconnect selected servers and return updated status.
 
@@ -1106,6 +1287,14 @@ class McpHub:
         if error is not None:
             return error
         assert tool is not None
+        emit_event(
+            self.event_sink,
+            "mcp",
+            "call_started",
+            server=tool.server,
+            tool=tool.qualified_name,
+            argument_count=len(arguments),
+        )
         semaphore = self._call_semaphore
         assert semaphore is not None
         async with semaphore:
@@ -1144,11 +1333,21 @@ class McpHub:
                         tool=tool.qualified_name,
                         retryable=True,
                     )
-        return _normalize_result(
+        normalized = _normalize_result(
             tool,
             result,
             self.config.max_result_bytes,
         )
+        emit_event(
+            self.event_sink,
+            "mcp",
+            "call_finished",
+            server=tool.server,
+            tool=tool.qualified_name,
+            ok=normalized["ok"],
+            truncated=normalized["truncated"],
+        )
+        return normalized
 
     async def _call_once(
         self,

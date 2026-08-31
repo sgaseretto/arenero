@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from pydantic_monty import MontyError
 
+from .events import emit_event
 from .kernel import ExecutionResult, PersistentMontyKernel
 from .network import NetworkRequest, NetworkResponse, fetch_url
 
@@ -162,6 +163,14 @@ class VirtualShell:
                 if name in allowed
             }
 
+    def available_commands(self) -> list[str]:
+        """Return sorted command names enabled by the active policy.
+
+        Returns:
+            Enabled virtual command names.
+        """
+        return self._available_commands()
+
     def execute(
         self,
         command: str,
@@ -179,8 +188,24 @@ class VirtualShell:
         Returns:
             Command output, exit code, and truncation state.
         """
+        emit_event(
+            self.kernel.event_sink,
+            "execution",
+            "shell_started",
+            session_id=self.session_id,
+            command_chars=len(command),
+        )
         with self.kernel.filesystem_guard():
-            return self._execute_locked(command, output_limit_chars, output_file)
+            result = self._execute_locked(command, output_limit_chars, output_file)
+        emit_event(
+            self.kernel.event_sink,
+            "execution",
+            "shell_finished",
+            session_id=self.session_id,
+            exit_code=result.exit_code,
+            output_chars=len(result.output),
+        )
+        return result
 
     def _execute_locked(
         self,
@@ -549,6 +574,14 @@ class VirtualShell:
         _expect_no_input(stdin, "curl")
         options = _parse_curl_arguments(args)
         config = self.kernel.network_config
+        emit_event(
+            self.kernel.event_sink,
+            "network",
+            "request_started",
+            session_id=self.session_id,
+            method=options.method,
+            request_bytes=len(options.data or b""),
+        )
         response = fetch_url(
             NetworkRequest(
                 url=options.url,
@@ -559,6 +592,14 @@ class VirtualShell:
             config,
             follow_redirects=options.follow_redirects,
             timeout_seconds=options.timeout_seconds,
+        )
+        emit_event(
+            self.kernel.event_sink,
+            "network",
+            "request_finished",
+            session_id=self.session_id,
+            status=response.status,
+            response_bytes=len(response.body),
         )
         if options.fail_on_http_error and response.status >= 400:
             return ShellResult(

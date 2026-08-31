@@ -17,7 +17,8 @@ class PackagingTests(unittest.TestCase):
                 "-c",
                 (
                     "import arenero, sys; assert not any("
-                    "name.startswith(('langchain', 'mcp', 'httpx2')) "
+                    "name.startswith(('langchain', 'deepagents', 'mcp', 'httpx2', "
+                    "'pydantic_ai', 'opentelemetry')) "
                     "for name in sys.modules)"
                 ),
             ],
@@ -29,14 +30,16 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_integrations_are_optional_development_dependencies(self) -> None:
-        """Keep LangChain and MCP out of the installed core dependency set."""
+        """Keep agent and MCP integrations out of core dependencies."""
         project = tomllib.loads(Path("pyproject.toml").read_text())
         dependencies = project["project"]["dependencies"]
 
         self.assertFalse(any(item.startswith("langchain") for item in dependencies))
         self.assertIn("langchain", project["project"]["optional-dependencies"])
+        self.assertIn("deepagents", project["project"]["optional-dependencies"])
         self.assertIn("mcp", project["project"]["optional-dependencies"])
         self.assertIn("langchain>=1.3.18", project["dependency-groups"]["dev"])
+        self.assertIn("deepagents>=0.7,<0.8", project["dependency-groups"]["dev"])
         self.assertIn("mcp>=2,<3", project["dependency-groups"]["dev"])
         self.assertIn("pydantic-monty>=0.0.21,<0.0.22", dependencies)
 
