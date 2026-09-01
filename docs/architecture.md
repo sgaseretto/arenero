@@ -13,6 +13,7 @@ flowchart TB
     subgraph PublicAPI["Public Arenero APIs"]
         CLI["Terminal REPL"]
         Tools["LangChain and LangGraph tools"]
+        PackageTools["Opt-in package tools"]
         Deep["Deep Agents interpreter middleware"]
         Facade["AreneroSandbox and AsyncAreneroSandbox"]
         Runtime["AreneroRuntime lifecycle owner"]
@@ -29,6 +30,7 @@ flowchart TB
     Network["Bounded HTTP and HTTPS"]
     Hosted["Hosted tool guard and call ledger"]
     Modules["Static virtual-module resolver"]
+    Packages["Monty source package manager"]
     Frameworks["Application, LangChain, or Pydantic AI tools"]
     McpHub["Optional MCP hub"]
     McpServers["Configured MCP servers"]
@@ -40,6 +42,7 @@ flowchart TB
 
     Caller --> CLI
     Caller --> Tools
+    Caller --> PackageTools
     Caller --> Deep
     Caller --> Facade
     Caller --> Direct
@@ -63,6 +66,10 @@ flowchart TB
     Kernel <--> Files
     Modules --> Files
     Modules --> Kernel
+    PackageTools --> Packages
+    Packages --> Modules
+    Packages --> Files
+    Packages --> Kernel
     Kernel --> VM
     VM -->|Selected function calls| Hosted
     Hosted <--> Frameworks
@@ -87,6 +94,7 @@ again.
 | Capability report | `capabilities.py` | Report active limits, commands, storage, network, MCP, bootstrap, and sync or async rules and generate model instructions. |
 | Bound session | `session.py` | Keep one trusted session ID with execute, file, reset, info, and fork operations. |
 | Static virtual modules | `modules.py` | Resolve bounded top-level imports, build isolated module objects, and generate one Monty feed. |
+| Monty source packages | `packages.py` | Create the fixed dependency-free layout, check source and revisions, test in a fresh Monty session, and export a deterministic source ZIP. |
 | Runtime owner | `runtime.py` | Close a kernel and its optional MCP hub in dependency order. |
 | Event records | `events.py` | Send safe execution, session, file, network, MCP, RLM, speculation, and runtime metadata to one callback. |
 | Hosted tools | `hosted_tools.py` | Generate function catalogs, apply per-operation budgets and sequencing, convert boundary values, and record nested calls. |
@@ -105,6 +113,7 @@ again.
 | Sandbox facade | `sandbox.py` | Group execution, files, binary transfer, and a stable sandbox ID in one framework-neutral API. |
 | Media bridge | `media.py` | Read virtual binary files and create data URLs or image content blocks. |
 | Agent adapters | `langchain_tools.py` and `langchain_filesystem_tools.py` | Build thread-scoped LangChain and LangGraph tools. |
+| Package agent adapter | `langchain_package_tools.py` | Give an agent explicit package initialization, check, test, and export tools with active limits. |
 | Deep Agents middleware | `deepagents.py` | Add async interpreter tools, live prompts, PTC runtime injection, three state modes, subagent calls, and private checkpoint snapshots. |
 | Optional integration loader | `integrations.py` | Keep LangChain out of the core import path until tools are requested. |
 | MCP hub | `mcp.py` | Keep configured async MCP clients on a host event loop and expose bounded sync or async host functions to Monty. |
@@ -394,9 +403,11 @@ code the host process's command authority and remove the main product boundary.
 - A shared virtual workspace for collaborating agents in one trusted tenant.
 - A framework adapter that maps another agent SDK to `AreneroSandbox`.
 - A local assistant that recovers state and files after an application restart.
+- An agent that creates reviewable dependency-free Monty source packages.
 
-Use a real execution sandbox for repository coding agents, package builds, system
-tests, browser automation, native libraries, or arbitrary command-line tools.
+Use a real execution sandbox for standard Python package builds, repository
+coding agents, system tests, browser automation, native libraries, or arbitrary
+command-line tools. Arenero supports only its documented Monty source ZIP flow.
 
 ## Related references
 
@@ -407,3 +418,4 @@ tests, browser automation, native libraries, or arbitrary command-line tools.
 - [MCP tools inside the REPL](mcp.md)
 - [Hosted tools and code-mode composition](hosted-tools.md)
 - [Quality-of-life APIs](quality-of-life.md)
+- [Monty-compatible source packages](monty-source-packages.md)

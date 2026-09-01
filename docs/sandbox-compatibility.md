@@ -78,8 +78,10 @@ other command and shell operator. The application must give
 commands.
 
 This limited form is useful for calculations, short text pipelines, file changes,
-and virtual helper files. It is not suitable for coding agents that build packages,
-run system test commands, install dependencies, use Git, or call executables.
+and virtual helper files. It cannot build standard Python packages, run system
+test commands, install dependencies, use Git, or call executables. The separate
+package workflow can create only a dependency-free Monty source ZIP. See
+[Monty-compatible source packages](monty-source-packages.md).
 See [the virtual shell reference](virtual-shell.md) for its exact grammar, command
 flags, limits, exit codes, and unsupported features.
 

@@ -24,6 +24,12 @@ Use a container, VM, or managed sandbox when code needs any of these:
 - Native extensions, threads, multiprocessing, sockets, or direct network access.
 - Full Python compatibility, notebooks, data-science libraries, or application builds.
 
+Arenero has one narrow exception to general package building. Use
+`MontyPackageManager` or the opt-in package tools to create a dependency-free
+Monty source package. Keep the fixed manifest and layout, run `package_check`,
+run `package_test` in its fresh session, and export only its source ZIP. This is
+not a wheel, Python sdist, package install, or build backend.
+
 Do not describe a Monty-backed `execute` operation as shell execution. Name it `execute_python`, `python_repl`, or clearly state that it accepts only Monty's Python subset.
 
 ## Design the host boundary
@@ -107,6 +113,11 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
   `.py` and `__init__.py` imports, relative imports, roots, and aliases. It rejects
   dynamic, wildcard, nested, circular, and third-party imports. The generated
   module feed skips Monty type checking.
+- For an Arenero source package, keep `arenero-package.json` dependencies empty.
+  Use `NAME/__init__.py` as `entry` and `verify.py` as `verify`. Write plain
+  assertions in `verify.py`, then set public `passed = True`. Always test in the
+  package manager's new temporary session. Do not use a persistent REPL as proof
+  that current source passes.
 - Simple classes work. Inheritance, method decorators, descriptors, `super()`, and user-defined exception classes do not.
 - Generators, `match`, `del`, `async with`, `async for`, exception groups, wildcard imports, complex literals, and several other constructs do not run.
 - Some familiar operations are eager. In particular, `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions materialize lists and can consume large memory.
@@ -147,6 +158,8 @@ Test the actual Monty runtime for:
 - Thread isolation, shared-file behavior, and concurrent calls.
 - Unsupported syntax and imports that the model is likely to produce.
 - Binary file round trips if the application accepts images or other artifacts.
+- The complete package init, edit, check, fresh test, revision, and export flow
+  when the application enables Monty source package tools.
 
 ## Authoritative sources
 

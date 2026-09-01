@@ -11,6 +11,7 @@ Monty is experimental, so run the project tests before a Monty version update.
 | Direct persistent Python cells | `PersistentMontyKernel.execute()` |
 | One virtual helper file and follow-up code | `PersistentMontyKernel.execute_file()` |
 | Small static graph of virtual Python files | `execute_module()` or an agent module tool |
+| Dependency-free Monty source package | `MontyPackageManager` or `create_package_tools()` |
 | Python, `!COMMAND`, and `%%shell` cells | `execute_repl_cell()` or `AreneroSandbox.execute_cell()` |
 | Framework-neutral execution and file methods | `AreneroSandbox` |
 | Full sandbox API in an async web service | `AsyncAreneroSandbox` |
@@ -450,7 +451,9 @@ assert result["ok"] is False
 ```
 
 There is no package installer or site-packages. Use plain supported values, add a
-narrow host function, or choose a container when the package itself is required.
+narrow host function, or choose a container when a third-party package is
+required. Arenero can create its own dependency-free source ZIP. See
+[Monty-compatible source packages](monty-source-packages.md).
 
 ### Importing a virtual helper
 
@@ -684,6 +687,8 @@ framework adapters, MCP promotion, budgets, restart behavior, and telemetry.
 - Restrict or disable `curl` when the agent can access sensitive data.
 - Give the model the exact shell and Monty limits.
 - Check error, retry, and truncation fields in every adapter.
+- Treat graph tool delivery as at least once. Make state-changing retries
+  idempotent or deduplicate them in durable application state.
 - Close kernels and caller-owned mounts.
 - Prune expired SQLite sessions.
 - Use external coordination for multiple processes that write one workspace.

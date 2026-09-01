@@ -283,6 +283,31 @@ party packages, or type checking of the generated feed. File reads remain under
 the existing filesystem transfer limit, plus module count, depth, source-byte,
 root, and cycle checks.
 
+## Monty packages use one source-only format
+
+Arenero does not emulate `pip`, a build backend, wheels, or Python source
+distributions. `MontyPackageManager` uses one JSON manifest, one fixed package
+layout, an empty dependency list, and the existing static module resolver. This
+keeps the package contract small and makes it visible to an agent.
+
+Package verification runs in a fresh temporary session and reads the current
+virtual files. This prevents a persistent REPL from hiding a source edit with old
+definitions. The verification module exports `passed = True` because a module's
+last expression is not the result of Arenero's generated module bundle.
+
+Export runs verification again and writes a deterministic source ZIP. It excludes
+`dist` from the source revision and archive. The archive is useful for transfer,
+review, and storage. It is not installable by Python. A source digest supports an
+`expected_revision` check between edit, test, and export operations.
+
+```mermaid
+flowchart LR
+    Source["Fixed source tree"] --> Digest["Source revision"]
+    Digest --> Static["Static module checks"]
+    Static --> Fresh["Fresh Monty test"]
+    Fresh --> Zip["Deterministic source ZIP"]
+```
+
 ## Related references
 
 - [Architecture and components](architecture.md)
@@ -295,3 +320,4 @@ root, and cycle checks.
 - [Deep Agents interpreter middleware](deepagents.md)
 - [Recursive Language Models](rlm.md)
 - [Static virtual modules](virtual-modules.md)
+- [Monty-compatible source packages](monty-source-packages.md)

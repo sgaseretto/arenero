@@ -41,6 +41,15 @@ uv run python -m unittest \
   tests.test_speculation_frameworks -v
 ```
 
+Run the complete mocked agent tests only:
+
+```console
+uv run python -m unittest \
+  tests.test_langchain_agent \
+  tests.test_langchain_agent_lifecycle \
+  tests.test_langchain_agent_boundaries -v
+```
+
 Run static checks:
 
 ```console
@@ -114,6 +123,43 @@ sequenceDiagram
     Tool-->>Agent: result = 42, state_restored = true
 ```
 
+## Complete mocked agent coverage
+
+The complete-agent tests use a scripted tool-calling chat model. The agent graph,
+LangGraph checkpoint operations, Arenero tools, Monty workers, stores, virtual
+files, and in-process MCP calls are real. No provider or external service is
+called.
+
+| Area | Mocked workflow and assertions |
+| --- | --- |
+| Concurrent threads | Two agents run in parallel, restore separate values, and keep separate session IDs. |
+| Kernel and graph restart | A new model, graph, kernel, worker pool, and SQLite store instance restore the same REPL session. |
+| Independent lifetimes | Resetting the REPL keeps graph messages. Replacing the graph keeps saved REPL state. |
+| Save policies | `always`, `success`, and `never` control whether a change before a normal error is visible next turn. |
+| Interrupt and resume | `interrupt_before=["tools"]` creates no session until resume. Resume executes one tool call and creates revision 1 once. |
+| Cancellation | Cancelling a graph while Monty waits for a hosted function releases the worker and session lock. A later call succeeds. |
+| Pool pressure | A full worker pool returns `WorkerCheckoutTimeout`, `retryable=true`, and `recovery=retry_later`. A later turn succeeds. |
+| Duplicate delivery | Delivering the same LangChain tool-call ID twice executes the state-changing cell twice. This confirms at-least-once behavior. |
+| Trimmed output | The agent sees truncation, reads the full output file, and continues in the same loop. |
+| Virtual files | Shell creation, Python reading, file-tool editing, and later Python reading share one virtual filesystem. |
+| MCP | An in-process MCP server supports search, Monty composition, an image result, and automatic virtual-file materialization. |
+| Code correction | The first Monty call rejects an unavailable package. The next model call uses supported code and returns the result. |
+| Snapshot recovery | A wrong Monty version returns a structured error. The agent resets the REPL and retries successfully. |
+
+Item 12 from the proposed list, a complete Deep Agents workflow, is intentionally
+not included.
+
+### Duplicate-delivery rule
+
+Arenero does not use the LangChain tool-call ID as a durable idempotency key. A
+graph checkpoint replay can therefore execute the same state-changing REPL cell
+again. The test asserts this current at-least-once rule instead of hiding it.
+
+Applications that need exactly-once effects must use an application idempotency
+key, make the operation idempotent, or store completed operation IDs in durable
+application state. This applies especially to hosted tools and MCP calls with
+external side effects.
+
 Assert exact output for deterministic fakes. For any future live integration
 test, assert the response structure and required fields instead of exact natural
 language. Keep live tests in a separate opt-in group because network and provider
@@ -148,3 +194,37 @@ If live provider tests are added later:
 These rules follow the LangChain distinction between deterministic unit tests and
 network integration tests. They also follow the LangGraph recommendation to use
 fresh graphs and in-memory checkpointers for isolated state tests.
+
+## Monty source package tests
+
+`tests/test_packages.py` follows the same steps that a human or agent must use:
+
+1. Initialize the fixed package layout.
+2. Edit source through the virtual filesystem.
+3. Check the manifest, source limits, syntax, imports, and revision.
+4. Test `verify.py` in a fresh temporary Monty session.
+5. Export only after the package passes the same test again.
+
+The tests also change a file after `package_check` and assert a revision conflict.
+One test first loads the old package into a persistent REPL, edits the source, and
+then proves that `package_test` sees the current file instead of old REPL state.
+A fixed LangChain model drives the complete package tool flow without a network
+or model provider call.
+
+```mermaid
+flowchart LR
+    Fake["Fixed agent model"] --> FileTools["Virtual file tools"]
+    Fake --> PackageTools["Package tools"]
+    PackageTools --> Check["Static checks and revision"]
+    Check --> Fresh["Fresh Monty verification"]
+    Fresh --> Archive["Deterministic source ZIP"]
+```
+
+Run this focused layer with:
+
+```console
+uv run python -m unittest tests.test_packages -v
+```
+
+See [Monty-compatible source packages](monty-source-packages.md) for the package
+contract that these tests enforce.

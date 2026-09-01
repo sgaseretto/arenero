@@ -29,6 +29,13 @@ reload, a module cache, dynamic imports, or third-party packages. Generated
 module feeds disable type checking because the simple objects need dynamic
 attributes.
 
+Arenero can wrap this static graph in its own dependency-free source package
+format. The host checks the fixed JSON manifest and bounded UTF-8 files, then runs
+`verify.py` in a fresh Monty session. The file must export `passed = True` after
+its assertions. Export creates a deterministic source ZIP. It does not add an
+installer, build backend, wheel, standard sdist, third-party dependency, or new
+import behavior.
+
 Generator expressions and `enumerate`, `zip`, `map`, `filter`, and `reversed` are eager lists. Avoid them on large or unbounded inputs.
 
 ## Standard library

@@ -12,6 +12,7 @@ from .integrations import (
     adapt_pydantic_ai_tools,
     create_async_python_repl_tools,
     create_deepagents_middleware,
+    create_package_tools,
     create_python_repl_tools,
 )
 from .kernel import (
@@ -29,6 +30,13 @@ from .modules import (
     VirtualModuleResolver,
 )
 from .network import NetworkConfig
+from .packages import (
+    MONTY_PACKAGE_INSTRUCTIONS,
+    PACKAGE_FORMAT,
+    PACKAGE_MANIFEST,
+    MontyPackageManager,
+    PackageConfig,
+)
 from .rlm import (
     RLM,
     RLMConfig,
@@ -68,8 +76,11 @@ from .store import (
 from .workspace import WorkspaceConfig
 
 __all__ = [
+    "MONTY_PACKAGE_INSTRUCTIONS",
     "MONTY_SANDBOX_INSTRUCTIONS",
     "MONTY_STDLIB_MODULES",
+    "PACKAGE_FORMAT",
+    "PACKAGE_MANIFEST",
     "RLM",
     "AreneroEvent",
     "AreneroRuntime",
@@ -90,8 +101,10 @@ __all__ = [
     "KernelConfig",
     "MediaFile",
     "ModuleBundle",
+    "MontyPackageManager",
     "NetworkConfig",
     "OpenTelemetryEventSink",
+    "PackageConfig",
     "PersistentMontyKernel",
     "RLMConfig",
     "RLMModelCall",
@@ -125,6 +138,7 @@ __all__ = [
     "capability_report",
     "create_async_python_repl_tools",
     "create_deepagents_middleware",
+    "create_package_tools",
     "create_python_repl_tools",
     "execute_repl_cell",
     "model_instructions",

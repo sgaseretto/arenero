@@ -41,28 +41,65 @@ class ToolCallingFakeChatModel(GenericFakeChatModel):
         return self
 
 
-def _tool_call(call_id: str, code: str) -> AIMessage:
-    """Build one scripted Python REPL tool call.
+def named_tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> AIMessage:
+    """Build one scripted agent tool call.
 
     Args:
         call_id: Stable synthetic model call ID.
-        code: Monty source sent to the REPL tool.
+        name: Tool name selected by the fake model.
+        arguments: Model-visible tool arguments.
 
     Returns:
-        AI message with one `python_repl` call.
+        AI message with one tool call.
     """
 
     return AIMessage(
         content="",
         tool_calls=[
             {
-                "name": "python_repl",
-                "args": {"code": code},
+                "name": name,
+                "args": arguments,
                 "id": call_id,
                 "type": "tool_call",
             }
         ],
     )
+
+
+def python_tool_call(
+    call_id: str,
+    code: str,
+    **arguments: Any,
+) -> AIMessage:
+    """Build one scripted Python REPL tool call.
+
+    Args:
+        call_id: Stable synthetic model call ID.
+        code: Monty source sent to the REPL tool.
+        **arguments: Optional additional REPL arguments.
+
+    Returns:
+        AI message with one `python_repl` call.
+    """
+
+    return named_tool_call(call_id, "python_repl", {"code": code, **arguments})
+
+
+def tool_results(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Decode every JSON tool result in an agent state.
+
+    Args:
+        state: Completed LangGraph agent state.
+
+    Returns:
+        Parsed tool results in message order.
+    """
+
+    return [
+        json.loads(message.content)
+        for message in state["messages"]
+        if isinstance(message, ToolMessage)
+    ]
 
 
 class LangChainAgentPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -74,9 +111,9 @@ class LangChainAgentPersistenceTests(unittest.IsolatedAsyncioTestCase):
         model = ToolCallingFakeChatModel(
             messages=iter(
                 [
-                    _tool_call("store-value", "value = 41"),
+                    python_tool_call("store-value", "value = 41"),
                     AIMessage(content="I stored the value."),
-                    _tool_call("increment-value", "value += 1\nvalue"),
+                    python_tool_call("increment-value", "value += 1\nvalue"),
                     AIMessage(content="The result is 42."),
                 ]
             )

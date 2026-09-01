@@ -22,6 +22,9 @@ flowchart LR
     Kernel --> MCP["Optional configured MCP tools"]
     Kernel --> Hosted["Selected application and framework tools"]
     Kernel --> Modules["Bounded static virtual modules"]
+    Interface --> Packages["Monty source package workflow"]
+    Packages --> Modules
+    Packages --> Files
     Kernel --> QoL["Capabilities, events, statistics, and bound sessions"]
     Interface --> RLM["Recursive model runner"]
     RLM --> Kernel
@@ -43,6 +46,7 @@ Arenero is a good fit when an agent needs a small, persistent computation space:
 - Read and change bounded virtual files.
 - Reuse a virtual Python helper file with `execute_file()`.
 - Resolve a small static graph of virtual Python files with `execute_module()`.
+- Build, verify, and export a dependency-free Monty source package.
 - Run short allowlisted text pipelines.
 - Fetch bounded public HTTP or HTTPS data through virtual `curl`.
 - Call narrow application functions without giving Python ambient host access.
@@ -85,6 +89,9 @@ arbitrary executables, or a real shell.
   rules for future opt-in live tests.
 - [Static virtual modules](docs/virtual-modules.md) explains module resolution,
   examples, limits, and differences from CPython imports.
+- [Monty-compatible source packages](docs/monty-source-packages.md) defines the
+  fixed layout, manifest, human and agent process, fresh-session test, archive,
+  limits, and errors.
 - [Quality-of-life APIs](docs/quality-of-life.md) explains capability reports,
   bound sessions, state policies, forks, bootstrap, runtime ownership, doctor,
   events, statistics, REPL commands, and MCP artifacts.

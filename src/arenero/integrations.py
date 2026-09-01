@@ -4,6 +4,7 @@ from typing import Any
 from .async_kernel import AsyncPersistentMontyKernel
 from .hosted_tools import HostedToolConfig, HostedToolSet
 from .kernel import PersistentMontyKernel
+from .packages import PackageConfig
 from .rlm import RLMModelCall, RLMModelStreamCall
 
 
@@ -80,6 +81,34 @@ def create_async_python_repl_tools(
         hosted_tools,
         hosted_tool_config,
     )
+
+
+def create_package_tools(
+    kernel: PersistentMontyKernel,
+    config: PackageConfig | None = None,
+) -> list[Any]:
+    """Create LangChain package tools when the optional integration is installed.
+
+    Args:
+        kernel: Synchronous kernel with a writable virtual filesystem.
+        config: Optional package roots and hard limits.
+
+    Returns:
+        Package initialization, check, test, and export tools.
+
+    Raises:
+        ImportError: If the ``langchain`` package extra is not installed.
+    """
+
+    try:
+        from .langchain_package_tools import create_package_tools as create_tools
+    except ModuleNotFoundError as exc:
+        if exc.name and (exc.name == "pydantic" or exc.name.startswith("langchain")):
+            raise ImportError(
+                "Install Arenero with the langchain extra: uv add 'arenero[langchain]'"
+            ) from exc
+        raise
+    return create_tools(kernel, config)
 
 
 def adapt_langchain_tools(
