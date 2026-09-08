@@ -52,9 +52,13 @@ executables.
 | Static virtual modules | `execute_module` resolves a bounded graph of top-level virtual imports. It is not CPython importlib and generated feeds skip type checking. |
 | Session administration | Stores and kernels list safe session metadata and delete expired sessions without exposing snapshot bytes. |
 | Stable sandbox identifier | `AreneroSandbox.id` is available. |
+| Ready-to-use owned sandbox | `open_sandbox()` and `SandboxConfig` presets assemble the store, files, policy, kernel, runtime, bound ID, relative root, quotas, and common results. |
+| Multi-sandbox owner | `SandboxManager` shares one worker pool, isolates Python by ID, shares configured files, and bounds active handles. |
+| Combined checkpoint | `ManagedSandbox.checkpoint()` combines exact-version Monty state and a bounded file tree. Restore requires the same execution policy. |
+| Complete async managed surface | `AsyncManagedSandbox` offloads the synchronous surface to threads and uses the subprocess worker pool. It is separate from native async Monty. |
 | Secrets outside execution | Narrow host functions can use credentials without exposing them to Monty. |
 | Bounded network access | The virtual `curl` command allows public HTTP and HTTPS URLs by default. `NetworkConfig` can restrict exact URL prefixes and methods or disable the command. DNS targets, redirects, time, and byte sizes are checked. Monty code has no direct network access. |
-| Configured MCP tools | The optional `McpHub` gives Monty progressive tool discovery and bounded tool calls. The application owns server configuration and authority. |
+| Dynamic MCP tools | The optional `McpHub` gives Monty progressive discovery, bounded calls, and runtime add, replace, and remove operations. The registry is shared by sessions that use that hub and lasts only for the hub lifetime. |
 
 ## Limited execution
 

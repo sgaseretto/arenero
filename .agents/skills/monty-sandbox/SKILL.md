@@ -32,6 +32,21 @@ not a wheel, Python sdist, package install, or build backend.
 
 Do not describe a Monty-backed `execute` operation as shell execution. Name it `execute_python`, `python_repl`, or clearly state that it accepts only Monty's Python subset.
 
+For a new Arenero application, start with `open_sandbox()` and a
+`SandboxConfig` preset. Use `open_sandbox_manager()` for several bound session
+IDs on one worker pool. These APIs already own lifecycle, relative workspace
+paths, common results, total file quotas, revisions, tree transfer, checkpoints,
+and selected LangChain tools. Use low-level kernel assembly only when the managed
+surface cannot express the required host boundary.
+
+The `batch` preset has no filesystem by default so distinct sessions can overlap.
+Adding a shared filesystem makes filesystem-capable kernel calls serialize. Use
+separate managers and workspaces for concurrent file workloads.
+
+Managed async handles use `asyncio.to_thread()` over the synchronous managed
+surface. They are complete wrappers, not the native `AsyncMonty` path. Use
+`AsyncPersistentMontyKernel` when native async host calls are required.
+
 ## Design the host boundary
 
 - Monty has no ambient filesystem, environment, network, or process access.
@@ -77,6 +92,17 @@ Do not describe a Monty-backed `execute` operation as shell execution. Name it `
 - Materialize MCP binary blocks only after the active Monty checkout ends. Scan
   the final returned value or use an explicit host-side MCP result. Intermediate
   results and data removed by MCP result limits are unavailable.
+- Start with an empty `McpHub()` when an agent can need tools that are not known at
+  startup. The fixed `mcp_add_server`, `mcp_replace_server`, and
+  `mcp_remove_server` host functions let Monty change stdio and Streamable HTTP
+  servers without changing an outer agent tool schema. The new catalog is shared
+  by all sessions on that hub and lasts only until the hub closes. It is not part
+  of a Monty snapshot or SQLite session state. A running kernel created without
+  a hub cannot attach its first MCP from inside Monty.
+- Use generic `mcp_search`, `mcp_describe`, and `mcp_call` after a hot load.
+  These fixed names work in existing type-checked snapshots. A promoted direct
+  function can still require `restart=True` before an older snapshot knows its
+  Python name.
 - Prefer narrow domain tools such as `read_customer(id)` over broad primitives such as `read_file(path)`, `fetch(url)`, or `run(command)`.
 - Prefer `MountDir` for host-directory access because it provides descriptor-based confinement and path checks. Use `OSAccess` with `MemoryFile` for an in-memory virtual filesystem.
 - Use Arenero's `WorkspaceConfig` for a kernel-owned persistent read-write mount.

@@ -11,6 +11,7 @@ flowchart TB
     Caller["Human, agent, CLI, or application"]
 
     subgraph PublicAPI["Public Arenero APIs"]
+        Managed["ManagedSandbox factory and manager"]
         CLI["Terminal REPL"]
         Tools["LangChain and LangGraph tools"]
         PackageTools["Opt-in package tools"]
@@ -33,7 +34,7 @@ flowchart TB
     Packages["Monty source package manager"]
     Frameworks["Application, LangChain, or Pydantic AI tools"]
     McpHub["Optional MCP hub"]
-    McpServers["Configured MCP servers"]
+    McpServers["Initial or hot-loaded MCP servers"]
     Models["Configured async model adapters"]
 
     subgraph Worker["Monty worker pool"]
@@ -41,6 +42,7 @@ flowchart TB
     end
 
     Caller --> CLI
+    Caller --> Managed
     Caller --> Tools
     Caller --> PackageTools
     Caller --> Deep
@@ -49,6 +51,10 @@ flowchart TB
     Caller --> Runtime
     Caller --> Recursive
     Runtime --> Direct
+    Managed --> Runtime
+    Managed --> Tools
+    Managed --> Packages
+    Managed --> Files
     Direct --> Handle
     Recursive --> Kernel
     Recursive <--> Models
@@ -76,7 +82,7 @@ flowchart TB
     VM -->|Approved file operations| Files
     Shell --> Files
     Shell -->|curl only| Network
-    Kernel -->|Fixed host functions| McpHub
+    Kernel -->|Nine fixed host functions| McpHub
     McpHub -->|Promoted function| Hosted
     McpHub <--> McpServers
 ```
@@ -89,6 +95,8 @@ again.
 
 | Component | Main module | Responsibility |
 | --- | --- | --- |
+| Managed sandbox | `easy.py` | Build one complete owned runtime from presets and expose a bound session, relative files, common results, total quotas, checkpoints, and multi-session managers. |
+| Managed LangChain tools | `langchain_managed_tools.py` | Bind selected Python, shell, file, and package tools to one managed sandbox without model-supplied session IDs. |
 | Terminal REPL | `cli.py` | Parse CLI options, select a store, and run or administer a session. |
 | Cell dispatcher | `cell.py` | Route percent commands, normal Python, `!COMMAND`, and `%%shell` cells and return common result fields. |
 | Capability report | `capabilities.py` | Report active limits, commands, storage, network, MCP, bootstrap, and sync or async rules and generate model instructions. |
@@ -116,7 +124,7 @@ again.
 | Package agent adapter | `langchain_package_tools.py` | Give an agent explicit package initialization, check, test, and export tools with active limits. |
 | Deep Agents middleware | `deepagents.py` | Add async interpreter tools, live prompts, PTC runtime injection, three state modes, subagent calls, and private checkpoint snapshots. |
 | Optional integration loader | `integrations.py` | Keep LangChain out of the core import path until tools are requested. |
-| MCP hub | `mcp.py` | Keep configured async MCP clients on a host event loop and expose bounded sync or async host functions to Monty. |
+| MCP hub | `mcp.py` | Keep a mutable set of async MCP clients on a host event loop and expose bounded sync or async discovery, mutation, and call functions to Monty. |
 | MCP artifacts | `mcp_artifacts.py` | Decode supported MCP Base64 blocks and write them through a supplied virtual-file writer. |
 
 ## Python execution lifecycle
@@ -149,7 +157,7 @@ sequenceDiagram
         T-->>M: Plain bounded value
     end
     opt MCP function call
-        M->>H: Search, describe, refresh, or call
+        M->>H: Add, replace, remove, discover, refresh, or call
         H-->>M: Plain bounded data
     end
     M-->>K: Result, streams, or error
@@ -196,7 +204,7 @@ Python state and file state are intentionally separate:
 | Hosted tool catalog, callbacks, and call budgets | Host process and one execution scope | Catalog configuration is process memory. Call budgets and records reset for each operation. |
 | Deep Agents graph snapshot | Private LangGraph state when enabled | Contains full Monty bytes and optional HMAC. It does not contain files or host resources. |
 | Network policy | `NetworkConfig` in the host process | Never enters Monty state. |
-| MCP clients, credentials, and catalog | Caller-owned `McpHub` in the host process | Live while the hub is active. Reconnect after restart. Never enters a snapshot. |
+| MCP clients, credentials, dynamic server config, and catalog | Shared `McpHub` in the host process | Live while the hub is active. Recreate after restart. Never enters a snapshot or SQLite. |
 
 ```mermaid
 flowchart LR
@@ -208,8 +216,10 @@ flowchart LR
     FileConfig["Filesystem configuration"] --> MemoryFiles["OSAccess memory files"]
     FileConfig --> Workspace["Host-backed workspace"]
     FileConfig --> Mounts["Caller-supplied mounts"]
+    Hub["Shared MCP hub"] --> Registry["Dynamic servers and live clients"]
 
     Snapshot -. does not contain .-> FileConfig
+    Snapshot -. does not contain .-> Hub
 ```
 
 Resetting a session removes Python state and the shell directory. It does not
@@ -355,17 +365,19 @@ object access. Access enters through explicit configuration:
 - `OSAccess` or `MountDir` for virtual files.
 - The host-side virtual shell for its fixed command handlers.
 - `NetworkConfig` for the virtual `curl` handler.
-- An optional `McpHub` for six fixed discovery, promotion, and tool-call functions.
+- An optional `McpHub` for nine fixed discovery, server-mutation, promotion, and
+  tool-call functions.
 
 Hosted functions execute with host authority. Validate all arguments and return
 only supported plain values. Keep secrets in narrow host functions or trusted
 header providers. Do not place secrets in sandbox inputs, virtual files, or
 prompts.
 
-MCP tools keep the authority of their configured server. Monty limits model code,
-but it does not limit what an approved remote tool can do. The application selects
-server commands, URLs, credentials, and qualified tool allowlists outside model
-control. See [MCP tools inside the REPL](mcp.md).
+MCP tools keep the authority of their server. Monty limits model code, but it does
+not limit what an MCP process or remote tool can do. The dynamic API lets the
+model select commands, URLs, environment values, and headers. Applications that
+need a stricter boundary must not expose a hot-loadable hub. See
+[MCP tools inside the REPL](mcp.md).
 
 Hosted tools keep the authority of their source framework. Arenero does not make
 a broad application tool safe. It keeps the source framework's public invoke
@@ -388,8 +400,9 @@ service.
 | A smaller shell | Set `KernelConfig.allowed_shell_commands` | Include aliases separately, such as `python3`. |
 | Restricted network access | Set `NetworkConfig` | Prefer exact public origins and path prefixes; disable `curl` when unused. |
 | Another agent framework | Wrap `AreneroSandbox` and adapt its tools to `HostedTool` | Keep its result, path, persistence, nested-call, and execution limits visible to the model. |
+| A new application that needs a complete sandbox | Start with `open_sandbox()` or `open_sandbox_manager()` | Use presets first. Drop to the kernel only for custom assembly. |
 | Another model image format | Convert `MediaFile.content` on the host | The model cannot read a path or Base64 text as an image without a content block. |
-| Configured external tools | Add `McpHub` with the `mcp` extra | Keep server configuration outside model control and set call, schema, argument, result, and concurrency limits. |
+| Initial or agent-selected MCP tools | Add `McpHub` with the `mcp` extra | Start with configured servers or an empty hub. Use fixed `mcp_*` functions so the outer agent tool schema stays stable. |
 
 Do not add a broad `run_shell(command)` host function. It would give model-written
 code the host process's command authority and remove the main product boundary.
@@ -414,6 +427,7 @@ command-line tools. Arenero supports only its documented Monty source ZIP flow.
 - [Usage and capabilities](usage-and-capabilities.md)
 - [Virtual shell reference](virtual-shell.md)
 - [Sandbox compatibility](sandbox-compatibility.md)
+- [Managed sandbox API](managed-sandbox.md)
 - [Design decisions](design-decisions.md)
 - [MCP tools inside the REPL](mcp.md)
 - [Hosted tools and code-mode composition](hosted-tools.md)

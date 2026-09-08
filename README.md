@@ -11,7 +11,7 @@ separate human turns while the application process stays active.
 
 ```mermaid
 flowchart LR
-    User["Human or agent"] --> Interface["REPL, sandbox facade, or agent tools"]
+    User["Human or agent"] --> Interface["Managed sandbox, REPL, facade, or agent tools"]
     Interface --> Cell["Cell dispatcher"]
     Cell -->|Python| Kernel["Sync or native async persistent kernel"]
     Cell -->|Shell cell| Shell["Virtual shell"]
@@ -19,7 +19,7 @@ flowchart LR
     Kernel --> Worker["Monty worker pool"]
     Kernel <--> Store["Memory, SQLite, or stateless session store"]
     Kernel <--> Files["Virtual files or persistent workspace"]
-    Kernel --> MCP["Optional configured MCP tools"]
+    Kernel --> MCP["Optional initial or hot-loaded MCP tools"]
     Kernel --> Hosted["Selected application and framework tools"]
     Kernel --> Modules["Bounded static virtual modules"]
     Interface --> Packages["Monty source package workflow"]
@@ -50,7 +50,8 @@ Arenero is a good fit when an agent needs a small, persistent computation space:
 - Run short allowlisted text pipelines.
 - Fetch bounded public HTTP or HTTPS data through virtual `curl`.
 - Call narrow application functions without giving Python ambient host access.
-- Discover and compose user-configured MCP tools from persistent Python.
+- Add missing MCP servers at runtime, then discover and compose their tools from
+  persistent Python without changing the outer agent tool schema.
 - Keep large model input in Monty and make bounded plain or recursive model calls.
 - Start selected model or hosted-tool calls while generated Monty code streams.
 
@@ -63,6 +64,10 @@ arbitrary executables, or a real shell.
 - [Architecture and components](docs/architecture.md) explains each layer,
   execution flow, state ownership, locks, security boundaries, and extension
   points.
+- [Managed sandbox API](docs/managed-sandbox.md) explains the one-call factory,
+  presets, bound relative workspace, common results, total quotas, revisions,
+  tree transfer, portable checkpoints, managers, async use, and combined agent
+  tools.
 - [Usage and capabilities](docs/usage-and-capabilities.md) gives verified working
   examples, rejected examples, selection tables, agent guidance, and a production
   checklist.
@@ -70,8 +75,9 @@ arbitrary executables, or a real shell.
   operator, exit code, limit, and deliberate exclusion.
 - [Sandbox compatibility](docs/sandbox-compatibility.md) compares Arenero with the
   utilities expected by Deep Agents sandboxes.
-- [MCP tools inside the REPL](docs/mcp.md) explains configured servers,
-  progressive discovery, composition, persistence, limits, and security.
+- [MCP tools inside the REPL](docs/mcp.md) explains initial and hot-loaded
+  servers, progressive discovery, composition, shared runtime persistence,
+  stable CodeAct integration, limits, and security.
 - [Hosted tools and code-mode composition](docs/hosted-tools.md) explains plain
   callables, LangChain, Pydantic AI, MCP promotion, budgets, catalogs, records,
   restart behavior, and OpenTelemetry events.
@@ -116,6 +122,254 @@ uv add "arenero[mcp]"
 uv add "arenero[pydantic-ai]"
 uv add "arenero[observability]"
 ```
+
+## Fast application setup
+
+Use the managed API when an application needs a complete sandbox with few
+configuration steps:
+
+```python
+from arenero import SandboxConfig, open_sandbox
+
+config = SandboxConfig.conversation(
+    max_workspace_files=250,
+    max_workspace_bytes=5_000_000,
+)
+
+with open_sandbox("agent-1", config=config) as sandbox:
+    sandbox.run_python("values = [2, 4, 8]")
+    assert sandbox.run_python("sum(values)").value == 14
+    sandbox.write("result.txt", "14")
+```
+
+Use `SandboxConfig.ephemeral()` for stateless Python, `durable(directory)` for
+SQLite state and mounted files across restarts, or `batch(workers=N)` with
+`open_sandbox_manager()` for concurrent Python-only agents. Add
+`filesystem="memory"` to the batch preset when shared files are required and
+serialized file-capable calls are acceptable. See the
+[managed sandbox guide](docs/managed-sandbox.md) for limits and lifecycle rules.
+
+## Agent developer quick start
+
+Keep one sandbox open for the life of an agent conversation. Give the sandbox
+and the agent graph the same stable conversation ID. The two state systems are
+separate: LangGraph stores messages and graph state, while Arenero stores the
+Monty Python session and virtual files.
+
+This example uses one agent across two human turns. The second turn can reuse the
+`subtotal` value that the first turn created in the REPL:
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+from arenero import SandboxConfig, open_sandbox
+
+conversation_id = "customer-42"
+config = SandboxConfig.conversation(
+    network="off",
+    max_workspace_files=100,
+    max_workspace_bytes=1_000_000,
+)
+
+with open_sandbox(conversation_id, config=config) as sandbox:
+    bundle = sandbox.agent_bundle({"python", "files", "shell"})
+    agent = create_agent(
+        model=your_model,
+        tools=list(bundle.tools),
+        system_prompt=bundle.instructions,
+        checkpointer=InMemorySaver(),
+    )
+    graph_config = {"configurable": {"thread_id": conversation_id}}
+
+    first = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Use python_repl to set subtotal = 19 + 23.",
+                }
+            ]
+        },
+        graph_config,
+    )
+    second = agent.invoke(
+        {"messages": [{"role": "user", "content": "Multiply that subtotal by 10."}]},
+        graph_config,
+    )
+```
+
+```mermaid
+sequenceDiagram
+    participant H as Human
+    participant A as Agent graph
+    participant G as Graph checkpointer
+    participant T as Fixed python_repl tool
+    participant S as Managed Arenero sandbox
+    participant P as Monty session store
+
+    H->>A: First request
+    A->>G: Load graph messages and state
+    A->>T: Set subtotal = 19 + 23
+    T->>S: Run code with customer-42
+    S->>P: Restore and save Python state
+    A->>G: Save graph messages and state
+    A-->>H: First answer
+
+    H->>A: Related follow-up
+    A->>G: Load graph messages and state
+    A->>T: Use existing subtotal
+    T->>S: Run code with customer-42
+    S->>P: Restore subtotal and save new state
+    A-->>H: Follow-up answer
+```
+
+The graph checkpointer does not store the REPL. Arenero does not store the graph
+messages. A stable ID makes both systems follow the same conversation, but each
+system keeps and restores its own state.
+
+`SandboxConfig.conversation()` keeps REPL state and memory files until the
+sandbox closes. Do not create and close a new in-memory sandbox for each HTTP
+request. For process restarts, use one durable directory and reopen the same
+sandbox ID:
+
+```python
+config = SandboxConfig.durable(".arenero/customer-42")
+
+with open_sandbox("customer-42", config=config) as sandbox:
+    bundle = sandbox.agent_bundle({"python", "files"})
+    # Build or invoke the agent while this context is open.
+```
+
+The durable preset stores Python snapshots in SQLite and files in a mounted
+workspace directory. It does not store files inside SQLite.
+
+Use the generated instructions instead of a hand-written description. They tell
+the model the active limits, shell commands, network policy, MCP functions,
+session ID, and file rules:
+
+```python
+bundle = sandbox.agent_bundle({"python", "files"})
+print(bundle.instructions)
+print(sandbox.info().value)
+```
+
+### Add a missing MCP during an agent run
+
+Create the kernel with an empty `McpHub` when the required MCP servers are not
+known at startup. The agent can then add a stdio or Streamable HTTP server inside
+`python_repl`, and it can search and call the new tools in the same cell:
+
+```python
+from arenero import open_sandbox
+from arenero.mcp import McpHub
+
+with McpHub() as mcp, open_sandbox("agent-1", mcp_hub=mcp) as sandbox:
+    bundle = sandbox.agent_bundle({"python"})
+    # Keep bundle.tools as the stable outer agent tool list.
+
+    result = sandbox.run_python(
+        """connected = mcp_add_server({
+    "name": "late-tools",
+    "transport": "streamable-http",
+    "url": "https://tools.example.com/mcp",
+})
+matches = mcp_search("lookup order")
+tool_name = matches["tools"][0]["name"]
+mcp_call(tool_name, {"order_id": "order-123"})
+"""
+    )
+```
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant T as Fixed python_repl tool
+    participant M as Persistent Monty session
+    participant H as Shared MCP hub
+    participant N as New MCP server
+
+    A->>T: mcp_add_server(config)
+    T->>M: Run one Monty cell
+    M->>H: Call fixed host function
+    H->>N: Connect and list tools
+    N-->>H: Tool catalog
+    H-->>M: Server is ready
+    M-->>T: Addition result
+
+    A->>T: mcp_search() and mcp_call()
+    T->>M: Run later code with the same state
+    M->>H: Discover and call current tool
+    H->>N: Invoke tool
+    N-->>H: Tool result
+    H-->>M: Bounded result
+    M-->>T: Cell result
+```
+
+The outer LangChain or LangGraph interface stays unchanged because the model
+still calls only `python_repl`. The hub must exist when the sandbox is created.
+Its live server list is shared by sessions that use that hub and is lost when the
+hub closes. See [MCP tools inside the REPL](docs/mcp.md) for server configuration,
+limits, and promotion rules.
+
+### Capabilities at a glance
+
+| Capability | Agent use | Main boundary |
+| --- | --- | --- |
+| Persistent Python | Keep plain values, functions, and calculations between calls. | Monty's Python subset, not CPython. |
+| State modes | Select stateless, in-memory conversation, or durable SQLite state. | In-memory state ends when its runtime closes. |
+| Virtual files | Read, write, edit, delete, list, glob, and grep bounded files. | Files have a separate lifecycle from Python snapshots. |
+| Virtual shell | Run allowlisted text commands, pipes, redirects, and Monty `python`. | It never starts an operating-system process. |
+| Network | Fetch bounded public HTTP or HTTPS data with virtual `curl`. | No sockets; use `NetworkConfig` to narrow or disable access. |
+| Hosted tools | Compose selected application, LangChain, or Pydantic AI tools in Python. | Each exposed function runs with host authority. |
+| MCP | Discover, describe, compose, and hot-load stdio or HTTP MCP servers. | MCP connections and promotions are not saved in snapshots. |
+| Source files | Run one helper file or a small static virtual module graph. | This is source execution, not Python import machinery. |
+| Source packages | Build, check, test, and export dependency-free Monty source ZIP files. | No wheels, sdists, installers, or third-party dependencies. |
+| Concurrent agents | Use separate IDs with the batch preset and one worker pool. | Shared filesystem work is serialized in one kernel. |
+| Bounded results | Limit output, save larger bounded output to a file, and inspect statistics. | Hard stream, result, state, and transfer caps still apply. |
+
+### Common workarounds
+
+| Agent need | Arenero approach |
+| --- | --- |
+| Load `helper.py` | Use `run_file("helper.py", code="follow_up()")`, `%run`, or `python_repl_execute_file`. Names enter the current session. |
+| Use several local Python files | Use `run_module()` or `python_repl_execute_module` for the supported static import graph. |
+| Call a third-party library or service | Put the operation behind a narrow hosted function or MCP tool. Use an external CPython sandbox when arbitrary packages are required. |
+| Run a shell task | Use a supported virtual command. Put a missing operation behind a hosted tool, MCP server, or external sandbox. |
+| Keep work after a process restart | Use `SandboxConfig.durable()` and reopen the same sandbox ID and directory. |
+| Let several agents share artifacts | Use one manager with a shared filesystem. Use separate managers when files must be isolated. |
+| Return an image to a model | Read it through `read_media_file()` and add its provider content block to the model message. A path or Base64 string alone is not visible to the model. |
+| Handle a large result | Ask for a summary, request a smaller `output_limit_chars`, or write bounded data to `output_file` for a later read. |
+| Add an MCP later | Attach an empty `McpHub()` at startup, then use `mcp_add_server()`, `mcp_search()`, and `mcp_call()` inside the REPL. |
+
+### Important limitations
+
+- Monty does not provide full CPython. There is no `pip`, site-packages, native
+  extension, `eval()`, `exec()`, `compile()`, or dynamic import.
+- A virtual `.py` file cannot be imported in the normal CPython way. Use
+  `run_file()` for one file or `run_module()` for a bounded static file graph.
+- The virtual shell has a fixed command and flag set. It does not support Git,
+  arbitrary programs, shell scripts, background jobs, command substitution,
+  environment variables, or automatic wildcard expansion.
+- Python has no direct socket or process access. Virtual `curl`, MCP, and hosted
+  functions are explicit host bridges with separate policies and limits.
+- Python state, virtual files, MCP connections, and external side effects have
+  different lifecycles. A state reset or failed state save does not undo file,
+  network, MCP, or application changes.
+- Monty snapshots are version-specific. Host functions, mounts, callbacks, and
+  live MCP connections must be attached again after a process restart.
+- One session accepts one execution at a time. Use different stable session IDs
+  and enough workers for concurrent agents.
+- Sessions in one managed runtime can share configured files and MCP servers.
+  Use separate runtimes for isolation.
+- Duration is cumulative Monty interpreter time for a session. A session that
+  reaches its time or memory limit must be reset.
+- Hosted functions and MCP tools run outside Monty's isolation. Validate their
+  inputs and keep secrets in trusted host code.
+
+For verified accepted and rejected examples, read
+[Usage and capabilities](docs/usage-and-capabilities.md). For every shell flag and
+command limit, read [Virtual shell reference](docs/virtual-shell.md).
 
 ## Terminal REPL
 

@@ -1,8 +1,9 @@
 # MCP tools inside the Arenero REPL
 
-Arenero can connect user-configured MCP servers to Monty as an optional feature.
-This lets model-written Python discover and call tools without putting every tool
-schema or intermediate result in the model context.
+Arenero can connect MCP servers to Monty as an optional feature. Servers can be
+present when the hub starts, or model-written Python can add, replace, and remove
+them while the hub is running. This lets an agent repair a missing tool setup
+without changing its LangChain tool schema or losing its persistent REPL state.
 
 Install the optional client:
 
@@ -10,8 +11,9 @@ Install the optional client:
 uv add "arenero[mcp]"
 ```
 
-The bridge uses the MCP Python SDK 2.x. It supports configured `stdio`, Streamable
-HTTP, and in-process servers. SSE is not part of this API.
+The bridge uses the MCP Python SDK 2.x. Host code supports `stdio`, Streamable
+HTTP, and in-process servers. Agent-supplied plain configuration supports
+`stdio` and Streamable HTTP. SSE is not part of this API.
 
 ## Basic setup
 
@@ -55,8 +57,38 @@ server = McpServerConfig.http(
 )
 ```
 
-Headers never enter Monty or MCP discovery results. Do not put the token in a
-prompt, REPL variable, or virtual file.
+Headers supplied by host code never enter Monty or MCP discovery results.
+Headers supplied through `mcp_add_server()` necessarily pass through Monty and
+can appear in model-generated source or application logs.
+
+## Start with an empty hot-loadable hub
+
+Attach an empty hub before the first REPL session. This declares the fixed MCP
+host functions in Monty's type-check context even though no server exists yet:
+
+```python
+from arenero import PersistentMontyKernel
+from arenero.mcp import McpHub
+
+with McpHub() as mcp, PersistentMontyKernel(mcp_hub=mcp) as kernel:
+    result = kernel.execute(
+        "agent-thread-1",
+        """connected = mcp_add_server({
+    "name": "late-tools",
+    "transport": "stdio",
+    "command": "uv",
+    "args": ["run", "server.py"],
+    "cwd": "/srv/my-agent",
+})
+answer = mcp_call("late-tools__calculate", {"value": 21})
+{"connected": connected["ok"], "answer": answer}
+""",
+    )
+```
+
+The server is ready before `mcp_add_server()` returns, so the same cell can
+search, describe, or call it. A failed addition is removed from the registry.
+Use the same `McpHub` object for later agent and human turns.
 
 ### Native async kernel
 
@@ -77,7 +109,7 @@ async def call_tool() -> dict:
             )
 ```
 
-Use `await` with all six MCP functions in the native async kernel. The hub keeps
+Use `await` with all nine MCP functions in the native async kernel. The hub keeps
 its clients on one private event loop and the kernel awaits submitted calls. One
 slow MCP call therefore does not block other async kernel sessions. Hub limits,
 allowlists, result envelopes, and per-operation budgets are the same in both
@@ -91,6 +123,9 @@ modes.
 | `mcp_search(query, server=None, limit=20)` | Small ranked tool summaries | Discover only relevant tools. An empty query lists tools. |
 | `mcp_describe(name)` | One bounded input schema | Read exact arguments before a call. |
 | `mcp_promote(name, python_name=None)` | A direct-call declaration | Add one selected tool as a Python function on the next operation. |
+| `mcp_add_server(config)` | Added server status | Connect a new stdio or HTTP server and publish its tools. |
+| `mcp_remove_server(name)` | Removal status | Disconnect the server and remove its tools and promotions. |
+| `mcp_replace_server(config)` | Replacement status | Reconnect one namespace with new details; restore the old config if the change fails. |
 | `mcp_call(name, arguments=None)` | Bounded result envelope | Call one tool from Python. |
 | `mcp_refresh(server=None)` | Updated server and catalog status | Reconnect and reload tool lists. |
 
@@ -101,6 +136,82 @@ the matching qualified names.
 The LangChain and LangGraph `python_repl` description includes the correct sync
 or async forms when its kernel has an MCP hub. Other agent adapters can give
 `mcp.instructions` or `mcp.async_instructions` to the model.
+
+## Dynamic server configuration
+
+Agent-supplied configuration is a plain dictionary. These are the accepted
+forms:
+
+```python
+mcp_add_server({
+    "name": "local",
+    "transport": "stdio",
+    "command": "python",
+    "args": ["server.py"],
+    "env": {"MODE": "agent"},
+    "cwd": "/srv/tools",
+})
+
+mcp_add_server({
+    "name": "remote",
+    "transport": "streamable-http",
+    "url": "https://example.com/mcp",
+    "headers": {"Authorization": "Bearer token"},
+})
+```
+
+`transport="http"` is a short alias for `"streamable-http"`. Unknown fields,
+wrong field types, duplicate names, and the `in-process` transport return a
+structured error. In-process servers contain a live Python object, so only host
+code can add them:
+
+```python
+mcp.add_server(McpServerConfig.in_process("embedded", server_object))
+```
+
+Host code can use `add_server()`, `remove_server()`, and `replace_server()`, or
+their `async_add_server()`, `async_remove_server()`, and
+`async_replace_server()` forms. These methods return the same plain structured
+results as the REPL functions.
+
+Replace or remove a server by its stable namespace:
+
+```python
+changed = mcp_replace_server({
+    "name": "remote",
+    "transport": "http",
+    "url": "https://new.example.com/mcp",
+})
+removed = mcp_remove_server("remote")
+```
+
+An add that cannot connect leaves no configured server. A failed replacement
+tries to reconnect the previous configuration and reports whether it was
+restored. Remove, replace, and refresh return `McpServerBusy` when that server
+already has an active call. Retry after the call ends.
+
+The hub is shared. A server added by one session is visible to every kernel and
+agent session that uses the same hub. Python variables remain isolated by
+`session_id`; MCP server configuration does not.
+
+### Stable LangChain and LangGraph interface
+
+Keep `python_repl` as the model's code-action interface. Do not add each MCP tool
+to the LangChain tool list:
+
+```python
+tools = create_python_repl_tools(kernel)
+agent = create_agent(model, tools, checkpointer=checkpointer)
+```
+
+The agent calls `mcp_add_server()` and `mcp_call()` inside `python_repl`. The
+outer tool names and schemas stay unchanged when the MCP catalog changes, so a
+compiled graph and its model binding do not need to be rebuilt.
+
+Generate `kernel.instructions()` again when an application wants an updated
+server-status report. A LangChain tool description created earlier still has
+the complete dynamic API, but its embedded list of active servers is a snapshot
+from tool creation time. `mcp_servers()` is always the current source of truth.
 
 ### Promote a selected tool
 
@@ -185,10 +296,16 @@ sequenceDiagram
     participant K as Arenero kernel
     participant M as Monty session
     participant H as MCP hub
-    participant S as Configured MCP server
+    participant S as MCP server
 
     A->>K: Execute Python cell
     K->>M: Restore snapshot and attach host functions
+    opt A required a missing server
+        M->>H: mcp_add_server(config)
+        H->>S: Connect and initialize
+        S-->>H: Tool catalog
+        H-->>M: Connected server status
+    end
     M->>H: mcp_search(query)
     H-->>M: Bounded summaries
     M->>H: mcp_describe(server__tool)
@@ -284,26 +401,26 @@ The MCP client and server processes run outside Monty with host authority:
 
 ```mermaid
 flowchart LR
-    Model["Model-written Monty code"] --> API["Five fixed MCP host functions"]
+    Model["Model-written Monty code"] --> API["Nine fixed MCP host functions"]
     API --> Policy["Hub limits and qualified allowlist"]
     Policy --> Client["Host-side MCP clients"]
-    Client --> Local["User-configured stdio process"]
-    Client --> Remote["User-configured HTTP endpoint"]
+    Client --> Local["stdio process"]
+    Client --> Remote["HTTP endpoint"]
 
-    Model -. cannot configure .-> Local
-    Model -. cannot configure .-> Remote
+    Model -->|mcp_add_server config| Client
     Secrets["Trusted headers and environment"] --> Client
-    Secrets -. never returned .-> Model
 ```
 
 This bridge limits code execution, discovery size, and result transfer. It does
 not make an MCP tool safe. A configured tool can read data, send a message,
 delete a record, charge money, or run code according to that server's authority.
 
-The application, not the model, must select server commands, URLs, environment,
-headers, and tool allowlists. A model-selected `stdio` command would be arbitrary
-host process execution. A model-selected URL can create server-side request
-forgery and data-exfiltration risks.
+Dynamic configuration intentionally lets model-written code select stdio
+commands, URLs, environment values, and headers. A stdio command is a real host
+process, and an HTTP URL is a real host network destination. `McpHubConfig`
+limits tool discovery and calls after connection; it does not confine the MCP
+server process or URL. Applications that need a stricter boundary must not give
+untrusted code an MCP hub with dynamic configuration.
 
 Treat tool names, descriptions, schemas, and results as untrusted data. MCP tool
 annotations are descriptive hints. Arenero does not use them as policy or as an
@@ -312,15 +429,21 @@ approval decision.
 ## Current limits
 
 - Tools are supported. MCP resources and prompts are not exposed.
+- The kernel must receive an `McpHub` when it is created. Use `McpHub()` when no
+  initial servers are known. A running kernel that has no hub cannot add its
+  first MCP through the REPL.
 - Sampling, roots, elicitation, and multi-round input-required flows are not
   bridged into the active Monty feed.
-- The model cannot add, remove, or change configured servers.
-- Calls are synchronous. There is no parallel batch call API.
+- Agent-supplied setup supports stdio and Streamable HTTP, not in-process server
+  objects.
+- Sync calls run in order, and native async calls must be awaited. There is no
+  parallel batch-call helper.
 - Catalog data changes only after `mcp_refresh()` or a reconnect.
-- Live connections, authentication state, and catalog data do not persist in a
-  Monty snapshot or SQLite.
-- There is no approval callback, audit sink, result cache, or automatic virtual
-  file materialization in this version.
+- Live connections, dynamic configuration, authentication state, promotions,
+  and catalog data do not persist in a Monty snapshot or SQLite. Recreate or
+  reload them after process restart.
+- There is no approval callback or result cache. The existing event sink records
+  safe server mutation and call metadata.
 - SSE is not supported. Use Streamable HTTP for remote servers.
 - Closing a kernel does not close a shared hub. Close both context managers.
 

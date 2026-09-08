@@ -50,6 +50,18 @@ uv run python -m unittest \
   tests.test_langchain_agent_boundaries -v
 ```
 
+Run the managed sandbox tests only:
+
+```console
+uv run python -m unittest tests.test_easy -v
+```
+
+These tests use real Monty workers. They cover all presets, bound state, relative
+files, file revisions, total quota rollback, deterministic and unsafe ZIPs,
+binary host tree transfer, memory-to-durable checkpoint restore, durable
+restart, package creation, manager file sharing and state isolation, async batch
+execution, and the fixed-session LangChain tool bundle.
+
 Run static checks:
 
 ```console
@@ -142,7 +154,8 @@ called.
 | Duplicate delivery | Delivering the same LangChain tool-call ID twice executes the state-changing cell twice. This confirms at-least-once behavior. |
 | Trimmed output | The agent sees truncation, reads the full output file, and continues in the same loop. |
 | Virtual files | Shell creation, Python reading, file-tool editing, and later Python reading share one virtual filesystem. |
-| MCP | An in-process MCP server supports search, Monty composition, an image result, and automatic virtual-file materialization. |
+| MCP | In-process and real stdio servers support search, Monty composition, same-cell hot loading, replace rollback, removal, an image result, and automatic virtual-file materialization. |
+| Dynamic MCP CodeAct | A scripted model adds a missing stdio MCP through `python_repl` on one human turn, then uses it with restored Python state on the next turn. The LangChain tool names stay unchanged. |
 | Code correction | The first Monty call rejects an unavailable package. The next model call uses supported code and returns the result. |
 | Snapshot recovery | A wrong Monty version returns a structured error. The agent resets the REPL and retries successfully. |
 

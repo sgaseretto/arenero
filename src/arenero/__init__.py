@@ -2,6 +2,20 @@ from .async_kernel import AsyncPersistentMontyKernel
 from .capabilities import capability_report, model_instructions
 from .cell import execute_repl_cell
 from .doctor import run_doctor
+from .easy import (
+    AsyncManagedSandbox,
+    AsyncSandboxManager,
+    ManagedSandbox,
+    SandboxAgentBundle,
+    SandboxConfig,
+    SandboxError,
+    SandboxManager,
+    SandboxResult,
+    open_async_sandbox,
+    open_async_sandbox_manager,
+    open_sandbox,
+    open_sandbox_manager,
+)
 from .events import AreneroEvent, EventSink, OpenTelemetryEventSink
 from .filesystem import FilesystemConfig
 from .hosted_tools import HostedTool, HostedToolConfig, HostedToolSet
@@ -87,7 +101,9 @@ __all__ = [
     "AreneroSandbox",
     "AsyncAreneroRuntime",
     "AsyncAreneroSandbox",
+    "AsyncManagedSandbox",
     "AsyncPersistentMontyKernel",
+    "AsyncSandboxManager",
     "AsyncSessionHandle",
     "EventSink",
     "ExecutionResult",
@@ -99,6 +115,7 @@ __all__ = [
     "HostedToolSet",
     "InMemorySessionStore",
     "KernelConfig",
+    "ManagedSandbox",
     "MediaFile",
     "ModuleBundle",
     "MontyPackageManager",
@@ -113,9 +130,14 @@ __all__ = [
     "RLMResult",
     "RLMUsage",
     "SQLiteSessionStore",
+    "SandboxAgentBundle",
+    "SandboxConfig",
+    "SandboxError",
     "SandboxExecuteResult",
+    "SandboxManager",
     "SandboxOperationResult",
     "SandboxReadResult",
+    "SandboxResult",
     "SandboxSearchResult",
     "SessionHandle",
     "SessionInfo",
@@ -142,6 +164,10 @@ __all__ = [
     "create_python_repl_tools",
     "execute_repl_cell",
     "model_instructions",
+    "open_async_sandbox",
+    "open_async_sandbox_manager",
+    "open_sandbox",
+    "open_sandbox_manager",
     "read_media_file",
     "run_doctor",
 ]

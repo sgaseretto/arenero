@@ -17,6 +17,45 @@ flowchart LR
 SQLite stores interpreter snapshots and session metadata. Workspace files use a
 Monty mount and remain outside SQLite.
 
+## The managed layer composes existing parts
+
+`open_sandbox()` is a thin composition layer. It selects an existing session
+store, virtual filesystem, network policy, synchronous kernel, and
+`AreneroRuntime`. It does not add another interpreter or filesystem.
+
+`SandboxConfig` presets make lifetime choices explicit. `ManagedSandbox` owns a
+runtime only when the factory created it. Handles opened by `SandboxManager`
+borrow one manager-owned runtime. This keeps shutdown order in one place and
+prevents one handle from closing a shared worker pool.
+
+```mermaid
+flowchart LR
+    Preset["SandboxConfig preset"] --> Factory["Factory or manager"]
+    Factory --> Existing["Existing store + filesystem + kernel + runtime"]
+    Existing --> Handle["Bound ManagedSandbox"]
+    Handle --> Relative["Relative-path convenience"]
+    Handle --> Result["Common result conversion"]
+    Handle --> Quota["Managed total quota check"]
+    Handle --> Checkpoint["Combined state and file checkpoint"]
+```
+
+The total workspace quota uses a simple bounded tree capture. Direct writes are
+checked before mutation. Code, shell, and package calls are checked after the
+call. Arenero restores the old managed files when those calls exceed the quota.
+It cannot roll back Python state or external side effects. This is intentionally
+not described as a transaction.
+
+Portable checkpoints combine the opaque snapshot and bounded files because
+their normal persistence planes are separate. Restore requires the same Monty
+version and execution policy. It permits another storage backend because memory
+versus SQLite does not change code authority.
+
+The managed async API uses `asyncio.to_thread()` over this complete synchronous
+surface. It reuses the synchronous kernel's subprocess pool. This keeps one
+implementation for files, shell, packages, quotas, and checkpoints. The native
+async kernel remains available for applications that need native async hosted
+functions.
+
 ## Persistent workspaces use Monty mounts
 
 `WorkspaceConfig` creates one kernel-owned, read-write `MountDir`. Files go to a
@@ -43,18 +82,21 @@ The core package does not import the MCP SDK. Applications import
 `McpHub` owns a private async event-loop thread so each client has one stable
 event loop for its complete lifetime. The sync kernel waits for calls on that
 loop. The native async kernel wraps the same submitted future and awaits it
-without blocking its caller event loop. Monty receives only six plain host
-functions. It never receives a client, transport, credential, or async object.
+without blocking its caller event loop. Monty receives nine plain host
+functions. It never receives a client, transport, or async object.
 
 The kernel asks the hub for a fresh function set for each outer operation. This
 makes `max_calls_per_operation` cover direct code, an executed virtual file, and
 follow-up code as one operation. It also lets restored Monty functions resolve
 the newly attached `mcp_call` host function after a process restart.
 
-Server configuration is caller-owned. The model can discover and call configured
-tools, but it cannot select a process command, endpoint, environment, header, or
-allowlist. Automatic transport retry is off because an uncertain failed reply can
-hide a completed side effect.
+The hub registry is mutable. Host code can add every supported server config.
+Monty can add stdio and Streamable HTTP configs made from plain values. It can
+also replace or remove a server. This keeps the outer agent interface fixed while
+the inner tool catalog changes. The hub rejects removal, replacement, and refresh
+while that server has an active call. A failed add is removed, and a failed
+replacement tries to restore the previous config. Automatic tool-call retry is
+off because an uncertain failed reply can hide a completed side effect.
 
 ```mermaid
 flowchart TB
@@ -63,10 +105,17 @@ flowchart TB
     Functions --> Hub["Caller-owned McpHub"]
     Hub --> Loop["Private async event-loop thread"]
     Loop --> Clients["Persistent MCP clients"]
-    Clients --> Servers["Configured stdio, HTTP, or in-process servers"]
+    Clients --> Servers["Initial or hot-loaded stdio, HTTP, or in-process servers"]
+    Functions -->|mcp_add_server| Registry["Shared runtime registry"]
+    Registry --> Clients
     Snapshot["Monty snapshot"] -. stores helper that names mcp_call .-> Kernel
 Snapshot -. does not store .-> Hub
 ```
+
+Dynamic server configuration belongs to the hub, not to a Monty session. All
+sessions that share the hub see the change. It lasts until the hub closes and is
+not written to SQLite. Starting with `McpHub()` ensures the fixed function names
+exist before any type-checked session snapshot is created.
 
 ## Hosted tools keep framework execution paths
 

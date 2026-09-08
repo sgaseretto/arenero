@@ -53,11 +53,13 @@ def capability_report(
         }
     mcp_hub = kernel.mcp_hub
     mcp_limits: dict[str, Any] | None = None
+    mcp_servers: list[dict[str, Any]] = []
     if mcp_hub is not None:
         mcp_limits = asdict(mcp_hub.config)
         allowed_tools = mcp_limits.get("allowed_tools")
         if allowed_tools is not None:
             mcp_limits["allowed_tools"] = sorted(allowed_tools)
+        mcp_servers = mcp_hub.servers()["servers"]
     promoted_tools = mcp_hub.promoted_toolset() if mcp_hub is not None else None
     active_hosted_tools = kernel.hosted_tools.merged(promoted_tools)
     return {
@@ -135,6 +137,9 @@ def capability_report(
                     "mcp_search",
                     "mcp_describe",
                     "mcp_promote",
+                    "mcp_add_server",
+                    "mcp_remove_server",
+                    "mcp_replace_server",
                     "mcp_refresh",
                     "mcp_call",
                 ]
@@ -146,6 +151,11 @@ def capability_report(
                 if promoted_tools is not None
                 else []
             ),
+            "servers": mcp_servers,
+            "dynamic_server_configuration": mcp_hub is not None,
+            "dynamic_server_scope": "shared MCP hub",
+            "dynamic_server_transports": ["stdio", "streamable-http"],
+            "dynamic_server_configuration_is_durable": False,
             "artifact_directory": getattr(kernel, "mcp_artifact_directory", None),
             "limits": mcp_limits,
         },
@@ -175,6 +185,7 @@ def capability_report(
             "Use execute_file or %run for one flat virtual Python file.",
             "Use execute_module for a bounded static virtual module graph.",
             "Session snapshots do not contain virtual files or host functions.",
+            "Dynamic MCP server configuration lasts only while its hub is alive.",
             "One execution at a time is allowed for each session.",
         ],
     }

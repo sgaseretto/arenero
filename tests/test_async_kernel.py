@@ -244,6 +244,72 @@ class AsyncKernelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertIn('"sum": 42', result["result"])
 
+    async def test_async_hub_can_add_and_remove_a_live_server(self) -> None:
+        """Update one shared hub without blocking the caller event loop."""
+
+        server = MCPServer("async-dynamic")
+
+        @server.tool(description="Double one integer")
+        async def double(value: int) -> dict[str, int]:
+            """Double one integer after yielding to the event loop."""
+
+            await asyncio.sleep(0)
+            return {"value": value * 2}
+
+        hub = McpHub([])
+        try:
+            added = await hub.async_add_server(
+                McpServerConfig.in_process("late", server)
+            )
+            async with AsyncPersistentMontyKernel(mcp_hub=hub) as kernel:
+                result = await kernel.execute(
+                    "dynamic-mcp",
+                    "response = await mcp_call('late__double', {'value': 21})\n"
+                    "response['value']['value']",
+                )
+                removed = await kernel.execute(
+                    "dynamic-mcp", "await mcp_remove_server('late')"
+                )
+        finally:
+            await asyncio.to_thread(hub.close)
+
+        self.assertEqual(added["action"], "added")
+        self.assertEqual(result["result"], 42)
+        self.assertEqual(removed["result"]["action"], "removed")
+
+    async def test_dynamic_mutation_rejects_an_active_server_call(self) -> None:
+        """Keep a live client until its active MCP tool call has completed."""
+
+        server = MCPServer("async-busy")
+
+        @server.tool(description="Wait and return")
+        async def wait() -> str:
+            """Return after a short deterministic delay."""
+
+            await asyncio.sleep(0.05)
+            return "done"
+
+        hub = McpHub([McpServerConfig.in_process("busy", server)])
+        try:
+            call = asyncio.create_task(hub.async_call("busy__wait"))
+            active = False
+            for _ in range(50):
+                status = await hub.async_servers()
+                if status["servers"][0]["active_calls"] == 1:
+                    active = True
+                    break
+                await asyncio.sleep(0.001)
+            blocked = await hub.async_remove_server("busy")
+            completed = await call
+            removed = await hub.async_remove_server("busy")
+        finally:
+            await asyncio.to_thread(hub.close)
+
+        self.assertTrue(active)
+        self.assertEqual(blocked["error"]["type"], "McpServerBusy")
+        self.assertTrue(completed["ok"])
+        self.assertEqual(removed["action"], "removed")
+
     async def test_async_mcp_promotion_becomes_an_awaitable_function(self) -> None:
         """Promote one MCP tool and await it on the next async operation."""
 

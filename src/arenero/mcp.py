@@ -43,6 +43,9 @@ def mcp_search(
 ) -> dict[str, Any]: ...
 def mcp_describe(name: str) -> dict[str, Any]: ...
 def mcp_promote(name: str, python_name: str | None = None) -> dict[str, Any]: ...
+def mcp_add_server(config: dict[str, Any]) -> dict[str, Any]: ...
+def mcp_remove_server(name: str) -> dict[str, Any]: ...
+def mcp_replace_server(config: dict[str, Any]) -> dict[str, Any]: ...
 def mcp_refresh(server: str | None = None) -> dict[str, Any]: ...
 def mcp_call(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]: ...
 """
@@ -61,6 +64,9 @@ async def mcp_promote(
     name: str,
     python_name: str | None = None,
 ) -> dict[str, Any]: ...
+async def mcp_add_server(config: dict[str, Any]) -> dict[str, Any]: ...
+async def mcp_remove_server(name: str) -> dict[str, Any]: ...
+async def mcp_replace_server(config: dict[str, Any]) -> dict[str, Any]: ...
 async def mcp_refresh(server: str | None = None) -> dict[str, Any]: ...
 async def mcp_call(
     name: str,
@@ -75,9 +81,13 @@ discovered tool a direct Python function on the next REPL execution, and
 mcp_call(name, arguments) to call it. Use the qualified server__tool name returned by search. You can call
 tools in loops and pass one tool result to another without returning intermediate
 data to the model. mcp_refresh() reconnects configured servers and reloads the
-catalog. The application chooses servers, credentials, limits, and allowlists.
-You cannot add servers or use MCP resources and prompts from this API. Results
-are plain bounded dictionaries. Check ok, error, and truncated before use.
+catalog. Use mcp_add_server(config), mcp_remove_server(name), or
+mcp_replace_server(config) to change the shared runtime catalog. Agent-supplied
+config supports stdio and Streamable HTTP, including the http transport alias.
+The new server can be searched and called later in the same Python cell. Dynamic
+server configuration lasts only while this MCP hub is alive. MCP resources and
+prompts are not exposed. Results are plain bounded dictionaries. Check ok,
+error, and truncated before use.
 """
 
 ASYNC_MCP_REPL_INSTRUCTIONS = """Configured MCP tools are available as async
@@ -86,7 +96,10 @@ mcp_search(query) to discover tools, await mcp_describe(name) to read one input
 schema, await mcp_promote(name) to make it a direct function on the next REPL
 execution, and await mcp_call(name, arguments) to call it. Use qualified server__tool
 names. Await mcp_refresh() to reconnect servers. Calls return plain bounded
-dictionaries. Check ok, error, and truncated before use.
+dictionaries. Use await mcp_add_server(config), await mcp_remove_server(name),
+or await mcp_replace_server(config) to change the shared runtime catalog. Dynamic
+server configuration lasts only while this MCP hub is alive. Check ok, error,
+and truncated before use.
 """
 
 
@@ -213,6 +226,63 @@ class McpServerConfig:
         """
         return cls(name=name, transport="in-process", target=target)
 
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> Self:
+        """Create an agent-configurable server from plain values.
+
+        Args:
+            config: Server name, transport, and stdio or HTTP connection values.
+                ``transport="http"`` is accepted as an alias for
+                ``"streamable-http"``.
+
+        Returns:
+            A validated stdio or Streamable HTTP server configuration.
+
+        Raises:
+            TypeError: If a field has the wrong plain-value type.
+            ValueError: If the transport or supplied fields are not supported.
+        """
+
+        if not isinstance(config, Mapping):
+            raise TypeError("MCP server config must be a dictionary")
+        data = dict(config)
+        transport = data.get("transport")
+        if transport == "http":
+            transport = "streamable-http"
+        if transport not in {"stdio", "streamable-http"}:
+            raise ValueError("transport must be 'stdio', 'http', or 'streamable-http'")
+        allowed = {
+            "stdio": {"name", "transport", "command", "args", "env", "cwd"},
+            "streamable-http": {"name", "transport", "url", "headers"},
+        }[transport]
+        unknown = sorted(data.keys() - allowed)
+        if unknown:
+            raise ValueError(f"unsupported MCP server fields: {', '.join(unknown)}")
+        name = data.get("name")
+        if not isinstance(name, str):
+            raise TypeError("MCP server name must be a string")
+        if transport == "stdio":
+            command = data.get("command")
+            args = data.get("args", ())
+            env = data.get("env")
+            cwd = data.get("cwd")
+            if not isinstance(command, str):
+                raise TypeError("stdio command must be a string")
+            if not isinstance(args, (list, tuple)) or not all(
+                isinstance(value, str) for value in args
+            ):
+                raise TypeError("stdio args must be a list of strings")
+            _validate_string_mapping(env, "stdio env")
+            if cwd is not None and not isinstance(cwd, str):
+                raise TypeError("stdio cwd must be a string")
+            return cls.stdio(name, command, args=args, env=env, cwd=cwd)
+        url = data.get("url")
+        headers = data.get("headers")
+        if not isinstance(url, str):
+            raise TypeError("HTTP url must be a string")
+        _validate_string_mapping(headers, "HTTP headers")
+        return cls.http(name, url, headers=headers)
+
 
 @dataclass(frozen=True)
 class McpHubConfig:
@@ -332,14 +402,15 @@ class McpHub:
 
     def __init__(
         self,
-        servers: Sequence[McpServerConfig],
+        servers: Sequence[McpServerConfig] = (),
         config: McpHubConfig | None = None,
         event_sink: EventSink | None = None,
     ) -> None:
         """Create an MCP hub without opening its connections.
 
         Args:
-            servers: User-configured MCP servers. Names must be unique.
+            servers: Initial MCP servers. Names must be unique. An empty value
+                creates a hub that agents can populate at runtime.
             config: Discovery, call, concurrency, and transfer limits.
             event_sink: Optional observer for safe MCP metadata.
         """
@@ -355,6 +426,7 @@ class McpHub:
         self._tools: dict[str, _ToolEntry] = {}
         self._catalog_truncated = False
         self._promoted: dict[str, str] = {}
+        self._active_calls: dict[str, int] = {name: 0 for name in names}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._loop_ready = threading.Event()
@@ -446,6 +518,18 @@ class McpHub:
 
             return self.promote(name, python_name=python_name)
 
+        def mcp_add_server(config: dict[str, Any]) -> dict[str, Any]:
+            """Connect and publish one new stdio or HTTP MCP server."""
+            return self.add_server(config)
+
+        def mcp_remove_server(name: str) -> dict[str, Any]:
+            """Disconnect and remove one MCP server from this shared hub."""
+            return self.remove_server(name)
+
+        def mcp_replace_server(config: dict[str, Any]) -> dict[str, Any]:
+            """Replace one MCP server while keeping its namespace."""
+            return self.replace_server(config)
+
         def mcp_refresh(server: str | None = None) -> dict[str, Any]:
             """Reconnect and refresh one server or the full catalog."""
             return self.refresh(server)
@@ -485,6 +569,9 @@ class McpHub:
             "mcp_search": mcp_search,
             "mcp_describe": mcp_describe,
             "mcp_promote": mcp_promote,
+            "mcp_add_server": mcp_add_server,
+            "mcp_remove_server": mcp_remove_server,
+            "mcp_replace_server": mcp_replace_server,
             "mcp_refresh": mcp_refresh,
             "mcp_call": mcp_call,
         }
@@ -520,6 +607,18 @@ class McpHub:
             """Promote one discovered MCP tool for the next REPL execution."""
 
             return await self.async_promote(name, python_name=python_name)
+
+        async def mcp_add_server(config: dict[str, Any]) -> dict[str, Any]:
+            """Connect and publish one new stdio or HTTP MCP server."""
+            return await self.async_add_server(config)
+
+        async def mcp_remove_server(name: str) -> dict[str, Any]:
+            """Disconnect and remove one MCP server from this shared hub."""
+            return await self.async_remove_server(name)
+
+        async def mcp_replace_server(config: dict[str, Any]) -> dict[str, Any]:
+            """Replace one MCP server while keeping its namespace."""
+            return await self.async_replace_server(config)
 
         async def mcp_refresh(server: str | None = None) -> dict[str, Any]:
             """Reconnect and refresh one server or the full catalog."""
@@ -560,6 +659,9 @@ class McpHub:
             "mcp_search": mcp_search,
             "mcp_describe": mcp_describe,
             "mcp_promote": mcp_promote,
+            "mcp_add_server": mcp_add_server,
+            "mcp_remove_server": mcp_remove_server,
+            "mcp_replace_server": mcp_replace_server,
             "mcp_refresh": mcp_refresh,
             "mcp_call": mcp_call,
         }
@@ -635,6 +737,64 @@ class McpHub:
         await asyncio.to_thread(self.open)
         return await self._asubmit(
             self._promote_data(name, python_name), self.config.connect_timeout_seconds
+        )
+
+    async def async_add_server(
+        self, server: McpServerConfig | Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Connect a new server without blocking the caller event loop.
+
+        Args:
+            server: Validated host config or agent-supplied stdio or HTTP values.
+
+        Returns:
+            Added server status or a structured configuration or connection error.
+        """
+
+        config, error = _coerce_server_config(server)
+        if error is not None:
+            return error
+        assert config is not None
+        await asyncio.to_thread(self.open)
+        return await self._asubmit(
+            self._add_server_data(config), self.config.connect_timeout_seconds
+        )
+
+    async def async_remove_server(self, name: str) -> dict[str, Any]:
+        """Remove a server without blocking the caller event loop.
+
+        Args:
+            name: Configured server namespace.
+
+        Returns:
+            Removal status or a structured unknown or busy error.
+        """
+
+        await asyncio.to_thread(self.open)
+        return await self._asubmit(
+            self._remove_server_data(name), self.config.connect_timeout_seconds
+        )
+
+    async def async_replace_server(
+        self, server: McpServerConfig | Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Replace a server without blocking the caller event loop.
+
+        Args:
+            server: Config with the namespace to replace and its new connection.
+
+        Returns:
+            Replacement status or a structured configuration or connection error.
+        """
+
+        config, error = _coerce_server_config(server)
+        if error is not None:
+            return error
+        assert config is not None
+        await asyncio.to_thread(self.open)
+        return await self._asubmit(
+            self._replace_server_data(config),
+            self.config.connect_timeout_seconds * 2,
         )
 
     async def async_refresh(self, server: str | None = None) -> dict[str, Any]:
@@ -862,6 +1022,62 @@ class McpHub:
             1 if server is not None else max(1, len(self._states))
         )
         return self._submit(self._refresh_data(server), timeout)
+
+    def add_server(self, server: McpServerConfig | Mapping[str, Any]) -> dict[str, Any]:
+        """Connect and publish one new MCP server.
+
+        Args:
+            server: Validated host config or agent-supplied stdio or HTTP values.
+
+        Returns:
+            Added server status or a structured configuration or connection error.
+        """
+
+        config, error = _coerce_server_config(server)
+        if error is not None:
+            return error
+        assert config is not None
+        self.open()
+        return self._submit(
+            self._add_server_data(config), self.config.connect_timeout_seconds
+        )
+
+    def remove_server(self, name: str) -> dict[str, Any]:
+        """Disconnect and remove one MCP server.
+
+        Args:
+            name: Configured server namespace.
+
+        Returns:
+            Removal status or a structured unknown or busy error.
+        """
+
+        self.open()
+        return self._submit(
+            self._remove_server_data(name), self.config.connect_timeout_seconds
+        )
+
+    def replace_server(
+        self, server: McpServerConfig | Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Replace one MCP server and keep its namespace.
+
+        Args:
+            server: Config with the namespace to replace and its new connection.
+
+        Returns:
+            Replacement status or a structured configuration or connection error.
+        """
+
+        config, error = _coerce_server_config(server)
+        if error is not None:
+            return error
+        assert config is not None
+        self.open()
+        return self._submit(
+            self._replace_server_data(config),
+            self.config.connect_timeout_seconds * 2,
+        )
 
     def call(
         self,
@@ -1113,23 +1329,35 @@ class McpHub:
             Safe server and catalog state.
         """
         servers = []
-        for name, state in self._states.items():
-            servers.append(
-                {
-                    "name": name,
-                    "transport": state.config.transport,
-                    "connected": state.client is not None,
-                    "tool_count": sum(
-                        1 for tool in self._tools.values() if tool.server == name
-                    ),
-                    "error": state.error,
-                }
-            )
+        for name in self._states:
+            servers.append(self._server_status(name))
         return {
             "ok": True,
             "servers": servers,
             "tool_count": len(self._tools),
             "catalog_truncated": self._catalog_truncated,
+        }
+
+    def _server_status(self, name: str) -> dict[str, Any]:
+        """Build safe status for one configured server.
+
+        Args:
+            name: Configured server namespace.
+
+        Returns:
+            Public transport, connection, call, tool, and error fields.
+        """
+
+        state = self._states[name]
+        return {
+            "name": name,
+            "transport": state.config.transport,
+            "connected": state.client is not None,
+            "active_calls": self._active_calls.get(name, 0),
+            "tool_count": sum(
+                1 for tool in self._tools.values() if tool.server == name
+            ),
+            "error": state.error,
         }
 
     async def _search_data(
@@ -1251,6 +1479,168 @@ class McpHub:
             },
         }
 
+    async def _add_server_data(self, server: McpServerConfig) -> dict[str, Any]:
+        """Connect and publish one server on the hub event loop.
+
+        Args:
+            server: Validated server configuration.
+
+        Returns:
+            Added server status or a structured duplicate or connection error.
+        """
+
+        if server.name in self._states:
+            return _error_result(
+                "McpServerAlreadyExists",
+                f"MCP server already exists: {server.name}",
+                server=server.name,
+            )
+        self._states[server.name] = _ServerState(config=server)
+        self._active_calls[server.name] = 0
+        await self._connect(server.name)
+        state = self._states[server.name]
+        if state.client is None:
+            message = state.error or "The MCP server did not connect."
+            del self._states[server.name]
+            del self._active_calls[server.name]
+            emit_event(
+                self.event_sink,
+                "mcp",
+                "server_add_failed",
+                server=server.name,
+                transport=server.transport,
+            )
+            return _error_result(
+                "McpConnectionFailed",
+                message,
+                server=server.name,
+                retryable=True,
+            )
+        emit_event(
+            self.event_sink,
+            "mcp",
+            "server_added",
+            server=server.name,
+            transport=server.transport,
+        )
+        return {
+            "ok": True,
+            "action": "added",
+            "server": self._server_status(server.name),
+            "tool_count": len(self._tools),
+        }
+
+    async def _remove_server_data(self, name: str) -> dict[str, Any]:
+        """Disconnect and remove one server on the hub event loop.
+
+        Args:
+            name: Configured server namespace.
+
+        Returns:
+            Removal status or a structured unknown or busy error.
+        """
+
+        if not isinstance(name, str) or name not in self._states:
+            return _error_result(
+                "UnknownMcpServer", f"Unknown MCP server: {name}", server=name
+            )
+        if self._active_calls.get(name, 0):
+            return _error_result(
+                "McpServerBusy",
+                f"MCP server has active calls: {name}",
+                server=name,
+                retryable=True,
+            )
+        transport = self._states[name].config.transport
+        await self._disconnect(name)
+        del self._states[name]
+        del self._active_calls[name]
+        prefix = f"{name}__"
+        for qualified_name in [
+            value for value in self._promoted if value.startswith(prefix)
+        ]:
+            del self._promoted[qualified_name]
+        emit_event(
+            self.event_sink,
+            "mcp",
+            "server_removed",
+            server=name,
+            transport=transport,
+        )
+        return {
+            "ok": True,
+            "action": "removed",
+            "server": name,
+            "tool_count": len(self._tools),
+        }
+
+    async def _replace_server_data(self, server: McpServerConfig) -> dict[str, Any]:
+        """Replace one server and restore its old config after a failed change.
+
+        Args:
+            server: Validated replacement configuration.
+
+        Returns:
+            Replacement status or a structured unknown, busy, or connection error.
+        """
+
+        if server.name not in self._states:
+            return _error_result(
+                "UnknownMcpServer",
+                f"Unknown MCP server: {server.name}",
+                server=server.name,
+            )
+        if self._active_calls.get(server.name, 0):
+            return _error_result(
+                "McpServerBusy",
+                f"MCP server has active calls: {server.name}",
+                server=server.name,
+                retryable=True,
+            )
+        state = self._states[server.name]
+        previous = state.config
+        state.config = server
+        state.error = None
+        await self._connect(server.name)
+        if state.client is None:
+            replacement_error = state.error or "The replacement did not connect."
+            state.config = previous
+            state.error = None
+            await self._connect(server.name)
+            restored = state.client is not None
+            suffix = (
+                "The previous server was restored."
+                if restored
+                else "The previous server could not be restored."
+            )
+            emit_event(
+                self.event_sink,
+                "mcp",
+                "server_replace_failed",
+                server=server.name,
+                transport=server.transport,
+                restored=restored,
+            )
+            return _error_result(
+                "McpConnectionFailed",
+                f"{replacement_error} {suffix}",
+                server=server.name,
+                retryable=True,
+            )
+        emit_event(
+            self.event_sink,
+            "mcp",
+            "server_replaced",
+            server=server.name,
+            transport=server.transport,
+        )
+        return {
+            "ok": True,
+            "action": "replaced",
+            "server": self._server_status(server.name),
+            "tool_count": len(self._tools),
+        }
+
     async def _refresh_data(self, server: str | None) -> dict[str, Any]:
         """Reconnect selected servers and return updated status.
 
@@ -1261,6 +1651,14 @@ class McpHub:
             Safe server and catalog state.
         """
         names = [server] if server is not None else list(self._states)
+        busy = next((name for name in names if self._active_calls.get(name, 0)), None)
+        if busy is not None:
+            return _error_result(
+                "McpServerBusy",
+                f"MCP server has active calls: {busy}",
+                server=busy,
+                retryable=True,
+            )
         self._catalog_truncated = False
         for name in names:
             assert name is not None
@@ -1297,57 +1695,61 @@ class McpHub:
         )
         semaphore = self._call_semaphore
         assert semaphore is not None
-        async with semaphore:
-            try:
-                result = await self._call_once(tool, arguments, timeout_seconds)
-            except Exception as first_error:  # noqa: BLE001 - transport boundary
-                await self._connect(tool.server)
-                if not self.config.retry_transport_errors:
-                    return _error_result(
-                        "McpTransportError",
-                        _exception_text(first_error),
-                        server=tool.server,
-                        tool=tool.qualified_name,
-                        retryable=True,
-                    )
-                refreshed = self._tools.get(tool.qualified_name)
-                if refreshed is None:
-                    return _error_result(
-                        "McpTransportError",
-                        _exception_text(first_error),
-                        server=tool.server,
-                        tool=tool.qualified_name,
-                        retryable=True,
-                    )
+        self._active_calls[tool.server] = self._active_calls.get(tool.server, 0) + 1
+        try:
+            async with semaphore:
                 try:
-                    result = await self._call_once(
-                        refreshed,
-                        arguments,
-                        timeout_seconds,
-                    )
-                except Exception as second_error:  # noqa: BLE001 - transport boundary
-                    return _error_result(
-                        "McpTransportError",
-                        _exception_text(second_error),
-                        server=tool.server,
-                        tool=tool.qualified_name,
-                        retryable=True,
-                    )
-        normalized = _normalize_result(
-            tool,
-            result,
-            self.config.max_result_bytes,
-        )
-        emit_event(
-            self.event_sink,
-            "mcp",
-            "call_finished",
-            server=tool.server,
-            tool=tool.qualified_name,
-            ok=normalized["ok"],
-            truncated=normalized["truncated"],
-        )
-        return normalized
+                    result = await self._call_once(tool, arguments, timeout_seconds)
+                except Exception as first_error:  # noqa: BLE001 - transport boundary
+                    await self._connect(tool.server)
+                    if not self.config.retry_transport_errors:
+                        return _error_result(
+                            "McpTransportError",
+                            _exception_text(first_error),
+                            server=tool.server,
+                            tool=tool.qualified_name,
+                            retryable=True,
+                        )
+                    refreshed = self._tools.get(tool.qualified_name)
+                    if refreshed is None:
+                        return _error_result(
+                            "McpTransportError",
+                            _exception_text(first_error),
+                            server=tool.server,
+                            tool=tool.qualified_name,
+                            retryable=True,
+                        )
+                    try:
+                        result = await self._call_once(
+                            refreshed,
+                            arguments,
+                            timeout_seconds,
+                        )
+                    except Exception as second_error:  # noqa: BLE001
+                        return _error_result(
+                            "McpTransportError",
+                            _exception_text(second_error),
+                            server=tool.server,
+                            tool=tool.qualified_name,
+                            retryable=True,
+                        )
+            normalized = _normalize_result(
+                tool,
+                result,
+                self.config.max_result_bytes,
+            )
+            emit_event(
+                self.event_sink,
+                "mcp",
+                "call_finished",
+                server=tool.server,
+                tool=tool.qualified_name,
+                ok=normalized["ok"],
+                truncated=normalized["truncated"],
+            )
+            return normalized
+        finally:
+            self._active_calls[tool.server] -= 1
 
     async def _call_once(
         self,
@@ -1613,6 +2015,52 @@ def _content_text(content: list[dict[str, Any]]) -> str:
         for block in content
         if block.get("type") == "text" and block.get("text")
     )
+
+
+def _validate_string_mapping(value: Any, field_name: str) -> None:
+    """Validate one optional string-to-string configuration mapping.
+
+    Args:
+        value: Mapping to validate, or ``None``.
+        field_name: Public field name used in an error message.
+
+    Raises:
+        TypeError: If the value is not a string mapping.
+    """
+
+    if value is not None and (
+        not isinstance(value, Mapping)
+        or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in value.items()
+        )
+    ):
+        raise TypeError(f"{field_name} must be a dictionary of strings")
+
+
+def _coerce_server_config(
+    server: McpServerConfig | Mapping[str, Any],
+) -> tuple[McpServerConfig | None, dict[str, Any] | None]:
+    """Convert public server input into a config or structured error.
+
+    Args:
+        server: Existing config or agent-supplied plain mapping.
+
+    Returns:
+        A config and no error, or no config and one MCP error envelope.
+    """
+
+    if isinstance(server, McpServerConfig):
+        return server, None
+    try:
+        return McpServerConfig.from_mapping(server), None
+    except (TypeError, ValueError) as exc:
+        name = server.get("name") if isinstance(server, Mapping) else None
+        return None, _error_result(
+            "InvalidMcpServerConfig",
+            str(exc),
+            server=name if isinstance(name, str) else None,
+        )
 
 
 def _error_result(

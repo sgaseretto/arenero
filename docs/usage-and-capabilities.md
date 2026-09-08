@@ -8,6 +8,9 @@ Monty is experimental, so run the project tests before a Monty version update.
 
 | Requirement | Use |
 | --- | --- |
+| Complete sandbox with simple setup | `open_sandbox()` and a `SandboxConfig` preset |
+| Several bound sandboxes on one pool | `open_sandbox_manager()` and `SandboxConfig.batch()` |
+| Complete managed API in async code | `open_async_sandbox()` or `open_async_sandbox_manager()` |
 | Direct persistent Python cells | `PersistentMontyKernel.execute()` |
 | One virtual helper file and follow-up code | `PersistentMontyKernel.execute_file()` |
 | Small static graph of virtual Python files | `execute_module()` or an agent module tool |
@@ -30,20 +33,24 @@ Monty is experimental, so run the project tests before a Monty version update.
 ```mermaid
 flowchart TD
     Need["What does the caller need?"] --> Batch{"Concurrent async Python agents?"}
-    Batch -->|Yes| Native["AsyncPersistentMontyKernel and optional async tools"]
+    Batch -->|Yes, complete sandbox| ManagedBatch["Async managed manager + batch preset"]
+    Batch -->|Yes, native async host calls| Native["AsyncPersistentMontyKernel and optional async tools"]
     Batch -->|No| Agent{"Agent framework tools?"}
     Agent -->|Yes| Tools["create_python_repl_tools"]
-    Agent -->|No| Async{"Async application?"}
+    Agent -->|No, simple setup| Managed["open_sandbox"]
+    Agent -->|No, custom assembly| Async{"Async application?"}
     Async -->|Yes| AsyncFacade["AsyncAreneroSandbox"]
     Async -->|No| Surface{"Structured files and shell?"}
     Surface -->|Yes| Facade["AreneroSandbox"]
     Surface -->|No| Kernel["PersistentMontyKernel"]
     Tools --> Durable{"Survive process restart?"}
     Native --> Durable
+    ManagedBatch --> Durable
+    Managed --> Durable
     AsyncFacade --> Durable
     Facade --> Durable
     Kernel --> Durable
-    Need --> MCP{"Call configured MCP tools?"}
+    Need --> MCP{"Call initial or hot-loaded MCP tools?"}
     MCP -->|Yes| Hub["McpHub plus either persistent kernel"]
     Need --> RLMNeed{"Keep large context outside the model?"}
     RLMNeed -->|Yes| RLM["RLM plus AsyncPersistentMontyKernel"]
@@ -56,6 +63,7 @@ flowchart TD
 
 | Area | Supported | Main limit |
 | --- | --- | --- |
+| Managed setup | Owned factory, lifetime presets, bound IDs, relative paths, common results, total quotas, revisions, tree transfer, checkpoints, managers, and selected tools | Convenience does not expand Monty's language or host authority. |
 | Persistent Python | Variables, functions, closures, comprehensions, simple classes, dataclasses, control flow, and a partial standard library | Monty's Python subset, not CPython. |
 | Type checking | Optional checks before each user feed, including filesystem and host-function declarations | A clean check does not prove that every partial runtime API exists. |
 | Files | UTF-8 text, bytes, in-memory files, confined mounts, persistent workspaces, and bounded structured operations | No ambient host paths or live file descriptors. |
@@ -71,7 +79,7 @@ flowchart TD
 | Binary and images | Upload, download, Base64 data URL, and LangChain image block | The host must create the model content block. |
 | Output control | Caller-selected lower limits, application hard caps, truncation data, and optional file offload | Offloaded output is still bounded. |
 | Async use | Full thread-based sandbox facade or native async Python worker pool | The native adapter does not include the virtual shell. Shared files serialize work. |
-| MCP tools | Configured stdio, Streamable HTTP, or in-process servers; progressive discovery; calls from persistent Python | Tools only; no resources, prompts, dynamic server configuration, or input-required flow. |
+| MCP tools | Initial or hot-loaded stdio and Streamable HTTP servers, host-supplied in-process servers, progressive discovery, and calls from persistent Python | Tools only; no resources, prompts, SSE, durable dynamic registry, or input-required flow. |
 
 ### Discover and compose MCP tools inside Python
 
@@ -98,10 +106,12 @@ with (
 ```
 
 The model can search before it requests a full schema. It can call several tools
-and calculate over their results in one Python cell. A helper function that uses
-`mcp_call` persists with the session. Live server connections do not persist in
-the snapshot. See [MCP tools inside the REPL](mcp.md) for the exact API, limits,
-result envelope, and security boundary.
+and calculate over their results in one Python cell. If a server is missing, use
+`McpHub()` and let the model call `mcp_add_server()` from the REPL. It can use
+the new server in the same cell. The hub registry is shared, but it does not
+persist in the Monty snapshot or SQLite. A helper function that uses `mcp_call`
+does persist with its session. See [MCP tools inside the REPL](mcp.md) for the
+exact config forms, lifecycle, limits, result envelope, and boundary.
 
 ### Run independent agents in one async batch
 

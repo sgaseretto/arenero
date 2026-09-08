@@ -256,6 +256,119 @@ second["error"]["type"]
         self.assertTrue(refreshed["servers"][0]["connected"])
         self.assertIn('"product": 15', after_refresh["result"]["content"][0]["text"])
 
+    def test_repl_can_add_call_replace_and_remove_a_stdio_server(self) -> None:
+        """Change the shared MCP catalog through fixed REPL host functions."""
+
+        fixture = Path("tests/fixtures/mcp_server.py").resolve()
+        config = {
+            "name": "late",
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(fixture)],
+            "cwd": str(Path.cwd()),
+        }
+        with (
+            McpHub([]) as hub,
+            PersistentMontyKernel(
+                config=KernelConfig(type_check=True),
+                mcp_hub=hub,
+            ) as kernel,
+        ):
+            added_and_called = kernel.execute(
+                "dynamic",
+                f"added = mcp_add_server({config!r})\n"
+                "answer = mcp_call('late__multiply', {'a': 6, 'b': 7})\n"
+                "{'added': added['ok'], 'answer': answer['content'][0]['text']}",
+            )
+            shared_call = kernel.execute(
+                "another-session",
+                "mcp_call('late__multiply', {'a': 2, 'b': 4})['content'][0]['text']",
+            )
+            replaced_and_called = kernel.execute(
+                "dynamic",
+                f"replaced = mcp_replace_server({config!r})\n"
+                "answer = mcp_call('late__multiply', {'a': 3, 'b': 5})\n"
+                "{'replaced': replaced['ok'], 'answer': answer['content'][0]['text']}",
+            )
+            promoted = kernel.execute("dynamic", "mcp_promote('late__multiply')['ok']")
+            removed = kernel.execute("dynamic", "mcp_remove_server('late')")
+            report = kernel.capabilities()
+            missing = kernel.execute(
+                "dynamic", "mcp_call('late__multiply', {'a': 1, 'b': 2})"
+            )
+
+        self.assertTrue(added_and_called["result"]["added"])
+        self.assertIn('"product": 42', added_and_called["result"]["answer"])
+        self.assertIn('"product": 8', shared_call["result"])
+        self.assertTrue(replaced_and_called["state_restored"])
+        self.assertTrue(replaced_and_called["result"]["replaced"])
+        self.assertIn('"product": 15', replaced_and_called["result"]["answer"])
+        self.assertTrue(promoted["result"])
+        self.assertEqual(removed["result"]["action"], "removed")
+        self.assertEqual(report["mcp"]["promoted_functions"], [])
+        self.assertEqual(missing["result"]["error"]["type"], "UnknownMcpTool")
+
+    def test_dynamic_server_failure_rolls_back_registry_changes(self) -> None:
+        """Keep the old server when an add or replacement cannot connect."""
+
+        with McpHub([McpServerConfig.in_process("demo", self.make_server())]) as hub:
+            duplicate = hub.add_server(
+                McpServerConfig.in_process("demo", self.make_server("duplicate"))
+            )
+            failed_add = hub.add_server(
+                {
+                    "name": "missing",
+                    "transport": "stdio",
+                    "command": "/arenero-command-that-does-not-exist",
+                }
+            )
+            failed_replace = hub.replace_server(
+                {
+                    "name": "demo",
+                    "transport": "stdio",
+                    "command": "/arenero-command-that-does-not-exist",
+                }
+            )
+            servers = hub.servers()
+            still_works = hub.call("demo__add", {"a": 20, "b": 22})
+
+        self.assertEqual(duplicate["error"]["type"], "McpServerAlreadyExists")
+        self.assertEqual(failed_add["error"]["type"], "McpConnectionFailed")
+        self.assertEqual(failed_replace["error"]["type"], "McpConnectionFailed")
+        self.assertIn(
+            "previous server was restored", failed_replace["error"]["message"]
+        )
+        self.assertEqual([server["name"] for server in servers["servers"]], ["demo"])
+        self.assertTrue(still_works["ok"])
+
+    def test_agent_server_mapping_rejects_in_process_and_unknown_fields(self) -> None:
+        """Accept only serializable stdio and HTTP details from Monty code."""
+
+        remote = McpServerConfig.from_mapping(
+            {
+                "name": "remote",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+            }
+        )
+        hub = McpHub([])
+        invalid = hub.add_server(
+            {"name": "bad", "transport": "in-process", "target": "not-live"}
+        )
+        unknown = hub.add_server(
+            {
+                "name": "bad",
+                "transport": "stdio",
+                "command": "python",
+                "surprise": True,
+            }
+        )
+        hub.close()
+
+        self.assertEqual(remote.transport, "streamable-http")
+        self.assertEqual(invalid["error"]["type"], "InvalidMcpServerConfig")
+        self.assertEqual(unknown["error"]["type"], "InvalidMcpServerConfig")
+
     def test_langchain_repl_description_explains_mcp_functions(self) -> None:
         """Tell a LangChain agent how to discover and call configured tools."""
         with (
@@ -263,10 +376,14 @@ second["error"]["type"]
             PersistentMontyKernel(mcp_hub=hub) as kernel,
         ):
             tools = create_python_repl_tools(kernel)
+            report = kernel.capabilities()
 
         repl = next(tool for tool in tools if tool.name == "python_repl")
         self.assertIn("mcp_search(query)", repl.description)
         self.assertIn("mcp_call(name, arguments)", repl.description)
+        self.assertIn("mcp_add_server(config)", repl.description)
+        self.assertTrue(report["mcp"]["dynamic_server_configuration"])
+        self.assertEqual(report["mcp"]["servers"][0]["name"], "demo")
 
     def test_promoted_tool_uses_restart_for_a_saved_typed_session(self) -> None:
         """Restart a saved typed session before its first promoted tool call."""

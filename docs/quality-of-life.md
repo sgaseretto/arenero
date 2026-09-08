@@ -8,6 +8,8 @@ operate, and debug. They do not change Monty's Python limits.
 ```mermaid
 flowchart LR
     App["Agent application"] --> Runtime["AreneroRuntime"]
+    App --> Managed["ManagedSandbox"]
+    Managed --> Runtime
     Runtime --> Kernel["Persistent kernel"]
     Runtime --> Hub["Optional MCP hub"]
     Kernel --> Handle["Bound SessionHandle"]
@@ -23,6 +25,10 @@ flowchart LR
 
 | Mechanism | Public API | Main purpose |
 | --- | --- | --- |
+| Ready-to-use composition | `open_sandbox()` and `SandboxConfig` | Select lifetime, own resources, bind one session, and expose one relative workspace. |
+| Multi-sandbox owner | `SandboxManager` | Share one worker pool, isolate Python IDs, share files, and bound active handles. |
+| Common managed result | `SandboxResult` and `SandboxError` | Normalize execution, shell, file, package, and checkpoint outcomes. |
+| Portable state and file checkpoint | `ManagedSandbox.checkpoint()` and `restore()` | Move exact-version Python state and bounded files together. |
 | Dynamic capability report | `kernel.capabilities()` | Give code and agents the active limits and features. |
 | Generated model instructions | `kernel.instructions()` | Describe the active configuration in a prompt-ready form. |
 | Bound session handle | `kernel.session(session_id)` | Remove repeated session IDs from application code. |

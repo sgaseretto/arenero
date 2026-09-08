@@ -1,6 +1,7 @@
 """Model-driven agent tests for files, MCP, errors, and recovery."""
 
 import base64
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -240,6 +241,66 @@ class AgentMcpWorkflowTests(unittest.TestCase):
             media["result"]["content"][0]["virtual_path"],
             media["mcp_artifacts"][0],
         )
+
+    def test_codeact_agent_hot_loads_mcp_and_uses_it_on_next_turn(self) -> None:
+        """Keep one REPL tool schema while an agent extends its shared MCP hub."""
+
+        fixture = Path("tests/fixtures/mcp_server.py").resolve()
+        server_config = {
+            "name": "late",
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(fixture)],
+            "cwd": str(Path.cwd()),
+        }
+        model = ToolCallingFakeChatModel(
+            messages=iter(
+                [
+                    python_tool_call(
+                        "connect-late-mcp",
+                        f"scale = 6\nmcp_add_server({server_config!r})",
+                    ),
+                    AIMessage(content="The missing MCP server is ready."),
+                    python_tool_call(
+                        "use-late-mcp",
+                        "response = mcp_call("
+                        "'late__multiply', {'a': scale, 'b': 7})\n"
+                        "response['content'][0]['text']",
+                    ),
+                    AIMessage(content="The persisted result is 42."),
+                ]
+            )
+        )
+        config = _config("dynamic-mcp-agent")
+
+        with (
+            McpHub([]) as hub,
+            PersistentMontyKernel(mcp_hub=hub) as kernel,
+        ):
+            tools = create_python_repl_tools(kernel)
+            initial_names = [tool.name for tool in tools]
+            agent = create_agent(model, tools, checkpointer=InMemorySaver())
+            first = agent.invoke(
+                {"messages": [HumanMessage(content="Connect the missing MCP.")]},
+                config,
+            )
+            second = agent.invoke(
+                {"messages": [HumanMessage(content="Use it with the saved value.")]},
+                config,
+            )
+            current_names = [tool.name for tool in create_python_repl_tools(kernel)]
+            server_status = hub.servers()
+
+        first_call = tool_results(first)[0]
+        second_call = tool_results(second)[-1]
+        self.assertTrue(first_call["result"]["ok"])
+        self.assertEqual(first_call["result"]["action"], "added")
+        self.assertTrue(second_call["state_restored"])
+        self.assertIn('"product": 42', second_call["result"])
+        self.assertEqual(second["messages"][-1].content, "The persisted result is 42.")
+        self.assertEqual(initial_names, current_names)
+        self.assertFalse(any(name.startswith("mcp_") for name in initial_names))
+        self.assertTrue(server_status["servers"][0]["connected"])
 
 
 class AgentCorrectionAndSnapshotTests(unittest.TestCase):
