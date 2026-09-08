@@ -73,6 +73,17 @@ class ManagedSandboxTests(unittest.TestCase):
             assert escaped.error is not None
             self.assertEqual(escaped.error.code, "file_read_failed")
 
+    def test_managed_shell_cell_preserves_multiline_syntax(self) -> None:
+        """Run variables and a here document through the managed cell facade."""
+        with open_sandbox("managed-shell-cell") as sandbox:
+            result = sandbox.run_cell(
+                "%%shell\nNAME=managed\ncat <<EOF > message.txt\n$NAME works\nEOF\n"
+            )
+            saved = sandbox.read("message.txt")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(saved.value, "managed works\n")
+
     def test_trusted_bootstrap_runs_for_each_new_session(self) -> None:
         """Managed configuration forwards trusted startup code to the kernel."""
 

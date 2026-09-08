@@ -73,7 +73,9 @@ def create_managed_sandbox_tools(
             description=(
                 "Run the small Arenero virtual shell in the bound workspace. "
                 "This is not an operating-system shell: no processes, pip, pytest, "
-                "environment variables, command substitution, or arbitrary binaries. "
+                "full Bash control flow, command substitution, descriptor redirection, "
+                "or arbitrary binaries. It supports persistent virtual variables, "
+                "bounded globs, and straight-line source files. "
                 "Use the active sandbox instructions for commands and limits."
             ),
         )

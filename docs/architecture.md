@@ -196,7 +196,7 @@ Python state and file state are intentionally separate:
 | State | Owner | Persistence |
 | --- | --- | --- |
 | Python globals, functions, classes, and remaining duration budget | Monty snapshot in the selected `SessionStore` | Follows memory, SQLite, or stateless mode. |
-| Virtual shell working directory | Reserved value in the Monty session | Follows the Python session. |
+| Virtual shell variables, working directory, previous directory, and last status | Reserved values in the Monty session | Follow the Python session. |
 | `OSAccess` memory files | The caller-owned `OSAccess` object | Lives while that object lives. It is not in SQLite. |
 | `WorkspaceConfig` files | Dedicated host directory through `MountDir` | Survives process restarts. It is not in SQLite. |
 | Caller-supplied mounts | Caller-owned `MountDir` objects | Follows the selected mount mode and host directory. |
@@ -210,7 +210,7 @@ Python state and file state are intentionally separate:
 flowchart LR
     SessionID["session_id"] --> Snapshot["Monty snapshot"]
     Snapshot --> PythonState["Python values and functions"]
-    Snapshot --> Cwd["Virtual shell directory"]
+    Snapshot --> ShellState["Shell variables, PWD, OLDPWD, and status"]
     Snapshot --> Budget["Remaining cumulative duration"]
 
     FileConfig["Filesystem configuration"] --> MemoryFiles["OSAccess memory files"]
@@ -222,8 +222,9 @@ flowchart LR
     Snapshot -. does not contain .-> Hub
 ```
 
-Resetting a session removes Python state and the shell directory. It does not
-delete shared files. Applications must define file cleanup separately.
+Resetting a session removes Python state, shell variables, shell directories, and
+the last shell status. It does not delete shared files. Applications must define
+file cleanup separately.
 
 ## Deep Agents execution path
 

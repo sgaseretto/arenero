@@ -67,7 +67,7 @@ flowchart TD
 | Persistent Python | Variables, functions, closures, comprehensions, simple classes, dataclasses, control flow, and a partial standard library | Monty's Python subset, not CPython. |
 | Type checking | Optional checks before each user feed, including filesystem and host-function declarations | A clean check does not prove that every partial runtime API exists. |
 | Files | UTF-8 text, bytes, in-memory files, confined mounts, persistent workspaces, and bounded structured operations | No ambient host paths or live file descriptors. |
-| Virtual shell | Fixed file and text commands, pipes, redirection, conditional lists, Monty Python, and bounded `curl` | No operating-system process or automatic expansion. |
+| Virtual shell | Fixed file and text commands, persistent variables, bounded globs, here documents, straight-line source files, conditional lists, Monty Python, and bounded `curl` | No operating-system process or full Bash grammar. |
 | Persistence | Memory, SQLite, or stateless snapshots selected by `session_id` | Files have a separate lifecycle. Snapshots are Monty-version-specific. |
 | Agent tools | Full sync tools, or a small native async Python, file, module, and reset set | LangChain is optional and the runtime thread selects the session. |
 | Static virtual modules | Top-level absolute and relative imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested, cyclic, or third-party imports. Generated feeds skip type checking. |
@@ -502,16 +502,19 @@ assert result.exit_code == 127
 Arenero never searches `PATH` and never starts a host executable. Use a container,
 VM, or managed execution sandbox for Git, package tools, builds, and system tests.
 
-### Automatic shell expansion
+### Bounded shell expansion
 
 ```text
-cat *.txt       # Looks for a file literally named *.txt.
-echo $HOME      # Prints $HOME. There is no environment expansion.
-echo $(pwd)     # Command substitution is rejected.
-cd ~            # There is no home-directory expansion.
+cat *.txt       # Expands against bounded virtual paths.
+echo $HOME      # Expands the persistent virtual HOME value.
+cd ~            # Uses virtual HOME.
+echo $(pwd)     # Command substitution is still rejected.
 ```
 
-Use `glob '*.txt'` or `find / '*.txt'`, then send explicit paths in a later call.
+Only unquoted `*`, `?`, and `**` expand. Quoted or unmatched patterns stay
+literal. There is no field splitting, brace expansion, character-class glob, or
+advanced parameter expansion. Use `glob` or `find` when a structured, bounded
+path list is better than automatic argument expansion.
 
 ### Regular-expression shell grep
 
@@ -520,8 +523,10 @@ echo Alpha | grep 'A.*a'
 ```
 
 Shell `grep` searches for the literal text `A.*a`, so this returns exit code `1`.
-Use a direct Monty `re` operation or structured `fs_grep(..., regex=True)` when a
-regular expression is needed. The `AreneroSandbox.grep()` facade stays literal.
+Use `grep -E 'A.*a'` for the supported Python regular-expression syntax. This is
+not exact POSIX ERE syntax. A direct Monty `re` operation or structured
+`fs_grep(..., regex=True)` gives more explicit control. The
+`AreneroSandbox.grep()` facade stays literal.
 
 ### Normal file iteration and CPython modes
 
@@ -636,9 +641,11 @@ Python subset, not CPython. State remains available in later calls in this threa
 Use python_repl_execute_file for one known flat virtual .py helper file. Use
 python_repl_execute_module for a small bounded graph with supported static
 imports. Direct Monty imports cannot load virtual files. Use !COMMAND or %%shell
-only for the documented Arenero virtual shell. It
-does not run host executables, Git, package tools, environment expansion, command
-substitution, or automatic globs. Use file tools for structured file results. Use
+only for the documented Arenero virtual shell. It supports persistent virtual
+variables, bounded globs, here documents, and straight-line source files. It does
+not run host executables, Git, package tools, full Bash control flow, command
+substitution, descriptor redirection, or binary pipes. Use file tools for
+structured file results. Use
 small output_limit_chars values when full output is not needed, and use an
 absolute output_file when a larger bounded result must remain available.
 ```

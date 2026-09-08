@@ -1,459 +1,484 @@
 # Arenero virtual shell reference
 
-## Purpose
+## Scope
 
-The virtual shell gives agents a familiar command interface for short file tasks.
-It is an allowlisted command dispatcher. It is not an operating-system shell and
-does not start processes.
+Arenero has a small Bash-like shell for work on its virtual filesystem. The
+shell is an allowlisted command dispatcher. It is not Bash, an operating-system
+shell, or a process runner. It never starts an arbitrary executable.
 
-The implementation is in `src/arenero/shell.py`. `AreneroSandbox.execute()`, the
-LangChain or LangGraph `virtual_shell` tool, and notebook-style REPL shell cells
-use the same implementation.
+Use it for short, predictable file workflows:
+
+- Create, read, find, copy, move, and delete virtual files.
+- Connect UTF-8 text commands with pipes and redirection.
+- Keep a small set of shell variables with the REPL session.
+- Run straight-line command files with `source`.
+- Run Monty-compatible Python with `python -c` or `python FILE.py`.
+- Fetch bounded public HTTP or HTTPS resources with the virtual `curl` command.
+
+Use a container or a managed operating-system sandbox when a task needs full
+Bash, external programs, package installation, compilation, Git, or process
+control.
 
 ```mermaid
 flowchart LR
-    Source["Shell cell or execute call"] --> Parse["Parse supported grammar"]
-    Parse --> Allowlist{"Command is allowed?"}
-    Allowlist -->|No| Reject["Exit code 127 or syntax error"]
-    Allowlist -->|Yes| Dispatch["Run command pipeline"]
-    Dispatch --> Files["Virtual filesystem command"]
-    Dispatch --> Python["Monty Python command"]
-    Dispatch --> Curl["Bounded curl command"]
-    Files --> Result["Bounded result"]
-    Python --> Result
-    Curl --> Result
+    Input["! cell, %%shell cell, or execute call"] --> Lexer["Quote-aware lexer"]
+    Lexer --> Expand["Variables, tilde, and bounded virtual globs"]
+    Expand --> Policy{"Command is enabled?"}
+    Policy -->|No| Reject["Exit 127"]
+    Policy -->|Yes| Dispatch["Virtual command dispatcher"]
+    Dispatch --> VFS["Virtual filesystem"]
+    Dispatch --> Monty["Persistent Monty session"]
+    Dispatch --> HTTP["Bounded HTTP client"]
+    VFS --> Result["Bounded text result"]
+    Monty --> Result
+    HTTP --> Result
 ```
 
-Parsing and command selection happen before execution. Every output path uses
-the configured response and file limits.
+The implementation is in `src/arenero/shell.py`. `AreneroSandbox.execute()`,
+`ManagedSandbox.run_shell()`, the LangChain or LangGraph `virtual_shell` tool,
+and REPL shell cells use this implementation.
 
-## REPL cell bridge
+## Entry points
 
-`execute_repl_cell()`, `AreneroSandbox.execute_cell()`, the `python_repl` agent
-tool, and the terminal REPL accept these cell forms:
+Use a single-line notebook form:
 
 ```text
-!COMMAND
+!grep -Ein 'error|warning' /logs/*.txt
 ```
+
+Use `%%shell` for multiline source, comments, continuations, or here documents:
 
 ```text
 %%shell
-COMMAND ONE
-COMMAND TWO
+NAME=Arenero
+cat <<EOF > /message.txt
+Hello, $NAME
+EOF
+grep Hello /message.txt
 ```
 
-`!` accepts one shell line and must be the first character. A `%%shell` header must
-be the first line; surrounding whitespace is accepted. Each later nonempty line
-becomes one sequential shell command. Blank lines are ignored. Use the shell's
-`;`, `&&`, or `||` operators when commands need different control flow.
+The text after `%%shell` stays intact. Newlines are command separators unless
+they are inside a quote, a here-document body, or escaped with a backslash.
+A multiline `!` cell is invalid.
 
-The dispatcher checks the cell before Monty starts. It then runs either the Python
-cell or the shell cell. Both modes use the same session ID, persistent Python
-state, virtual shell working directory, and virtual filesystem. A shell cell can
-use existing Python state through `python -c CODE`. Python code can use the
-existing `fs_read`, `fs_write`, `fs_edit`, `fs_mkdir`, `fs_delete`, `fs_ls`,
-`fs_glob`, and `fs_grep` helpers.
+Python and shell cells use the same session ID and virtual filesystem. They also
+use the same Monty snapshot for Python state and shell state. A shell cell can
+run existing Python state with `python -c CODE`. Monty Python code can use the
+`fs_read`, `fs_write`, `fs_edit`, `fs_mkdir`, `fs_delete`, `fs_ls`, `fs_glob`,
+and `fs_grep` hosted functions. A running Monty feed cannot recursively call the
+complete shell because that would re-enter its own session lock.
 
-Do not mix Python and shell source in one cell. A multiline cell that starts with
-`!` returns exit code `2`; use `%%shell`. Python results contain `mode=python` and
-the normal kernel result fields. Shell results contain `mode=shell`, `ok`,
-`output`, `exit_code`, and `truncated`.
+## Supported grammar
+
+### Command lists
+
+| Syntax | Meaning |
+| --- | --- |
+| `A ; B` | Run `B` after `A`, for all exit codes. |
+| `A` newline `B` | Same as `A ; B`. |
+| `A && B` | Run `B` only if `A` returns exit code `0`. |
+| `A || B` | Run `B` only if `A` returns a nonzero exit code. |
+| `A \| B` | Send the UTF-8 output of `A` to `B`. |
+| `< FILE` | Read UTF-8 text from a virtual file. |
+| `> FILE` | Replace a virtual text file with command output. |
+| `>> FILE` | Append command output to a virtual text file. |
+| `<<WORD` | Use a here-document body as command input. |
+
+A failed command stops the current pipeline. This differs from normal Bash,
+which usually reports the last command status unless `pipefail` is active.
+Arenero then uses the failed status for `&&` and `||`.
+
+Only one input and one output redirection are allowed for each command. Only one
+here document is supported on one command line. Redirection has no file
+descriptor syntax. There is no separate shell stderr stream.
+
+### Quotes, escapes, and comments
+
+- Single quotes preserve all characters.
+- Double quotes expand `$NAME`, `${NAME}`, and `$?`.
+- Outside quotes, a backslash quotes the next character.
+- A backslash followed by a newline continues the current line.
+- An unquoted `#` starts a comment only at a word boundary.
+- Empty quoted strings are kept as empty arguments.
+
+This is a small lexer, not a complete Bash parser. Escapes and edge cases can
+differ from Bash outside the forms documented here.
+
+### Variables and tilde
+
+These forms are supported:
+
+```text
+NAME=value
+export NAME=value
+export NAME
+unset NAME
+echo "$NAME ${NAME} $?"
+cd ~
+cd ~/project
+cd -
+```
+
+`PWD` and `OLDPWD` are managed by the shell. `HOME` defaults to the kernel's
+initial working directory and can be changed. Undefined variables expand to an
+empty string. Values are text. There is no Bash field splitting after variable
+expansion, so one parsed word stays one argument.
+
+An assignment must be the only item in its command. A prefix assignment such as
+`MODE=test python task.py` is not supported. Exported variables are virtual shell
+variables. They are not host process environment variables and are not passed to
+HTTP, Monty, or an operating system.
+
+### Wildcard expansion
+
+Unquoted command arguments can expand `*`, `?`, and `**` against virtual paths:
+
+```text
+cat /reports/*.txt
+grep -r TODO /project/**
+echo "/reports/*.txt"   # literal wildcard
+```
+
+Expansion returns absolute virtual paths. Quoted wildcard characters stay
+literal. An unmatched pattern also stays literal. Character classes such as
+`[a-z]`, brace expansion such as `{a,b}`, extglob, and Bash hidden-file rules are
+not supported. The shell rejects an expansion when its bounded filesystem scan
+is incomplete or the expanded argument limit is exceeded.
+
+### Here documents
+
+An unquoted delimiter expands the supported variables in the body:
+
+```text
+NAME=world
+cat <<EOF
+hello $NAME
+EOF
+```
+
+A single-quoted or double-quoted delimiter keeps the body literal:
+
+```text
+cat <<'EOF'
+hello $NAME
+EOF
+```
+
+The terminator must be alone on its line. Indented `<<-EOF`, here strings with
+`<<<`, tab stripping, command substitution, and multiple here documents on one
+command line are not supported.
 
 ## Supported commands
 
-| Command | Syntax | Behavior |
+The application can reduce this set with
+`KernelConfig.allowed_shell_commands`. Run `help` to see the active set.
+
+| Command | Supported form | Main limitation |
 | --- | --- | --- |
-| `help` | `help [COMMAND]` | List enabled commands and operators, or show one command syntax. |
-| `which` | `which COMMAND...` | Report enabled command names. It does not return host executable paths. |
-| `pwd` | `pwd` | Print the current virtual directory. |
-| `cd` | `cd [PATH]` | Change the current virtual directory. The default is `/`. |
-| `ls` | `ls [PATH ...]` | List direct entries as absolute virtual paths. Directories end with `/`. |
-| `mkdir` | `mkdir [-p] PATH...` | Create virtual directories. |
-| `cat` | `cat FILE...` | Concatenate UTF-8 files. It also accepts pipeline input without file arguments. |
-| `curl` | `curl [OPTIONS] URL` | Fetch one bounded public HTTP or HTTPS URL. `NetworkConfig` can restrict or disable it. |
-| `head` | `head [-n COUNT] [FILE]` | Return the first lines of one file or pipeline input. |
-| `tail` | `tail [-n COUNT] [FILE]` | Return the last lines of one file or pipeline input. |
-| `grep` | `grep [-i] [-n] PATTERN [FILE ...]` | Find literal text. Exit code `1` means no match. |
-| `find` | `find [PATH] [PATTERN]` | Find paths below a root. The default pattern is `**/*`. |
-| `glob` | `glob PATTERN [PATH]` | Find paths with the existing Arenero glob rules. |
-| `echo` | `echo [-n] [TEXT ...]` | Print literal arguments. |
-| `sort` | `sort [-r] [FILE]` | Sort UTF-8 input lines. |
-| `uniq` | `uniq [-c] [FILE]` | Remove adjacent duplicate UTF-8 input lines. `-c` adds counts. |
-| `rev` | `rev [FILE]` | Reverse the characters in each UTF-8 input line. |
-| `wc` | `wc [-lwc] [FILE]` | Count lines, words, or UTF-8 bytes. The default prints all three. |
-| `basename` | `basename PATH` | Return the last part of a POSIX path. |
-| `dirname` | `dirname PATH` | Return the directory part of a POSIX path. |
-| `tee` | `tee [-a] FILE...` | Copy pipeline input to virtual files and return the same text. |
-| `base64` | `base64 [FILE]` | Encode virtual file bytes or pipeline text as Base64. Decoding is not supported. |
-| `sha256sum` | `sha256sum [FILE ...]` | Calculate SHA-256 hashes for virtual file bytes or pipeline text. |
-| `rm` | `rm [-r] [-f] PATH...` | Delete files. `-r` is required for directories. |
-| `cp` | `cp SOURCE DESTINATION` | Copy one regular file and preserve its bytes. |
-| `mv` | `mv SOURCE DESTINATION` | Copy one regular file, then delete the source. It is not atomic. |
-| `python` | `python -c CODE` | Run Monty-compatible Python in the persistent session. `python3` and `monty` are aliases. |
-| `python` | `python FILE.py` | Load and run a virtual Python file in the persistent session. Relative paths work. |
+| `help` | `help [COMMAND]` | Reports virtual commands only. |
+| `which` | `which COMMAND...` | Reports names, not executable paths. |
+| `pwd` | `pwd` | No flags. |
+| `cd` | `cd [PATH\|-]` | No physical/logical flags. |
+| `env` | `env` | Prints virtual variables only. |
+| `export` | `export [NAME[=VALUE] ...]` | Does not affect a host environment. |
+| `unset` | `unset NAME...` | Variables only; no function mode. |
+| `true`, `false` | no arguments | Fixed exit code only. |
+| `test`, `[` | small expressions | No compound `-a`, `-o`, or nested expressions. |
+| `ls` | `ls [-aA1ldR] [PATH...]` | `-l` shows type and path only. |
+| `mkdir` | `mkdir [-p] PATH...` | No permission or mode flags. |
+| `touch` | `touch FILE...` | Creates missing files; does not change timestamps. |
+| `rm` | `rm [-r] [-f] PATH...` | No prompts or trash. |
+| `cp` | `cp [-r] SOURCE... DESTINATION` | No metadata, links, or atomic transaction. |
+| `mv` | `mv SOURCE... DESTINATION` | Copy then delete; not atomic. |
+| `cat` | `cat FILE...` | UTF-8 text output only. |
+| `head`, `tail` | `COMMAND [-n COUNT] [FILE]` | Lines only; no compact `-5` form. |
+| `grep` | `grep [-EFinvcqlrR] PATTERN [FILE...]` | `-E` uses Python regex syntax. |
+| `sort` | `sort [-r] [FILE]` | Unicode text order only. |
+| `uniq` | `uniq [-c] [FILE]` | Adjacent duplicate lines only. |
+| `rev` | `rev [FILE]` | Unicode character reversal only. |
+| `wc` | `wc [-lwc] [FILE]` | One input; no filename in output. |
+| `echo` | `echo [-n] [TEXT...]` | Does not interpret escapes. |
+| `printf` | `printf FORMAT [ARGUMENT...]` | Small `%s`, `%d`, `%f`, `%b`, and `%%` subset. |
+| `tee` | `tee [-a] FILE...` | Requires text pipeline input. |
+| `find` | `find [PATH] [GLOB]` | Glob search only; no predicates or actions. |
+| `glob` | `glob GLOB [PATH]` | Supports `*`, `?`, and `**` only. |
+| `basename` | `basename PATH` | No suffix removal. |
+| `dirname` | `dirname PATH` | Text path split only. |
+| `base64` | `base64 [-d] [FILE]` | Decoded pipe output must be UTF-8. |
+| `sha256sum` | `sha256sum [FILE...]` | No check mode. |
+| `source`, `.` | `COMMAND FILE` | Straight-line virtual shell source only. |
+| `curl` | documented options and one URL | Bounded HTTP client, not system curl. |
+| `python` | `python -c CODE` or `python FILE.py` | Monty Python, not CPython. |
+| `python3`, `monty` | same as `python` | Aliases only. |
 
-## Command grammar
+For `cat`, `head`, `tail`, `grep`, `sort`, `uniq`, `rev`, `wc`, `base64`, and
+`sha256sum`, `-` can select available pipeline input. Most commands also use
+pipeline input when no file is given.
 
-- `|` passes UTF-8 text to the next command.
-- `;` always runs the next pipeline.
-- `&&` runs the next pipeline only after exit code `0`.
-- `||` runs the next pipeline only after a nonzero exit code.
-- `< FILE` reads UTF-8 text from one virtual file.
-- `> FILE` replaces one virtual text file.
-- `>> FILE` appends to one virtual text file.
-- Single quotes, double quotes, and backslash quoting follow Python `shlex` rules.
-- `#` is plain text. It does not start a comment.
+### `test` expressions
 
-Each command can have at most one input redirection and one output redirection.
-Redirection applies to virtual files only. A pipeline stops at its first failed
-command. This is stricter than many operating-system shells, which often report
-only the last pipeline command status.
+The following expressions are supported:
 
-The shell does not expand `*`, `?`, `**`, `$NAME`, `~`, or command substitutions
-in arguments. Use `glob` or `find` to find paths, then use explicit paths in later
-commands. The parser does not support grouping with parentheses.
+- One string, `! STRING`, `-n STRING`, or `-z STRING`.
+- `-e PATH`, `-f PATH`, `-d PATH`, or `-s PATH`.
+- `LEFT = RIGHT`, `LEFT == RIGHT`, or `LEFT != RIGHT`.
+- Integer comparison with `-eq`, `-ne`, `-lt`, `-le`, `-gt`, or `-ge`.
 
-## Command-specific limitations
+`!` negates one string only. Boolean expression operators, parentheses, regex
+comparison, file age comparison, permissions, and other Bash tests are not
+supported.
 
-### Discovery and paths
+### `grep` flags
 
-- `help` accepts zero or one command name. It rejects pipeline input. The output
-  shows the active application allowlist, not every command Arenero can provide.
-- `which` accepts one or more command names. It prints virtual command names, not
-  executable paths. It returns exit code `1` when any name is unavailable.
-- `pwd` accepts no options, arguments, or pipeline input.
-- `cd` accepts zero or one directory. With no path it changes to `/`, not a home
-  directory. There is no `cd -`, home directory, or `~` expansion.
-- `basename` and `dirname` accept exactly one POSIX path. They only split text;
-  they do not check whether the path exists. Suffix removal and other system-tool
-  options are not supported.
+- The default and `-F` use literal text.
+- `-E` uses Python `re` syntax. It is not exact POSIX extended regex syntax.
+- `-i`, `-n`, `-v`, `-c`, `-q`, `-l`, and `-r`/`-R` are supported.
+- Recursive search reads UTF-8 regular files only and is bounded by filesystem
+  entry, depth, result, and character limits.
+- Exit code `1` means no selected line. Exit code `2` means invalid use.
+- Context, word, whole-line, include/exclude, binary, and color flags are absent.
 
-### Files and directories
+### `ls`, `cp`, and `mv`
 
-- `ls` accepts directory paths only. It has no flags, long format, sorting
-  options, metadata, or automatic recursive mode. Output uses absolute virtual
-  paths and adds `/` to directories.
-- `mkdir` supports only `-p`, and `-p` must be the first argument.
-- `rm` supports only `-r` and `-f`. Flags must come before paths. There is no
-  `--`, prompt, trash, secure erase, or wildcard expansion. The virtual root `/`
-  cannot be deleted. Recursive deletion fails if it exceeds filesystem scan or
-  depth limits.
-- `cp` copies exactly one regular file to one exact file path. It preserves bytes
-  but does not copy directories, metadata, links, or multiple sources. It does
-  not treat a directory destination as an instruction to keep the source name.
-- `mv` has the same file limits as `cp`. It copies and then deletes, so it is not
-  atomic and is not a directory rename operation.
+`ls -a`, `-A`, and `-1` are accepted for familiar syntax. The virtual filesystem
+does not hide dot files, and output is already one path per line. `ls -d` lists
+the target itself. `ls -R` recurses. `ls -l` prints only `d PATH/` for a directory
+or `- PATH` for a file; permissions, owner, timestamps, and size are not present.
 
-### Text commands
+`cp -r` copies bounded directory trees. Multiple sources require a directory
+destination. `mv` supports files, directory trees, and multiple sources without a
+`-r` flag. Both reject symbolic links. They do not preserve permissions,
+ownership, timestamps, hard links, or sparse layout. A failure can leave partial
+destination content. `mv` is copy then delete, so it is not atomic.
 
-- `cat` reads one or more UTF-8 files. With no file, it requires pipeline input.
-  It has no flags and does not use `-` as a standard-input placeholder.
-- `head` and `tail` support only `-n COUNT`, with a separate nonnegative integer.
-  They accept at most one UTF-8 file or pipeline input. Byte counts and compact
-  forms such as `-5` are not supported.
-- `grep` does literal substring matching only. It supports only `-i` and `-n`,
-  which can be combined. It has no regular expressions, invert mode, recursive
-  mode, context lines, word mode, count mode, or automatic glob expansion. Exit
-  code `1` means no match. Use the structured `grep_files` tool for bounded regex
-  search when that tool is available.
-- `echo` supports only a first `-n` flag. It does not process escape sequences or
-  expand variables.
-- `sort` supports only a first `-r` flag and at most one UTF-8 file or pipeline
-  input. It uses direct Unicode string ordering. Numeric, field, locale, month,
-  version, and stable-sort options are not supported.
-- `uniq` supports only a first `-c` flag and at most one UTF-8 file or pipeline
-  input. It removes adjacent duplicates only. Sort the input first when all equal
-  lines must become adjacent.
-- `rev` accepts at most one UTF-8 file or pipeline input. It reverses Unicode
-  characters in each line and has no options.
-- `wc` supports only `-l`, `-w`, and `-c`, which can be combined. It accepts at
-  most one UTF-8 file or pipeline input. `-c` reports UTF-8 bytes. It does not
-  print a filename.
-- `tee` requires pipeline input and one or more exact file paths. It supports only
-  a first `-a` flag. It creates missing parent directories and returns the same
-  text to the next pipeline stage.
+### `printf`
 
-### Path search
+The supported conversions are `%s`, `%d`, `%f`, `%b`, and `%%`. The format repeats
+when arguments remain. The supported escapes are `\n`, `\r`, `\t`, and `\\`.
+Width, precision, positional arguments, locale behavior, `%q`, and most Bash
+extensions are not supported.
 
-- `glob` supports only `*`, `?`, and `**`. Character classes, brace expansion,
-  extglob, and shell-style hidden-file rules are not supported. It scans below one
-  root and is capped by filesystem result, scan, and depth limits.
-- `find` is a short form of the same bounded glob search. It accepts only
-  `[PATH] [PATTERN]`. It has no predicates, actions, type filters, expressions,
-  deletion, or command execution. Its default pattern is `**/*`.
+### `source`
 
-### Binary utilities
+`source FILE` and `. FILE` read a UTF-8 virtual file and run it in the current
+shell state. The script can use all supported commands, variables, comments,
+newlines, pipes, redirections, here documents, `&&`, and `||`. Changes to
+variables and the working directory remain available after it returns.
 
-- `base64` only encodes. It accepts one virtual file as bytes or UTF-8 pipeline
-  input. It does not decode, wrap lines, ignore invalid data, or accept multiple
-  files. It fails when the complete encoded value exceeds the hard shell output
-  limit, so it never returns invalid partial Base64 as a successful result.
-- `sha256sum` accepts one or more virtual files as bytes, or UTF-8 pipeline input
-  when no file is given. It has no check mode, tagged output, zero terminator, or
-  other hash algorithms.
+Source files share the outer call's command count, output cap, filesystem limits,
+and session state. Nesting has its own configurable depth limit. There is no
+shebang handling, argument list, `return`, positional parameter, startup file, or
+full Bash control flow. Running `bash FILE` or `sh FILE` is not supported.
 
-### Network command
+### `base64` and binary files
 
-`curl` is a small HTTP client. It is not the system curl program. It is registered
-by default and allows public HTTP and HTTPS URLs. It supports these options:
+Encoding reads raw virtual file bytes and returns ASCII Base64. Decoding accepts
+whitespace in the input. A decoded value can enter a pipe only when it is valid
+UTF-8. To create or retrieve arbitrary binary data, use the structured filesystem
+API with Base64 content or use `curl -o FILE`.
+
+Pipes and `<`, `>`, and `>>` are text-only. `cp`, `mv`, `base64` encoding,
+`sha256sum`, structured file operations, and `curl -o` can preserve binary bytes.
+
+### `curl`
+
+The virtual `curl` command supports:
 
 | Option | Behavior |
 | --- | --- |
-| `-f`, `--fail` | Return exit code `22` and no body for HTTP status 400 or higher. |
-| `-L`, `--location` | Follow redirects up to the configured limit. Each target is checked before use. |
-| `-i`, `--include` | Include the final response status and headers. |
-| `-I`, `--head` | Send a `HEAD` request. |
-| `-s`, `--silent`, `-S`, `--show-error` | Accepted for familiar syntax. They do not change output because the virtual shell has no separate stderr. |
-| `-X METHOD`, `--request METHOD` | Select an HTTP method that the host policy allows. |
-| `-H 'NAME: VALUE'`, `--header 'NAME: VALUE'` | Add one request header. The option can be repeated. Arenero controls `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, and proxy authorization. |
-| `-d DATA`, `--data DATA` | Send UTF-8 form data. It selects `POST` unless `-X` or `-I` was used. Only one data value is accepted. |
-| `-o FILE`, `--output FILE` | Save response bytes to an exact virtual file path. With `-i`, a UTF-8 status and header block comes first. Missing parent directories are created. |
-| `--max-time SECONDS` | Request a lower connection and between-read idle timeout. It cannot raise the host limit. |
+| `-f`, `--fail` | Return exit code `22` for HTTP status 400 or higher. |
+| `-L`, `--location` | Follow bounded redirects and recheck each target. |
+| `-i`, `--include` | Include final response status and headers. |
+| `-I`, `--head` | Send `HEAD`. |
+| `-s`, `-S` | Accepted; there is no progress output to change. |
+| `-X METHOD` | Select a method allowed by `NetworkConfig`. |
+| `-H 'NAME: VALUE'` | Add a repeatable non-reserved request header. |
+| `-d DATA` | Send one UTF-8 request body; defaults to `POST`. |
+| `-o FILE` | Save response bytes to a virtual file. |
+| `--max-time SECONDS` | Lower connection and between-read idle limits. |
 
-Simple flags can be combined, for example `-fL` or `-si`. Options that take a
-value must be separate arguments. Only one URL is accepted. Pipeline input,
-uploads from virtual files, cookie jars, proxies, certificates, compressed output,
-multiple URLs, progress meters, and the other system curl options are not
-supported.
+Without an explicit `NetworkConfig`, public HTTP and HTTPS URLs are enabled.
+Private, local, reserved, link-local, and multicast addresses are blocked by
+default. A supplied policy can restrict URL prefixes, methods, request bytes,
+response bytes, redirects, and time, or can remove `curl` with `enabled=False`.
+Redirect targets repeat the URL and address checks.
 
-Normal output must be UTF-8. Use `-o FILE` for images and other binary responses.
-The downloaded file uses the same virtual filesystem as all other commands and
-agents that share that filesystem. The response-size limit also applies before a
-file is written. The filesystem binary-transfer limit can apply a lower cap.
-
-The host policy uses all these checks:
-
-- When `NetworkConfig` is absent, `curl` allows all public HTTP and HTTPS URLs.
-- An empty `allowed_url_prefixes` tuple also allows all public URLs. A nonempty
-  tuple requires an allowed scheme, exact host, effective port, and segment-aware
-  path prefix.
-- `NetworkConfig(enabled=False)` removes `curl` from the command set.
-- Only configured HTTP methods are accepted. The default is `GET` and `HEAD`.
-- Private, loopback, link-local, reserved, multicast, and other non-global
-  addresses are blocked by default.
-- All DNS results are checked. The HTTP connection uses one checked address, which
-  prevents a second DNS lookup from changing the target.
-- Redirects are off unless `-L` is used. Each redirect target repeats the URL and
-  DNS checks. Authorization and cookie headers are removed when the origin
-  changes.
-- Request bytes, response bytes, and redirect count have hard limits.
-- An optional host `trusted_header_provider(url)` can add authorization or other
-  headers after the URL check. Its case-insensitive values override agent headers.
-  The provider must select secrets by URL without exposing them in the curl
-  command. It must not return one secret for every public URL.
-- System proxy settings and environment variables are not used.
-
-Network time is host wall time. It is not Monty interpreter time. The timeout
-limits connection waits and idle time between socket reads. Elapsed redirect time
-reduces the next request timeout. It is not a strict end-to-end wall-clock limit:
-DNS resolution and a server that continuously sends small amounts of data can make
-the call take longer. The application should also set an outer agent-tool deadline
-when it needs a strict wall-time bound.
+This is not system curl. It has no uploads from files, cookies, proxy options,
+certificate options, compression handling, multiple URLs, or unrestricted
+network access. Normal response output must be UTF-8. Use `-o FILE` for binary
+responses. `--max-time` is not a strict wall-clock deadline for DNS or a response
+that keeps sending small data.
 
 ### Monty Python commands
 
-`python`, `python3`, and `monty` are aliases for the same Monty VM. They accept
-only these exact forms:
+These exact forms are supported:
 
 ```text
 python -c CODE
 python FILE.py
 ```
 
-They do not accept pipeline input, extra script arguments, interactive input,
-module mode, startup flags, or normal CPython options. `FILE.py` is read from the
-virtual filesystem and submitted as source to the persistent session. It is not a
+`python3` and `monty` are aliases. These commands use the persistent Monty
+session. They do not accept pipeline input, script arguments, `-m`, an interactive
+prompt, or normal CPython flags. `FILE.py` is submitted as source; it is not a
 normal Python import.
 
-Monty is not CPython. It has no package installer, `site-packages`, dynamic import,
-`eval`, `exec`, `compile`, `__import__`, subprocesses, sockets, threads, or direct
-network access. Only Monty's documented Python subset and partial standard-library
-modules are available. The installed version is `pydantic-monty 0.0.21`; behavior
-can change with a later version. See Monty's
-[Python subset](https://pydantic.dev/docs/monty/reference/python-subset/) and
-[complete limitations](https://github.com/pydantic/monty/tree/main/limitations).
+Monty has no `eval`, `exec`, `compile`, `__import__`, subprocesses, sockets,
+threads, site-packages, or native extensions. Use Arenero's `execute_module()` for
+a bounded Monty-compatible virtual source package.
 
-## Examples
-
-Examples:
+## Examples that work
 
 ```console
-mkdir -p /work/data
-cd /work
-echo 'Alpha' > data/input.txt
-echo 'beta' >> data/input.txt
-cat data/input.txt | grep -i alpha > result.txt
-sort data/input.txt | uniq -c | tee counts.txt
-grep warning result.txt || echo 'No warnings'
-python helpers.py
-python -c 'answer = 21 * 2'
-curl https://api.example.com/v1/items | grep active
-curl -o /work/image.png https://cdn.example.com/images/item.png
+# Variables, quotes, glob expansion, and status
+NAME=report
+touch /data/a.txt /data/b.txt
+printf '%s\n' /data/*.txt
+grep -q missing /data/a.txt || echo "$NAME has no match: $?"
+
+# A text workflow
+grep -rEin 'error|warning' /logs | sort | uniq -c > /summary.txt
+cat /summary.txt
+
+# A directory copy and a test
+cp -r /project /backup
+[ -f /backup/README.md ] && echo ready
+
+# A straight-line script
+source /scripts/prepare.sh
+
+# A here document
+cat <<'EOF' > /template.txt
+$NAME stays literal here
+EOF
+
+# Public HTTP, subject to active NetworkConfig
+curl -fL https://example.com/data.txt -o /downloads/data.txt
+sha256sum /downloads/data.txt
 ```
+
+## Examples that do not work
+
+```console
+# No command substitution
+echo "$(pwd)"
+
+# No loops or full Bash script grammar
+for file in /data/*.txt; do cat "$file"; done
+
+# No host executables
+git status
+pip install requests
+bash /scripts/prepare.sh
+
+# No stderr or descriptor redirection
+python task.py 2> /errors.txt
+
+# No prefix assignment
+MODE=test python task.py
+
+# No binary pipe
+base64 -d /image.b64 | some-image-program
+```
+
+These calls return a nonzero exit code or an unsupported-command error. They do
+not fall through to the host shell.
+
+## State and persistence
+
+```mermaid
+flowchart TB
+    SessionID["Session ID"] --> Snapshot["Monty session snapshot"]
+    Snapshot --> Python["Python variables and functions"]
+    Snapshot --> Shell["Shell variables, PWD, OLDPWD, and last status"]
+    SessionID --> Files["Configured virtual filesystem"]
+    Memory["In-memory store"] --> Snapshot
+    SQLite["SQLite store"] --> Snapshot
+    Stateless["Stateless store"] -. no saved snapshot .-> Snapshot
+```
+
+- The in-memory store keeps shell and Python state across calls while the store
+  object and process stay alive.
+- SQLite keeps that state across kernel and process restarts.
+- The stateless store starts shell and Python state again for each call.
+- A reset removes Python state and shell state together.
+- Session IDs isolate snapshots. Files can still be shared when sessions use the
+  same filesystem.
+- Virtual files are not inside the session snapshot. Their lifetime comes from
+  `OSAccess`, mounts, or `WorkspaceConfig`.
+- The filesystem lock is process-local. Separate host processes need their own
+  coordination for writes to the same mounted directory.
+
+## Limits
+
+The shell uses existing kernel, filesystem, and network limit objects.
+
+| Configuration | Default | Effect |
+| --- | ---: | --- |
+| `KernelConfig.max_shell_command_chars` | 20,000 | Raw call or sourced-file characters. |
+| `KernelConfig.max_shell_commands` | 8 | Commands in the call, including sourced commands. |
+| `KernelConfig.max_shell_expanded_args` | 1,000 | Arguments after wildcard expansion. |
+| `KernelConfig.max_shell_variables` | 100 | Persistent virtual variables. |
+| `KernelConfig.max_shell_script_depth` | 4 | Nested `source` calls. |
+| `KernelConfig.default_output_limit_chars` | 8,000 | Default returned text. |
+| `KernelConfig.max_output_limit_chars` | 50,000 | Hard result and pipeline text cap. |
+| `FilesystemConfig.default_result_limit` | 100 | Normal list and grep result count. |
+| `FilesystemConfig.max_result_limit` | 1,000 | Hard result count. |
+| `FilesystemConfig.max_scan_entries` | 5,000 | Recursive scans. |
+| `FilesystemConfig.max_grep_chars` | 2,000,000 | Text inspected by shell grep. |
+| `FilesystemConfig.max_depth` | 20 | Recursive path depth. |
+| `FilesystemConfig.max_transfer_bytes` | 10,000,000 | Binary or complete-file transfer. |
+| `NetworkConfig.max_response_bytes` | 1,000,000 | HTTP response body. |
+| `NetworkConfig.max_request_bytes` | 100,000 | HTTP request body. |
+
+Monty's duration, request, memory, recursion, stream, and saved-state limits also
+apply to Monty feeds used by shell state and Python commands. Applications can
+lower or raise configured limits. A per-call `output_limit_chars` can only lower
+the returned result limit below the hard maximum.
+
+If a scan or output is incomplete, `truncated` is true or the command fails with
+a limit message. Do not treat a truncated result as complete. `output_file` can
+save the larger bounded shell output when only the returned view is trimmed.
 
 ## Result contract
 
-`execute` returns `output`, `exit_code`, and `truncated`:
+`execute()` returns `output`, `exit_code`, and `truncated`:
 
-- Exit code `0` means success.
-- Exit code `1` means a command failed or `grep` found no match.
-- Exit code `2` means invalid syntax, invalid arguments, or a limit request below
-  zero.
-- Exit code `127` means the command is unknown or disabled by the allowlist.
-- `output` combines the text produced by each pipeline that ran. Shell errors use
-  the same output field; there is no separate shell `stderr` field.
-- `truncated=true` means a configured limit shortened output. A model must not
-  assume that a truncated value is complete.
+- `0` means success.
+- `1` means a command failed or `grep`/`test` found a false result.
+- `2` means invalid syntax, invalid arguments, or a shell limit error.
+- `127` means an unknown or disabled command.
+- Errors use `output`; there is no separate shell stderr field.
 
-Callers can also supply `output_file`. When output is trimmed, Arenero writes the
-larger bounded text to that absolute virtual path and returns `output_file` or
-`output_file_error`. The hard shell and transfer caps still apply.
+The output is the combined output of each command list that ran. The exit code is
+the last pipeline status that ran. Skipped `&&` or `||` branches do not replace
+the previous status.
 
-Notebook-style cell results add common `result`, `stdout`, `stderr`, `error`,
-`truncation`, `retryable`, state, and output-file fields for both Python and shell
-modes. The original shell fields stay available.
+## Clear boundary: what is not supported
 
-The exit code is the code from the last pipeline that ran. A pipeline stops at its
-first failure. Skipped `&&` or `||` branches do not change the previous exit code.
+Arenero does not support these Bash or operating-system features:
 
-## Filesystem behavior
+- Arbitrary executables, subprocesses, Git, package managers, compilers, Docker,
+  system utilities, or shell plugins.
+- `if`, `for`, `while`, `until`, `case`, `select`, functions, aliases, arrays,
+  traps, jobs, signals, process control, subshells, or grouped commands.
+- `$(...)`, backticks, arithmetic expansion, process substitution, brace
+  expansion, field splitting, pathname character classes, extglob, or advanced
+  forms such as `${NAME:-default}`.
+- Prefix assignments, positional parameters, script arguments, startup files,
+  shebang execution, `sh FILE`, or `bash FILE`.
+- stderr pipelines, `2>`, `2>&1`, arbitrary file descriptors, here strings,
+  interactive input, terminals, or binary pipes.
+- Exact Bash quoting in undocumented edge cases or exact POSIX command behavior.
+- A virtual current time, file permissions, owners, groups, devices, links, or
+  complete file metadata.
+- Network access from Monty Python. Only the host-side virtual `curl` command and
+  explicitly configured hosted tools or MCP tools can access a network.
+- The virtual shell in the native async kernel. Use the synchronous kernel for
+  shell cells; the async kernel is Python-only.
 
-Every path is a POSIX virtual path. Relative paths resolve against the session's
-virtual working directory. `..` cannot move above `/`.
-
-Commands use the same `OSAccess` or `MountDir` configuration as Monty code and the
-structured filesystem tools:
-
-- Memory files stay in the shared `OSAccess` object.
-- Read-only mounts reject changes.
-- Read-write mounts change the selected host directory.
-- Overlay mount writes last for one Monty feed only. A later shell command cannot
-  depend on an overlay write from an earlier feed.
-
-Text commands require UTF-8. `cp`, `mv`, `base64`, and `sha256sum` read file bytes
-through the binary transfer API. Pipes and redirection are text-only. `base64`
-rejects encoded output above `KernelConfig.max_output_limit_chars` instead of
-returning invalid partial Base64.
-
-## Persistence decision
-
-The shell stores its current directory in the reserved Monty global
-`__arenero_shell_cwd`. This keeps the implementation small and gives it the same
-lifecycle as Python state:
-
-- In-memory sessions preserve it while the process and store remain active.
-- SQLite sessions preserve it after a process restart.
-- Stateless sessions start at `/` for each call.
-- A new session with `WorkspaceConfig` starts at the configured workspace path,
-  `/workspace` by default.
-- Resetting the Python session also resets the working directory.
-
-Each session has its own working directory. Files can still be shared when sessions
-use the same filesystem object or mounts. Arenero serializes filesystem-capable
-execution across sessions that use one kernel. This lock is process-local; two
-application processes still need external coordination when they write the same
-host directory.
-
-## Limits decision
-
-The shell reuses existing configuration instead of adding another limit class:
-
-- `KernelConfig.default_output_limit_chars` sets the default final output size.
-- `KernelConfig.max_output_limit_chars` is the final hard cap and the cap between
-  pipeline stages.
-- `KernelConfig.max_shell_command_chars` limits command text before parsing.
-- `KernelConfig.max_shell_commands` limits commands in the full command list.
-- `KernelConfig.allowed_shell_commands` can enable only selected command names.
-- `output_limit_chars` lets a caller or model request a smaller final result.
-- `FilesystemConfig` limits reads, writes, scans, search results, depth, and binary
-  transfers.
-- `NetworkConfig` restricts or disables `curl` and limits allowed URLs, methods,
-  time, redirects, request bytes, and response bytes.
-- Monty's duration, request, memory, recursion, stream, and session-state limits
-  still apply to Python and filesystem feeds.
-
-The default hard limits are:
-
-| Configuration | Default | Applies to |
-| --- | ---: | --- |
-| `KernelConfig.default_output_limit_chars` | 8,000 | Final output when no smaller request is given. |
-| `KernelConfig.max_output_limit_chars` | 50,000 | Final output, pipeline stages, and Base64 encoded output. |
-| `KernelConfig.max_shell_command_chars` | 20,000 | Raw command text before parsing. |
-| `KernelConfig.max_shell_commands` | 8 | All commands across all pipelines in one call. |
-| `FilesystemConfig.max_write_chars` | 1,000,000 | Redirection and `tee` text writes. |
-| `FilesystemConfig.default_result_limit` | 100 | `ls`, `glob`, `find`, and shell `grep` results. |
-| `FilesystemConfig.max_scan_entries` | 5,000 | Recursive path scans and deletion. |
-| `FilesystemConfig.max_grep_chars` | 2,000,000 | Total UTF-8 characters searched by shell `grep`. |
-| `FilesystemConfig.max_depth` | 20 | Recursive scan depth. |
-| `FilesystemConfig.max_transfer_bytes` | 10,000,000 | Each binary or full-file upload and download. |
-| `NetworkConfig.timeout_seconds` | 10 seconds | Connection and between-read idle timeout. Elapsed redirects reduce it. |
-| `NetworkConfig.max_response_bytes` | 1,000,000 | Final HTTP response body. |
-| `NetworkConfig.max_request_bytes` | 100,000 | HTTP request body. |
-| `NetworkConfig.max_redirects` | 5 | Redirects followed with `curl -L`. |
-| `KernelConfig.max_stream_bytes` | 1,000,000 | Captured Monty standard streams. |
-| `KernelConfig.max_state_bytes` | 5,000,000 | Saved persistent Monty state. |
-| `KernelConfig.max_duration_seconds` | 5 seconds | Cumulative Monty interpreter time for one session. |
-| `KernelConfig.max_memory_bytes` | 64 MiB | Monty-tracked allocations. |
-| `KernelConfig.max_recursion_depth` | 100 | Monty call depth. |
-| `KernelConfig.request_timeout_seconds` | 10 seconds | Worker request wall time. |
-
-Applications can change these defaults. The configured maximums remain hard caps.
-The shell cannot increase a limit. A caller or model can only request a smaller
-final `output_limit_chars` value.
-
-The shell stops a pipeline at the first nonzero exit code. It uses that code for
-`&&` and `||`. The final result has the last command list exit code and reports
-whether output was shortened.
-
-The command allowlist is optional. `None` enables the full virtual command set.
-An empty `frozenset()` disables every command. Aliases such as `python3` must be
-listed separately when an allowlist is active.
-
-```python
-KernelConfig(allowed_shell_commands=frozenset({"help", "which", "cat", "grep"}))
-```
-
-## Security decision
-
-The dispatcher maps each command name to a Python handler. It never calls
-`subprocess`, `os.system`, a system shell, or an arbitrary executable. Adding a
-broad hosted `run_shell()` function would give sandbox code host command authority,
-so Arenero does not provide one.
-
-`curl` is also a host-side handler. By default, it has bounded access to all public
-HTTP and HTTPS URLs. Monty code does not receive a socket, HTTP client, or host
-function that can bypass the handler. An agent can send data that it knows to a
-public service. Applications must use narrow URL prefixes when the agent can
-access sensitive data. Do not put a broad public proxy in an allowlist.
-
-Arenero does not expose the complete shell as a hosted function inside an active
-Monty feed. The current shell reads and changes persistent session state. Calling
-it through a hosted function would try to enter the same locked session again.
-The outer REPL cell dispatcher avoids this nested call because it chooses shell or
-Python before the Monty feed starts. Narrow hosted functions that do not re-enter
-the session remain suitable for domain-specific operations.
-
-The shell is also not called from inside a running Monty feed. A nested call into
-the same persistent session could deadlock or corrupt session ordering. Monty code
-already has `fs_read`, `fs_write`, `fs_edit`, `fs_mkdir`, `fs_delete`, `fs_ls`,
-`fs_glob`, and `fs_grep` for the same virtual filesystem.
-
-## Deliberate exclusions
-
-The shell does not support:
-
-- Arbitrary executables or shell scripts.
-- Background jobs or process control.
-- Environment variables, assignment, or expansion.
-- Wildcard expansion in command arguments. Use `glob` or `find`.
-- Command substitution, aliases, functions, or startup files.
-- File descriptor redirection or binary pipelines.
-- Standard input for Monty Python commands.
-- Git, package managers, compilers, Docker, unrestricted network commands, or
-  system test tools.
-
-These exclusions keep the grammar small, predictable, and safe. Work that needs a
-real shell must use a container, VM, or managed execution sandbox.
+These are product boundaries, not commands that are waiting on the host PATH.
+Arenero will not silently run them on the host.
 
 ## Related references
 
@@ -461,3 +486,4 @@ real shell must use a container, VM, or managed execution sandbox.
 - [Usage and capabilities](usage-and-capabilities.md)
 - [Sandbox compatibility](sandbox-compatibility.md)
 - [Design decisions](design-decisions.md)
+- [Monty constraints skill](../.agents/skills/monty-sandbox/SKILL.md)

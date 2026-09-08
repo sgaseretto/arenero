@@ -38,7 +38,7 @@ executables.
 | Thread or assistant scoping | The application selects the persistent `session_id`. |
 | Shared files | Sessions can share one `OSAccess` object or mount set. One kernel serializes filesystem-capable execution across sessions. |
 | `read`, `write`, `edit`, `delete`, `ls`, `glob`, `grep` | Available inside Monty, as LangChain tools, and through `AreneroSandbox`. `mkdir` is also available inside Monty and through the virtual shell. |
-| Minimal virtual shell | Configurable allowlisted file commands, Monty Python, text pipes, conditional command lists, redirection, and a persistent virtual working directory. |
+| Minimal virtual shell | Configurable allowlisted file commands, Monty Python, text pipes, persistent virtual variables, bounded globs, here documents, straight-line source files, conditional command lists, redirection, and a persistent virtual working directory. |
 | One-tool REPL bridge | `python_repl` accepts normal Python, one-line `!COMMAND` cells, and multiline `%%shell` cells with the same session and files. |
 | Binary upload and download | `upload_file`, `download_file`, `upload_files`, and `download_files` preserve bytes. |
 | Image input bridge | `read_media_file` creates a Base64 data URL or LangChain image block. |
@@ -73,11 +73,15 @@ packages, or direct network access.
 - Bounded text pipes and virtual-file redirection.
 - Sequential and exit-code conditional command lists with `;`, `&&`, and `||`.
 - Small text, Base64 encoding, and SHA-256 utilities.
+- Persistent virtual variables, `$?`, `HOME`, `PWD`, `OLDPWD`, and `~`.
+- Bounded `*`, `?`, and `**` argument expansion.
+- Here documents and straight-line scripts through `source` or `.`.
 - Default bounded public HTTP and HTTPS requests with `curl`.
 - A working directory stored with the selected interpreter session.
 
-It returns combined output, an exit code, and a truncation flag. It rejects every
-other command and shell operator. The application must give
+It returns combined output, an exit code, and a truncation flag. It rejects full
+Bash control flow, processes, command substitution, descriptor redirection,
+binary pipes, and every unlisted command or flag. The application must give
 `MONTY_SANDBOX_INSTRUCTIONS` to the model so the model does not plan unsupported
 commands.
 

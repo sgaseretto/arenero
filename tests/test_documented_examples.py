@@ -60,18 +60,20 @@ class DocumentedExamplesTests(unittest.TestCase):
         self.assertEqual(python["result"], 42)
 
     def test_documented_shell_and_python_limits(self) -> None:
-        """Reject packages and real commands while keeping shell text literal."""
+        """Reject packages and real commands while applying bounded expansion."""
         with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
             unsupported_import = kernel.execute("thread-1", "import numpy")
             sandbox = AreneroSandbox(kernel, session_id="thread-1")
             git = sandbox.execute("git status")
             environment = sandbox.execute("echo $HOME")
             regex = sandbox.execute("echo Alpha | grep 'A.*a'")
+            extended_regex = sandbox.execute("echo Alpha | grep -E 'A.*a'")
 
         self.assertFalse(unsupported_import["ok"])
         self.assertEqual(git.exit_code, 127)
-        self.assertEqual(environment.output.strip(), "$HOME")
+        self.assertEqual(environment.output.strip(), "/")
         self.assertEqual(regex.exit_code, 1)
+        self.assertEqual(extended_regex.output.strip(), "Alpha")
 
 
 if __name__ == "__main__":

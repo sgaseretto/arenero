@@ -140,7 +140,8 @@ application code to decode Base64.
 
 These names make the runtime boundary clear. `run_shell()` is not a host shell.
 It cannot start processes, call arbitrary binaries, run Git, install packages,
-or use shell scripts. See [Virtual shell reference](virtual-shell.md).
+or run full Bash scripts. It can run the documented straight-line virtual shell
+files with `source`. See [Virtual shell reference](virtual-shell.md).
 
 `run_cell()` supports `%run FILE`, `%reset`, `%limits`, `%sessions`, and `%mcp`.
 Managed `%run` resolves relative paths from the current directory.

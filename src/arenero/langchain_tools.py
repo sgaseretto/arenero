@@ -18,8 +18,9 @@ SessionIdResolver = Callable[[ToolRuntime], str | None]
 PYTHON_REPL_TOOL_DESCRIPTION = (
     """Run one persistent Arenero REPL cell.
 Normal input runs as Monty's limited Python subset. Prefix one shell command with
-! or start a multiline shell cell with %%shell. Each nonempty line after %%shell
-runs in sequence. Shell cells use the same session, working directory, Python
+! or start a multiline shell cell with %%shell. The complete body after %%shell
+runs with the documented virtual shell grammar. Shell cells use the same session,
+working directory, Python
 state, and virtual filesystem as Python cells. A shell cell can therefore use
 python -c CODE to access existing REPL variables. Do not mix Python and shell in
 one cell. A multiline ! cell is invalid; use %%shell. Python results contain

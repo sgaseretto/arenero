@@ -142,6 +142,9 @@ class KernelConfig:
         max_output_limit_chars: Hard maximum for each output field.
         max_shell_command_chars: Maximum virtual shell command length.
         max_shell_commands: Maximum commands in one virtual shell command list.
+        max_shell_expanded_args: Maximum arguments after wildcard expansion.
+        max_shell_variables: Maximum persistent virtual shell variables.
+        max_shell_script_depth: Maximum nested ``source`` script depth.
         allowed_shell_commands: Enabled virtual command names, or all commands.
         max_stream_bytes: Maximum collected standard stream bytes.
         max_state_bytes: Maximum saved Monty session size.
@@ -166,6 +169,9 @@ class KernelConfig:
     max_output_limit_chars: int = 50_000
     max_shell_command_chars: int = 20_000
     max_shell_commands: int = 8
+    max_shell_expanded_args: int = 1_000
+    max_shell_variables: int = 100
+    max_shell_script_depth: int = 4
     allowed_shell_commands: frozenset[str] | None = None
     max_stream_bytes: int = 1_000_000
     max_state_bytes: int = 5_000_000
@@ -189,7 +195,14 @@ class KernelConfig:
             raise ValueError("default_output_limit_chars must be at least 0")
         if self.max_output_limit_chars < self.default_output_limit_chars:
             raise ValueError("max_output_limit_chars must not be less than the default")
-        if self.max_shell_command_chars <= 0 or self.max_shell_commands <= 0:
+        shell_limits = (
+            self.max_shell_command_chars,
+            self.max_shell_commands,
+            self.max_shell_expanded_args,
+            self.max_shell_variables,
+            self.max_shell_script_depth,
+        )
+        if any(value <= 0 for value in shell_limits):
             raise ValueError("shell limits must be greater than 0")
         if self.allowed_shell_commands is not None and any(
             not name or name.strip() != name for name in self.allowed_shell_commands

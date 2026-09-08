@@ -357,6 +357,28 @@ flowchart LR
     Fresh --> Zip["Deterministic source ZIP"]
 ```
 
+## The virtual shell is a bounded Bash-like language
+
+The virtual shell uses its own quote-aware lexer and command dispatcher. It does
+not invoke Bash or search the host `PATH`. This keeps all file access on the
+configured virtual filesystem and lets the kernel apply the same command, output,
+scan, transfer, and network limits on each call.
+
+The supported language includes persistent virtual variables, `$?`, `PWD`,
+`OLDPWD`, `HOME`, tilde paths, bounded `*`, `?`, and `**` expansion, comments,
+line continuation, UTF-8 pipes and redirection, here documents, and straight-line
+files through `source`. Shell state is stored in reserved Monty globals so memory,
+SQLite, stateless, reset, and session isolation rules match Python state. Files
+remain separate.
+
+Arenero deliberately does not add a Bash AST or subprocess runtime. Control flow,
+command substitution, field splitting, brace expansion, descriptor redirection,
+binary pipes, job control, and arbitrary executables stay outside the contract.
+Directory copy and move are bounded host operations and are not transactional.
+This is enough for common agent file workflows without making the shell a second
+general execution engine. See the [virtual shell reference](virtual-shell.md) for
+the exact command and grammar limits.
+
 ## Related references
 
 - [Architecture and components](architecture.md)

@@ -319,7 +319,7 @@ limits, and promotion rules.
 | Persistent Python | Keep plain values, functions, and calculations between calls. | Monty's Python subset, not CPython. |
 | State modes | Select stateless, in-memory conversation, or durable SQLite state. | In-memory state ends when its runtime closes. |
 | Virtual files | Read, write, edit, delete, list, glob, and grep bounded files. | Files have a separate lifecycle from Python snapshots. |
-| Virtual shell | Run allowlisted text commands, pipes, redirects, and Monty `python`. | It never starts an operating-system process. |
+| Virtual shell | Run allowlisted text commands, variables, bounded globs, redirects, here documents, straight-line scripts, and Monty `python`. | It is a small Bash-like grammar and never starts an operating-system process. |
 | Network | Fetch bounded public HTTP or HTTPS data with virtual `curl`. | No sockets; use `NetworkConfig` to narrow or disable access. |
 | Hosted tools | Compose selected application, LangChain, or Pydantic AI tools in Python. | Each exposed function runs with host authority. |
 | MCP | Discover, describe, compose, and hot-load stdio or HTTP MCP servers. | MCP connections and promotions are not saved in snapshots. |
@@ -348,9 +348,10 @@ limits, and promotion rules.
   extension, `eval()`, `exec()`, `compile()`, or dynamic import.
 - A virtual `.py` file cannot be imported in the normal CPython way. Use
   `run_file()` for one file or `run_module()` for a bounded static file graph.
-- The virtual shell has a fixed command and flag set. It does not support Git,
-  arbitrary programs, shell scripts, background jobs, command substitution,
-  environment variables, or automatic wildcard expansion.
+- The virtual shell has a fixed command and flag set. It supports persistent
+  virtual variables, bounded wildcard expansion, and straight-line `source`
+  files. It does not support Git, arbitrary programs, full Bash control flow,
+  background jobs, command substitution, binary pipes, or descriptor redirection.
 - Python has no direct socket or process access. Virtual `curl`, MCP, and hosted
   functions are explicit host bridges with separate policies and limits.
 - Python state, virtual files, MCP connections, and external side effects have
@@ -685,8 +686,9 @@ curl https://example.com/data > /work/data.txt
 grep result /work/data.txt
 ```
 
-`!command` accepts one shell line. In a `%%shell` cell, each nonempty line runs in
-sequence. Python and shell cells use the same thread session, shell working
+`!command` accepts one shell line. A `%%shell` cell preserves its complete body,
+including comments, continuations, and here documents. Python and shell cells use
+the same thread session, shell working
 directory, Python state, and virtual filesystem. For example, a later shell cell
 can run `python -c 'existing_variable'`, and a later Python cell can read a file
 that the shell created.
@@ -1170,23 +1172,42 @@ state. It does not create a second Monty runtime. Use
 
 `execute` provides a small virtual shell. It supports:
 
-- `help`, `which`, `pwd`, `cd`, `ls`, `mkdir`, `cat`, `head`, `tail`, `grep`,
-  `find`, `glob`, `echo`, `sort`, `uniq`, `rev`, `wc`, `basename`, `dirname`,
-  `tee`, `base64`, `sha256sum`, `rm`, `cp`, and `mv`
-- Opt-in, policy-limited `curl`
+- `.`, `[`, `help`, `which`, `pwd`, `cd`, `env`, `export`, `unset`, `true`,
+  `false`, `test`, `ls`, `mkdir`, `touch`, `cat`, `head`, `tail`, `grep`,
+  `find`, `glob`, `echo`, `printf`, `sort`, `uniq`, `rev`, `wc`, `basename`,
+  `dirname`, `tee`, `base64`, `sha256sum`, `rm`, `cp`, `mv`, and `source`
+- Default bounded public HTTP and HTTPS through policy-limited `curl`
 - `python -c CODE` and `python FILE.py`
 - Text pipes with `|`
 - Command lists with `;`, `&&`, and `||`
-- Virtual file input and output with `<`, `>`, and `>>`
+- Virtual file input and output with `<`, `>`, `>>`, and `<<`
+- Single and double quotes, comments, and line continuation
+- Persistent virtual variables, `$?`, `PWD`, `OLDPWD`, `HOME`, and `~`
+- Bounded `*`, `?`, and `**` expansion for unquoted arguments
+- Straight-line virtual command files with `source FILE` or `. FILE`
 
-The working directory belongs to the Monty session. Memory and SQLite storage
-preserve it with Python state. Stateless storage starts at `/` for every call.
-Files still follow the separate virtual filesystem lifecycle and can be shared by
-sessions.
+```python
+with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
+    sandbox = AreneroSandbox(kernel, session_id="agent-1")
+    sandbox.execute("NAME=report; mkdir -p ~/work; touch ~/work/a.txt")
+    result = sandbox.execute(
+        "printf '%s\\n' ~/work/*.txt | grep -E 'a\\.txt$'"
+    )
+    print(result.output)
+```
+
+Use `%%shell` for multiline here documents and straight-line command source.
+Use `source /script.sh` to run a saved virtual command file. `if`, `for`, `while`,
+functions, command substitution, `bash FILE`, and host programs are not supported.
+
+The working directory, previous directory, variables, and last exit status belong
+to the Monty session. Memory and SQLite storage preserve them with Python state.
+Stateless storage starts them again for every call. Files still follow the
+separate virtual filesystem lifecycle and can be shared by sessions.
 
 This shell never starts an operating-system process. It rejects background jobs,
-environment variables, wildcard expansion, command substitution, Git, package
-installation, and all other executables. The virtual `curl` command allows
+full Bash control flow, command substitution, descriptor redirection, Git,
+package installation, and all other executables. The virtual `curl` command allows
 bounded requests to public HTTP and HTTPS URLs by default. Supply a host policy
 when you want a narrower URL or method set:
 
@@ -1235,11 +1256,12 @@ on `KernelConfig`. The supported `curl --max-time` option can only lower the
 network timeout in `NetworkConfig`. It does not have every timing guarantee of
 system curl.
 
-Shell `grep` uses literal substring search, not regular expressions. `glob` and
-`find` support only `*`, `?`, and `**`, and patterns are never expanded in normal
-command arguments. Pipes and redirection are UTF-8 text only. The `python` command
-runs Monty's Python subset, not CPython, and accepts only `-c CODE` or one virtual
-`.py` file. Each command supports only the flags listed above.
+Shell `grep` uses literal text by default and Python regular-expression syntax
+with `-E`. `glob`, `find`, and automatic argument expansion support only `*`, `?`,
+and `**`. Pipes and redirection are UTF-8 text only. `source` runs only the small
+straight-line grammar. The `python` command runs Monty's Python subset, not
+CPython, and accepts only `-c CODE` or one virtual `.py` file. Each command
+supports only the documented flags.
 
 Give `MONTY_SANDBOX_INSTRUCTIONS` to an LLM whenever it can call `execute`.
 See the [virtual shell reference](docs/virtual-shell.md) for every command form,

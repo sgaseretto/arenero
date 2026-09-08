@@ -273,8 +273,8 @@ def _shell_command(code: str) -> tuple[str | None, str | None]:
             return None, "Use %%shell for a shell cell with more than one line"
         return code[1:].strip(), None
     if lines and lines[0].strip() == "%%shell":
-        commands = [line.strip() for line in lines[1:] if line.strip()]
-        return "; ".join(commands), None
+        _, separator, body = code.partition("\n")
+        return body if separator else "", None
     return None, None
 
 

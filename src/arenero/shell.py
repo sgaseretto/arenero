@@ -1,51 +1,68 @@
 import base64
+import binascii
 import hashlib
 import json
 import posixpath
-import shlex
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic_monty import MontyError
 
 from .events import emit_event
+from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, PersistentMontyKernel
 from .network import NetworkRequest, NetworkResponse, fetch_url
 
 _CWD_NAME = "__arenero_shell_cwd"
+_STATE_NAME = "__arenero_shell_state"
+_HEREDOC_PREFIX = "__arenero_heredoc_"
+_VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PYTHON_COMMANDS = {"monty", "python", "python3"}
 _SHELL_ERRORS = (MontyError, ValueError, TypeError, RuntimeError)
 _COMMAND_USAGE = {
-    "base64": "base64 [FILE]",
+    ".": ". FILE",
+    "[": "[ EXPRESSION ]",
+    "base64": "base64 [-d] [FILE]",
     "basename": "basename PATH",
     "cat": "cat FILE...",
-    "cd": "cd [PATH]",
-    "cp": "cp SOURCE DESTINATION",
+    "cd": "cd [PATH|-]",
+    "cp": "cp [-r] SOURCE... DESTINATION",
     "curl": (
         "curl [-fLsiI] [-X METHOD] [-H 'NAME: VALUE'] [-d DATA] "
         "[-o FILE] [--max-time SECONDS] URL"
     ),
     "dirname": "dirname PATH",
     "echo": "echo [-n] [TEXT ...]",
+    "env": "env",
+    "export": "export [NAME[=VALUE] ...]",
     "find": "find [PATH] [PATTERN]",
     "glob": "glob PATTERN [PATH]",
-    "grep": "grep [-i] [-n] PATTERN [FILE ...]",
+    "grep": "grep [-EFinvcqlrR] PATTERN [FILE ...]",
     "head": "head [-n COUNT] [FILE]",
     "help": "help [COMMAND]",
-    "ls": "ls [PATH ...]",
+    "ls": "ls [-aA1ldR] [PATH ...]",
     "mkdir": "mkdir [-p] PATH...",
     "monty": "monty -c CODE or monty FILE.py",
-    "mv": "mv SOURCE DESTINATION",
+    "mv": "mv SOURCE... DESTINATION",
     "pwd": "pwd",
+    "printf": "printf FORMAT [ARGUMENT ...]",
     "python": "python -c CODE or python FILE.py",
     "python3": "python3 -c CODE or python3 FILE.py",
     "rev": "rev [FILE]",
     "rm": "rm [-r] [-f] PATH...",
     "sha256sum": "sha256sum [FILE ...]",
+    "source": "source FILE",
     "sort": "sort [-r] [FILE]",
     "tail": "tail [-n COUNT] [FILE]",
     "tee": "tee [-a] FILE...",
+    "test": "test EXPRESSION",
+    "touch": "touch FILE...",
+    "true": "true",
+    "false": "false",
     "uniq": "uniq [-c] [FILE]",
+    "unset": "unset NAME...",
     "wc": "wc [-lwc] [FILE]",
     "which": "which COMMAND...",
 }
@@ -71,12 +88,59 @@ class ShellResult:
 
 
 @dataclass(frozen=True)
+class _WordPart:
+    """Store one word fragment and its quote mode.
+
+    Attributes:
+        text: Literal source text without quote markers.
+        quote: ``none``, ``single``, or ``double``.
+    """
+
+    text: str
+    quote: str = "none"
+
+
+@dataclass(frozen=True)
+class _Word:
+    """Store one shell word before variable and path expansion.
+
+    Attributes:
+        parts: Ordered literal and quoted fragments.
+    """
+
+    parts: tuple[_WordPart, ...]
+
+    def literal(self) -> str:
+        """Return the word text before expansion.
+
+        Returns:
+            Joined word fragments.
+        """
+
+        return "".join(part.text for part in self.parts)
+
+
+@dataclass(frozen=True)
+class _HereDocument:
+    """Store one extracted here-document body.
+
+    Attributes:
+        content: Text between the header and terminator.
+        expand: Whether virtual variables expand in the body.
+    """
+
+    content: str
+    expand: bool
+
+
+@dataclass(frozen=True)
 class _Command:
     """Store one parsed command and its redirections."""
 
-    arguments: list[str]
-    input_path: str | None = None
-    output_path: str | None = None
+    arguments: list[_Word]
+    input_path: _Word | None = None
+    output_path: _Word | None = None
+    here_document: _HereDocument | None = None
     append: bool = False
 
 
@@ -124,9 +188,17 @@ class VirtualShell:
         """
         self.kernel = kernel
         self.session_id = session_id
+        self._variables: dict[str, str] = {}
+        self._oldpwd = self.kernel.default_working_directory
+        self._last_status = 0
+        self._current_cwd = self.kernel.default_working_directory
+        self._command_budget = self.kernel.config.max_shell_commands
+        self._script_depth = 0
         self._commands: dict[
             str, Callable[[list[str], str | None, str], ShellResult]
         ] = {
+            ".": self._source,
+            "[": self._bracket,
             "base64": self._base64,
             "basename": self._basename,
             "cat": self._cat,
@@ -134,6 +206,9 @@ class VirtualShell:
             "cp": self._cp,
             "dirname": self._dirname,
             "echo": self._echo,
+            "env": self._env,
+            "export": self._export,
+            "false": self._false,
             "find": self._find,
             "glob": self._glob,
             "grep": self._grep,
@@ -143,13 +218,19 @@ class VirtualShell:
             "mkdir": self._mkdir,
             "mv": self._mv,
             "pwd": self._pwd,
+            "printf": self._printf,
             "rev": self._rev,
             "rm": self._rm,
             "sha256sum": self._sha256sum,
             "sort": self._sort,
+            "source": self._source,
             "tail": self._tail,
             "tee": self._tee,
+            "test": self._test,
+            "touch": self._touch,
+            "true": self._true,
             "uniq": self._uniq,
+            "unset": self._unset,
             "wc": self._wc,
             "which": self._which,
         }
@@ -226,12 +307,6 @@ class VirtualShell:
         try:
             if len(command) > self.kernel.config.max_shell_command_chars:
                 raise _UsageError("command exceeds the virtual shell length limit")
-            pipelines = _parse(command)
-            command_count = sum(len(pipeline.commands) for pipeline in pipelines)
-            if command_count > self.kernel.config.max_shell_commands:
-                raise _UsageError(
-                    "command list exceeds the virtual shell command limit"
-                )
             limit = self._output_limit(output_limit_chars)
         except _UsageError as exc:
             return ShellResult(str(exc), 2)
@@ -239,22 +314,29 @@ class VirtualShell:
         cwd_result = self._load_cwd()
         if isinstance(cwd_result, ShellResult):
             return cwd_result
-        cwd = cwd_result
-        output = ""
-        last_result = ShellResult("", 0)
-        truncated = False
+        state_result = self._load_shell_state(cwd_result)
+        if isinstance(state_result, ShellResult):
+            return state_result
+        self._variables, self._oldpwd, self._last_status = state_result
+        self._current_cwd = cwd_result
+        self._command_budget = self.kernel.config.max_shell_commands
 
-        for pipeline in pipelines:
-            if pipeline.operator == "&&" and last_result.exit_code != 0:
-                continue
-            if pipeline.operator == "||" and last_result.exit_code == 0:
-                continue
-            last_result, cwd = self._execute_pipeline(pipeline.commands, cwd)
-            output, shortened = _trim(
-                output + last_result.output,
-                self.kernel.config.max_output_limit_chars,
-            )
-            truncated = truncated or last_result.truncated or shortened
+        usage_error = False
+        try:
+            result, _ = self._execute_program(command, cwd_result)
+        except _UsageError as exc:
+            result = ShellResult(str(exc), 2)
+            usage_error = True
+        self._last_status = result.exit_code
+        saved = self._save_shell_state()
+        if saved is not None and result.exit_code == 0:
+            result = saved
+        if usage_error:
+            return result
+
+        output = result.output
+        last_result = result
+        truncated = result.truncated
 
         returned_output, shortened = _trim(output, limit)
         was_truncated = truncated or shortened
@@ -275,6 +357,45 @@ class VirtualShell:
             output_file_error,
         )
 
+    def _execute_program(self, command: str, cwd: str) -> tuple[ShellResult, str]:
+        """Parse and run one top-level command list or sourced script.
+
+        Args:
+            command: Virtual shell source.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Combined result and final working directory.
+
+        Raises:
+            _UsageError: If syntax or a shared execution limit is invalid.
+        """
+
+        if len(command) > self.kernel.config.max_shell_command_chars:
+            raise _UsageError("script exceeds the virtual shell length limit")
+        pipelines = _parse(command)
+        command_count = sum(len(pipeline.commands) for pipeline in pipelines)
+        if command_count > self._command_budget:
+            raise _UsageError("command list exceeds the virtual shell command limit")
+        self._command_budget -= command_count
+
+        output = ""
+        last_result = ShellResult("", 0)
+        truncated = False
+        for pipeline in pipelines:
+            if pipeline.operator == "&&" and last_result.exit_code != 0:
+                continue
+            if pipeline.operator == "||" and last_result.exit_code == 0:
+                continue
+            last_result, cwd = self._execute_pipeline(pipeline.commands, cwd)
+            self._last_status = last_result.exit_code
+            output, shortened = _trim(
+                output + last_result.output,
+                self.kernel.config.max_output_limit_chars,
+            )
+            truncated = truncated or last_result.truncated or shortened
+        return ShellResult(output, last_result.exit_code, truncated), cwd
+
     def _execute_pipeline(
         self,
         commands: list[_Command],
@@ -292,33 +413,37 @@ class VirtualShell:
         pipeline_input: str | None = None
         truncated = False
         for parsed in commands:
-            input_path = (
-                self._path(parsed.input_path, cwd)
-                if parsed.input_path is not None
-                else None
-            )
-            output_path = (
-                self._path(parsed.output_path, cwd)
-                if parsed.output_path is not None
-                else None
-            )
+            arguments = self._expand_words(parsed.arguments, cwd)
+            input_path = self._expanded_path(parsed.input_path, cwd)
+            output_path = self._expanded_path(parsed.output_path, cwd)
+            if parsed.here_document is not None:
+                content = parsed.here_document.content
+                pipeline_input = (
+                    self._expand_parameters(content, cwd)
+                    if parsed.here_document.expand
+                    else content
+                )
             if input_path is not None:
                 read = self._read_text(input_path)
                 if isinstance(read, ShellResult):
                     return read, cwd
                 pipeline_input = read
 
-            result = self._run(parsed.arguments, pipeline_input, cwd)
+            assignment = (
+                _split_assignment(arguments[0]) if len(arguments) == 1 else None
+            )
+            if assignment is not None:
+                self._set_variable(*assignment)
+                result = ShellResult("", 0)
+            else:
+                result = self._run(arguments, pipeline_input, cwd)
             truncated = truncated or result.truncated
             if result.exit_code != 0:
                 return ShellResult(result.output, result.exit_code, truncated), cwd
 
             pipeline_input = result.output
-            if parsed.arguments[0] == "cd":
-                loaded = self._load_cwd()
-                if isinstance(loaded, ShellResult):
-                    return loaded, cwd
-                cwd = loaded
+            if arguments[0] in {".", "cd", "source"}:
+                cwd = self._current_cwd
 
             if output_path is not None:
                 written = self._write_text(
@@ -361,6 +486,206 @@ class VirtualShell:
             return ShellResult(str(exc), 2)
         except _SHELL_ERRORS as exc:
             return ShellResult(str(exc), 1)
+
+    def _expand_words(self, words: list[_Word], cwd: str) -> list[str]:
+        """Expand variables, tilde paths, and bounded virtual globs.
+
+        Args:
+            words: Parsed words with quote information.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Expanded command arguments.
+
+        Raises:
+            _UsageError: If expansion exceeds a hard limit.
+        """
+
+        arguments: list[str] = []
+        for index, word in enumerate(words):
+            arguments.extend(self._expand_word(word, cwd, allow_glob=index > 0))
+            if len(arguments) > self.kernel.config.max_shell_expanded_args:
+                raise _UsageError("shell argument expansion exceeds its limit")
+        return arguments
+
+    def _expand_word(
+        self,
+        word: _Word,
+        cwd: str,
+        *,
+        allow_glob: bool,
+    ) -> list[str]:
+        """Expand one parsed word while honoring its quote modes.
+
+        Args:
+            word: Parsed word fragments.
+            cwd: Current absolute virtual directory.
+            allow_glob: Whether unquoted wildcard text can expand.
+
+        Returns:
+            One literal argument or bounded matching virtual paths.
+        """
+
+        output: list[str] = []
+        can_glob = False
+        for index, part in enumerate(word.parts):
+            text = (
+                part.text
+                if part.quote == "single"
+                else self._expand_parameters(part.text, cwd)
+            )
+            if (
+                index == 0
+                and part.quote == "none"
+                and (text == "~" or text.startswith("~/"))
+            ):
+                home = self._variables.get(
+                    "HOME", self.kernel.default_working_directory
+                ).rstrip("/")
+                text = home + text[1:]
+                if not text:
+                    text = "/"
+            if part.quote == "none" and any(mark in text for mark in "*?"):
+                can_glob = True
+            output.append(text)
+        value = "".join(output)
+        if allow_glob and can_glob:
+            return self._expand_glob(value, cwd)
+        return [value]
+
+    def _expand_glob(self, value: str, cwd: str) -> list[str]:
+        """Expand one wildcard argument through the bounded virtual filesystem.
+
+        Args:
+            value: Expanded argument containing ``*`` or ``?``.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Absolute matches, or the literal value when no path matches.
+
+        Raises:
+            _UsageError: If the filesystem scan fails or is incomplete.
+        """
+
+        root = "/" if value.startswith("/") else cwd
+        pattern = value.lstrip("/") if value.startswith("/") else value
+        result = self.kernel.call_filesystem(
+            self.session_id,
+            "glob",
+            {
+                "pattern": pattern,
+                "root": root,
+                "limit": self.kernel.filesystem_config.max_result_limit,
+            },
+        )
+        if not result["ok"]:
+            raise _UsageError(_error_text(result))
+        matches = result["result"]
+        if matches["truncated"]:
+            raise _UsageError("wildcard expansion exceeds the filesystem limits")
+        return matches["matches"] or [value]
+
+    def _expanded_path(self, word: _Word | None, cwd: str) -> str | None:
+        """Expand one redirection word into exactly one virtual path.
+
+        Args:
+            word: Optional parsed path word.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Absolute path or ``None`` when no redirection exists.
+
+        Raises:
+            _UsageError: If a wildcard produces more than one path.
+        """
+
+        if word is None:
+            return None
+        values = self._expand_word(word, cwd, allow_glob=True)
+        if len(values) != 1:
+            raise _UsageError("redirection path expands to more than one file")
+        return self._path(values[0], cwd)
+
+    def _expand_parameters(self, text: str, cwd: str) -> str:
+        """Expand the supported virtual shell parameter forms.
+
+        Args:
+            text: Text from an unquoted or double-quoted fragment.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Text with ``$NAME``, ``${NAME}``, and ``$?`` expanded.
+
+        Raises:
+            _UsageError: If parameter or command-substitution syntax is invalid.
+        """
+
+        if "$(" in text or "`" in text:
+            raise _UsageError("command substitution is not supported")
+        variables = dict(self._variables)
+        variables.setdefault("HOME", self.kernel.default_working_directory)
+        variables["PWD"] = cwd
+        variables["OLDPWD"] = self._oldpwd
+        output: list[str] = []
+        index = 0
+        while index < len(text):
+            if text[index] != "$":
+                output.append(text[index])
+                index += 1
+                continue
+            if index + 1 >= len(text):
+                output.append("$")
+                break
+            next_character = text[index + 1]
+            if next_character == "?":
+                output.append(str(self._last_status))
+                index += 2
+                continue
+            if next_character == "{":
+                end = text.find("}", index + 2)
+                if end < 0:
+                    raise _UsageError("parameter expansion is missing }")
+                name = text[index + 2 : end]
+                if _VARIABLE_NAME.fullmatch(name) is None:
+                    raise _UsageError(f"unsupported parameter expansion: ${{{name}}}")
+                output.append(variables.get(name, ""))
+                index = end + 1
+                continue
+            end = index + 1
+            while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            if end == index + 1 or text[index + 1].isdigit():
+                output.append("$")
+                index += 1
+                continue
+            name = text[index + 1 : end]
+            output.append(variables.get(name, ""))
+            index = end
+        return "".join(output)
+
+    def _set_variable(self, name: str, value: str) -> None:
+        """Set one bounded persistent virtual shell variable.
+
+        Args:
+            name: Valid shell variable name.
+            value: Text value.
+
+        Raises:
+            _UsageError: If the name, value, or variable count is invalid.
+        """
+
+        if _VARIABLE_NAME.fullmatch(name) is None:
+            raise _UsageError(f"invalid shell variable name: {name}")
+        if name in {"OLDPWD", "PWD"}:
+            raise _UsageError(f"{name} is managed by the virtual shell")
+        if len(value) > self.kernel.config.max_shell_command_chars:
+            raise _UsageError("shell variable value exceeds the command length limit")
+        if (
+            name not in self._variables
+            and len(self._variables) >= self.kernel.config.max_shell_variables
+        ):
+            raise _UsageError("virtual shell variable count exceeds its limit")
+        self._variables[name] = value
 
     def _is_available(self, name: str) -> bool:
         """Return whether one command is enabled by the allowlist.
@@ -433,7 +758,9 @@ class VirtualShell:
         available = self._available_commands()
         if not args:
             return ShellResult(
-                "Commands: " + " ".join(available) + "\nOperators: | ; && || < > >>\n",
+                "Commands: "
+                + " ".join(available)
+                + "\nOperators: | ; newline && || < > >> <<\n",
                 0,
             )
         name = args[0]
@@ -503,7 +830,15 @@ class VirtualShell:
         """Change the persistent virtual directory."""
         _expect_no_input(stdin, "cd")
         _expect_count(args, 0, 1, "cd [PATH]")
-        target = self._path(args[0] if args else "/", cwd)
+        show_target = bool(args and args[0] == "-")
+        requested = (
+            self._oldpwd
+            if show_target
+            else args[0]
+            if args
+            else self._variables.get("HOME", self.kernel.default_working_directory)
+        )
+        target = self._path(requested, cwd)
         listed = self.kernel.call_filesystem(
             self.session_id,
             "ls",
@@ -511,35 +846,60 @@ class VirtualShell:
         )
         if not listed["ok"]:
             return ShellResult(_error_text(listed), 1)
+        self._oldpwd = cwd
         result = self.kernel.execute(
             self.session_id,
             f"{_CWD_NAME} = {target!r}",
             self.kernel.config.max_output_limit_chars,
         )
-        return shell_result_from_execution(result)
+        changed = shell_result_from_execution(result)
+        if changed.exit_code == 0:
+            self._current_cwd = target
+        if changed.exit_code == 0 and show_target:
+            return ShellResult(target + "\n", 0)
+        return changed
 
     def _ls(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
-        """List direct entries in one or more virtual directories."""
+        """List bounded virtual paths with common Bash-style flags."""
         _expect_no_input(stdin, "ls")
+        flags: set[str] = set()
+        while args and args[0].startswith("-") and args[0] != "-":
+            option = args.pop(0)
+            if option == "--":
+                break
+            short = option[1:]
+            if not short or any(flag not in "aA1ldR" for flag in short):
+                raise _UsageError("Usage: ls [-aA1ldR] [PATH ...]")
+            flags.update(short)
         paths = args or ["."]
         output: list[str] = []
         truncated = False
         for path in paths:
             target = self._path(path, cwd)
+            kind = self._path_kind(target)
+            if kind is None:
+                return ShellResult(f"ls: path does not exist: {path}", 1, truncated)
+            if kind == "file" or "d" in flags:
+                output.append(_ls_line(target, kind, "l" in flags))
+                continue
             result = self.kernel.call_filesystem(
                 self.session_id,
                 "ls",
-                {"path": target, "recursive": False, "limit": None},
+                {
+                    "path": target,
+                    "recursive": "R" in flags,
+                    "limit": self.kernel.filesystem_config.max_result_limit,
+                },
             )
             if not result["ok"]:
                 return ShellResult(_error_text(result), 1, truncated)
             value = result["result"]
             output.extend(
-                entry["path"] + ("/" if entry["type"] == "directory" else "")
-                for entry in value["entries"]
+                _ls_line(entry["path"], entry["type"], "l" in flags)
+                for entry in sorted(value["entries"], key=lambda item: item["path"])
             )
             truncated = truncated or value["truncated"]
-        return ShellResult("".join(f"{path}\n" for path in output), 0, truncated)
+        return ShellResult("".join(f"{line}\n" for line in output), 0, truncated)
 
     def _cat(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
         """Concatenate UTF-8 virtual files or pipeline input."""
@@ -549,7 +909,13 @@ class VirtualShell:
             return ShellResult(stdin, 0)
         output = ""
         for path in args:
-            read = self._read_text(self._path(path, cwd))
+            read = (
+                stdin
+                if path == "-" and stdin is not None
+                else ShellResult("cat: standard input is not available", 2)
+                if path == "-"
+                else self._read_text(self._path(path, cwd))
+            )
             if isinstance(read, ShellResult):
                 return read
             output, truncated = _trim(
@@ -622,7 +988,7 @@ class VirtualShell:
         return ShellResult(header_text + body_text, 0)
 
     def _base64(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
-        """Encode one virtual file or pipeline input as Base64 text.
+        """Encode or decode one virtual file or pipeline input.
 
         Args:
             args: Optional virtual file path.
@@ -632,16 +998,34 @@ class VirtualShell:
         Returns:
             Base64 text or an error result.
         """
-        _expect_count(args, 0, 1, "base64 [FILE]")
-        if args:
+        decode = bool(args and args[0] in {"-d", "--decode"})
+        paths = args[1:] if decode else args
+        _expect_count(paths, 0, 1, "base64 [-d] [FILE]")
+        if paths and paths[0] == "-":
+            if stdin is None:
+                return ShellResult("base64: standard input is not available", 2)
+            content = stdin.encode("utf-8")
+        elif paths:
             try:
-                content = self.kernel.download_file(self._path(args[0], cwd))
+                content = self.kernel.download_file(self._path(paths[0], cwd))
             except _SHELL_ERRORS as exc:
                 return ShellResult(str(exc), 1)
         elif stdin is not None:
             content = stdin.encode("utf-8")
         else:
             return ShellResult("base64 needs a file or pipeline input", 2)
+        if decode:
+            try:
+                decoded = base64.b64decode(b"".join(content.split()), validate=True)
+            except (binascii.Error, ValueError) as exc:
+                return ShellResult(f"base64: invalid input: {exc}", 1)
+            try:
+                return ShellResult(decoded.decode("utf-8"), 0)
+            except UnicodeDecodeError:
+                return ShellResult(
+                    "base64 decoded bytes are not UTF-8 and cannot enter a text pipe",
+                    1,
+                )
         encoded = base64.b64encode(content).decode("ascii") + "\n"
         if len(encoded) > self.kernel.config.max_output_limit_chars:
             return ShellResult("base64 output exceeds the shell output limit", 1)
@@ -666,6 +1050,13 @@ class VirtualShell:
         values: list[tuple[str, bytes]] = []
         if args:
             for path in args:
+                if path == "-":
+                    if stdin is None:
+                        return ShellResult(
+                            "sha256sum: standard input is not available", 2
+                        )
+                    values.append(("-", stdin.encode("utf-8")))
+                    continue
                 target = self._path(path, cwd)
                 try:
                     values.append((path, self.kernel.download_file(target)))
@@ -700,38 +1091,36 @@ class VirtualShell:
         return ShellResult("".join(text.splitlines(keepends=True)[-count:]), 0)
 
     def _grep(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
-        """Search literal text in UTF-8 files or pipeline input."""
-        ignore_case = False
-        line_numbers = False
+        """Search bounded UTF-8 input with common Bash-style grep flags."""
+        flags: set[str] = set()
         while args and args[0].startswith("-") and args[0] != "-":
-            flags = args.pop(0)[1:]
-            if not flags or any(flag not in "in" for flag in flags):
-                raise _UsageError("Usage: grep [-i] [-n] PATTERN [FILE ...]")
-            ignore_case = ignore_case or "i" in flags
-            line_numbers = line_numbers or "n" in flags
+            option = args.pop(0)
+            if option == "--":
+                break
+            short = option[1:]
+            if not short or any(flag not in "EFinvcqlrR" for flag in short):
+                raise _UsageError("Usage: grep [-EFinvcqlr] PATTERN [FILE ...]")
+            flags.update(short)
         if not args:
-            raise _UsageError("Usage: grep [-i] [-n] PATTERN [FILE ...]")
+            raise _UsageError("Usage: grep [-EFinvcqlr] PATTERN [FILE ...]")
+        if "E" in flags and "F" in flags:
+            raise _UsageError("grep -E and -F cannot be used together")
         pattern, paths = args[0], args[1:]
-        sources: list[tuple[str | None, str | None]] = []
-        if paths:
-            sources.extend((self._path(path, cwd), None) for path in paths)
-        elif stdin is not None:
-            sources.append((None, stdin))
-        else:
-            raise _UsageError("grep needs a file or pipeline input")
-
-        needle = pattern.lower() if ignore_case else pattern
+        sources_result = self._grep_sources(paths, stdin, cwd, bool(flags & {"r", "R"}))
+        if isinstance(sources_result, ShellResult):
+            return sources_result
+        sources = sources_result
         multiple = len(sources) > 1
-        matches: list[str] = []
+        expression = pattern if "E" in flags else re.escape(pattern)
+        try:
+            matcher = re.compile(expression, re.IGNORECASE if "i" in flags else 0)
+        except re.error as exc:
+            return ShellResult(f"grep: invalid regular expression: {exc}", 2)
+        output: list[str] = []
+        selected_total = 0
         characters_scanned = 0
         truncated = False
         for path, text in sources:
-            if text is None:
-                assert path is not None
-                read = self._read_text(path)
-                if isinstance(read, ShellResult):
-                    return read
-                text = read
             remaining = (
                 self.kernel.filesystem_config.max_grep_chars - characters_scanned
             )
@@ -742,20 +1131,117 @@ class VirtualShell:
                 text = text[:remaining]
                 truncated = True
             characters_scanned += len(text)
+            file_count = 0
             for number, line in enumerate(text.splitlines(), start=1):
-                candidate = line.lower() if ignore_case else line
-                if needle not in candidate:
+                selected = matcher.search(line) is not None
+                if "v" in flags:
+                    selected = not selected
+                if not selected:
                     continue
-                if len(matches) >= self.kernel.filesystem_config.default_result_limit:
+                file_count += 1
+                selected_total += 1
+                if "q" in flags:
+                    return ShellResult("", 0, truncated)
+                if "l" in flags:
+                    if (
+                        len(output)
+                        >= self.kernel.filesystem_config.default_result_limit
+                    ):
+                        truncated = True
+                        break
+                    output.append((path or "-") + "\n")
+                    break
+                if "c" in flags:
+                    continue
+                if len(output) >= self.kernel.filesystem_config.default_result_limit:
                     truncated = True
                     break
                 prefix = f"{path}:" if multiple and path is not None else ""
-                if line_numbers:
+                if "n" in flags:
                     prefix += f"{number}:"
-                matches.append(f"{prefix}{line}\n")
+                output.append(f"{prefix}{line}\n")
+            if "c" in flags:
+                if len(output) >= self.kernel.filesystem_config.default_result_limit:
+                    truncated = True
+                    break
+                prefix = f"{path}:" if multiple and path is not None else ""
+                output.append(f"{prefix}{file_count}\n")
             if truncated:
                 break
-        return ShellResult("".join(matches), 0 if matches else 1, truncated)
+        return ShellResult(
+            "".join(output),
+            0 if selected_total else 1,
+            truncated,
+        )
+
+    def _grep_sources(
+        self,
+        paths: list[str],
+        stdin: str | None,
+        cwd: str,
+        recursive: bool,
+    ) -> list[tuple[str | None, str]] | ShellResult:
+        """Collect bounded UTF-8 grep sources.
+
+        Args:
+            paths: File or directory arguments.
+            stdin: Optional pipeline input.
+            cwd: Current absolute virtual directory.
+            recursive: Whether directory arguments are accepted.
+
+        Returns:
+            Source labels and text, or a shell error.
+        """
+
+        if not paths:
+            if stdin is None:
+                return ShellResult("grep needs a file or pipeline input", 2)
+            return [(None, stdin)]
+        sources: list[tuple[str | None, str]] = []
+        for path in paths:
+            if path == "-":
+                if stdin is None:
+                    return ShellResult("grep: standard input is not available", 2)
+                sources.append((None, stdin))
+                continue
+            target = self._path(path, cwd)
+            kind = self._path_kind(target)
+            if kind == "directory":
+                if not recursive:
+                    return ShellResult(f"grep: {path} is a directory; use -r", 1)
+                listed = self.kernel.call_filesystem(
+                    self.session_id,
+                    "ls",
+                    {
+                        "path": target,
+                        "recursive": True,
+                        "limit": self.kernel.filesystem_config.max_result_limit,
+                    },
+                )
+                if not listed["ok"]:
+                    return ShellResult(_error_text(listed), 1)
+                value = listed["result"]
+                if value["truncated"]:
+                    return ShellResult(
+                        "grep recursive file scan exceeds filesystem limits",
+                        1,
+                        True,
+                    )
+                file_paths = sorted(
+                    entry["path"]
+                    for entry in value["entries"]
+                    if entry["type"] == "file"
+                )
+            elif kind == "file":
+                file_paths = [target]
+            else:
+                return ShellResult(f"grep: path does not exist: {path}", 1)
+            for file_path in file_paths:
+                read = self._read_text(file_path)
+                if isinstance(read, ShellResult):
+                    return read
+                sources.append((file_path, read))
+        return sources
 
     def _find(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
         """Find virtual paths below a root with a glob pattern."""
@@ -794,6 +1280,256 @@ class VirtualShell:
         newline = not args or args[0] != "-n"
         values = args if newline else args[1:]
         return ShellResult(" ".join(values) + ("\n" if newline else ""), 0)
+
+    def _env(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Print the persistent virtual shell variables.
+
+        Args:
+            args: No arguments are supported.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Sorted ``NAME=VALUE`` lines.
+        """
+
+        _expect_no_input(stdin, "env")
+        _expect_count(args, 0, 0, "env")
+        variables = dict(self._variables)
+        variables.setdefault("HOME", self.kernel.default_working_directory)
+        variables["OLDPWD"] = self._oldpwd
+        variables["PWD"] = cwd
+        return ShellResult(
+            "".join(f"{name}={variables[name]}\n" for name in sorted(variables)),
+            0,
+        )
+
+    def _export(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Set or list persistent virtual shell variables.
+
+        Args:
+            args: Variable names or ``NAME=VALUE`` assignments.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current directory used only when listing variables.
+
+        Returns:
+            Empty output after changes, or the current variable list.
+        """
+
+        _expect_no_input(stdin, "export")
+        if not args:
+            return self._env([], None, cwd)
+        for item in args:
+            assignment = _split_assignment(item)
+            if assignment is None:
+                self._set_variable(item, self._variables.get(item, ""))
+            else:
+                self._set_variable(*assignment)
+        return ShellResult("", 0)
+
+    def _unset(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Remove persistent virtual shell variables.
+
+        Args:
+            args: Variable names to remove.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current directory, which this command does not use.
+
+        Returns:
+            Empty output on success.
+        """
+
+        _expect_no_input(stdin, "unset")
+        if not args:
+            raise _UsageError("Usage: unset NAME...")
+        for name in args:
+            if _VARIABLE_NAME.fullmatch(name) is None:
+                raise _UsageError(f"invalid shell variable name: {name}")
+            if name in {"OLDPWD", "PWD"}:
+                raise _UsageError(f"{name} is managed by the virtual shell")
+            self._variables.pop(name, None)
+        return ShellResult("", 0)
+
+    def _true(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Return shell success without output."""
+
+        _expect_no_input(stdin, "true")
+        _expect_count(args, 0, 0, "true")
+        return ShellResult("", 0)
+
+    def _false(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Return shell failure without output."""
+
+        _expect_no_input(stdin, "false")
+        _expect_count(args, 0, 0, "false")
+        return ShellResult("", 1)
+
+    def _test(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Evaluate one small Bash-like file, string, or integer expression.
+
+        Args:
+            args: Supported ``test`` expression tokens.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Exit code zero when the expression is true, otherwise one.
+        """
+
+        _expect_no_input(stdin, "test")
+        return ShellResult("", int(not self._test_value(args, cwd)))
+
+    def _bracket(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Evaluate a bracketed alias of the virtual ``test`` command.
+
+        Args:
+            args: Expression tokens followed by ``]``.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Exit code zero when the expression is true, otherwise one.
+        """
+
+        _expect_no_input(stdin, "[")
+        if not args or args[-1] != "]":
+            raise _UsageError("Usage: [ EXPRESSION ]")
+        return ShellResult("", int(not self._test_value(args[:-1], cwd)))
+
+    def _test_value(self, args: list[str], cwd: str) -> bool:
+        """Return the value of one supported test expression.
+
+        Args:
+            args: Expression tokens without a closing bracket.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Boolean expression result.
+        """
+
+        if not args:
+            return False
+        if len(args) == 1:
+            return bool(args[0])
+        if len(args) == 2:
+            operator, value = args
+            if operator == "!":
+                return not bool(value)
+            if operator == "-n":
+                return bool(value)
+            if operator == "-z":
+                return not value
+            if operator in {"-d", "-e", "-f", "-s"}:
+                target = self._path(value, cwd)
+                kind = self._path_kind(target)
+                if operator == "-e":
+                    return kind is not None
+                if operator == "-d":
+                    return kind == "directory"
+                if operator == "-f":
+                    return kind == "file"
+                if kind != "file":
+                    return False
+                try:
+                    return bool(self.kernel.download_file(target))
+                except _SHELL_ERRORS:
+                    return False
+        if len(args) == 3:
+            left, operator, right = args
+            if operator in {"=", "=="}:
+                return left == right
+            if operator == "!=":
+                return left != right
+            if operator in {"-eq", "-ne", "-lt", "-le", "-gt", "-ge"}:
+                try:
+                    first, second = int(left), int(right)
+                except ValueError as exc:
+                    raise _UsageError("integer test values must be integers") from exc
+                comparisons = {
+                    "-eq": first == second,
+                    "-ne": first != second,
+                    "-lt": first < second,
+                    "-le": first <= second,
+                    "-gt": first > second,
+                    "-ge": first >= second,
+                }
+                return comparisons[operator]
+        raise _UsageError(
+            "test supports one string, -n, -z, -e, -f, -d, -s, string "
+            "comparison, or integer comparison"
+        )
+
+    def _touch(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Create missing regular files without changing existing content.
+
+        Args:
+            args: One or more virtual file paths.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Empty output or the first file error.
+        """
+
+        _expect_no_input(stdin, "touch")
+        if args and args[0] == "--":
+            args = args[1:]
+        if not args:
+            raise _UsageError("Usage: touch FILE...")
+        for path in args:
+            target = self._path(path, cwd)
+            kind = self._path_kind(target)
+            if kind == "directory":
+                return ShellResult(f"touch: {path} is a directory", 1)
+            if kind is None:
+                try:
+                    self.kernel.upload_file(target, b"")
+                except _SHELL_ERRORS as exc:
+                    return ShellResult(str(exc), 1)
+        return ShellResult("", 0)
+
+    def _printf(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Format text with a small Bash-like ``printf`` subset.
+
+        Args:
+            args: Format string followed by values.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current directory, which this command does not use.
+
+        Returns:
+            Formatted UTF-8 text.
+        """
+
+        _expect_no_input(stdin, "printf")
+        if not args:
+            raise _UsageError("Usage: printf FORMAT [ARGUMENT ...]")
+        return ShellResult(_format_printf(args[0], args[1:]), 0)
+
+    def _source(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
+        """Run one straight-line virtual shell script in the current state.
+
+        Args:
+            args: One virtual script path.
+            stdin: Pipeline input, which this command rejects.
+            cwd: Current absolute virtual directory.
+
+        Returns:
+            Combined script output and final exit code.
+        """
+
+        _expect_no_input(stdin, "source")
+        _expect_count(args, 1, 1, "source FILE")
+        if self._script_depth >= self.kernel.config.max_shell_script_depth:
+            return ShellResult("source nesting exceeds the shell script depth limit", 2)
+        script = self._read_text(self._path(args[0], cwd))
+        if isinstance(script, ShellResult):
+            return script
+        self._script_depth += 1
+        try:
+            result, _ = self._execute_program(script, cwd)
+        finally:
+            self._script_depth -= 1
+        return result
 
     def _wc(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
         """Count lines, words, and UTF-8 bytes."""
@@ -961,35 +1697,138 @@ class VirtualShell:
         return ShellResult("", 0)
 
     def _cp(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
-        """Copy one regular virtual file without changing its bytes."""
+        """Copy bounded virtual files or directory trees."""
         _expect_no_input(stdin, "cp")
-        _expect_count(args, 2, 2, "cp SOURCE DESTINATION")
-        source = self._path(args[0], cwd)
-        destination = self._path(args[1], cwd)
-        try:
-            content = self.kernel.download_file(source)
-            self.kernel.upload_file(destination, content)
-        except _SHELL_ERRORS as exc:
-            return ShellResult(str(exc), 1)
+        recursive, sources, destination = _copy_arguments(args, "cp")
+        target = self._path(destination, cwd)
+        target_kind = self._path_kind(target)
+        if len(sources) > 1 and target_kind != "directory":
+            return ShellResult("cp: multiple sources need a directory destination", 2)
+        for item in sources:
+            source = self._path(item, cwd)
+            final = (
+                posixpath.join(target, posixpath.basename(source))
+                if target_kind == "directory"
+                else target
+            )
+            copied = self._copy_path(source, final, recursive)
+            if copied is not None:
+                return copied
         return ShellResult("", 0)
 
     def _mv(self, args: list[str], stdin: str | None, cwd: str) -> ShellResult:
-        """Move one regular virtual file with copy then delete."""
+        """Move bounded virtual files or directory trees with copy then delete."""
         _expect_no_input(stdin, "mv")
-        _expect_count(args, 2, 2, "mv SOURCE DESTINATION")
-        if self._path(args[0], cwd) == self._path(args[1], cwd):
-            return ShellResult("source and destination must differ", 2)
-        copied = self._cp(args, stdin, cwd)
-        if copied.exit_code != 0:
-            return copied
-        result = self.kernel.call_filesystem(
-            self.session_id,
-            "delete",
-            {"path": self._path(args[0], cwd), "recursive": False},
-        )
-        if not result["ok"]:
-            return ShellResult(_error_text(result), 1)
+        _, sources, destination = _copy_arguments(args, "mv")
+        recursive = True
+        target = self._path(destination, cwd)
+        target_kind = self._path_kind(target)
+        if len(sources) > 1 and target_kind != "directory":
+            return ShellResult("mv: multiple sources need a directory destination", 2)
+        for item in sources:
+            source = self._path(item, cwd)
+            source_kind = self._path_kind(source)
+            if source_kind is None:
+                return ShellResult(f"mv: path does not exist: {item}", 1)
+            final = (
+                posixpath.join(target, posixpath.basename(source))
+                if target_kind == "directory"
+                else target
+            )
+            copied = self._copy_path(source, final, recursive)
+            if copied is not None:
+                return copied
+            result = self.kernel.call_filesystem(
+                self.session_id,
+                "delete",
+                {"path": source, "recursive": source_kind == "directory"},
+            )
+            if not result["ok"]:
+                return ShellResult(_error_text(result), 1)
         return ShellResult("", 0)
+
+    def _copy_path(
+        self,
+        source: str,
+        destination: str,
+        recursive: bool,
+    ) -> ShellResult | None:
+        """Copy one regular file or bounded directory tree.
+
+        Args:
+            source: Absolute virtual source path.
+            destination: Absolute virtual destination path.
+            recursive: Whether directory trees are allowed.
+
+        Returns:
+            ``None`` on success or the first shell error.
+        """
+
+        kind = self._path_kind(source)
+        if kind is None:
+            return ShellResult(f"cp: path does not exist: {source}", 1)
+        if source == destination:
+            return ShellResult("source and destination must differ", 2)
+        if kind == "file":
+            try:
+                self.kernel.upload_file(destination, self.kernel.download_file(source))
+            except _SHELL_ERRORS as exc:
+                return ShellResult(str(exc), 1)
+            return None
+        if not recursive:
+            return ShellResult(f"cp: {source} is a directory; use -r", 1)
+        prefix = source.rstrip("/") + "/"
+        if destination.startswith(prefix):
+            return ShellResult("cp: cannot copy a directory inside itself", 1)
+        listed = self.kernel.call_filesystem(
+            self.session_id,
+            "ls",
+            {
+                "path": source,
+                "recursive": True,
+                "limit": self.kernel.filesystem_config.max_result_limit,
+            },
+        )
+        if not listed["ok"]:
+            return ShellResult(_error_text(listed), 1)
+        value = listed["result"]
+        if value["truncated"]:
+            return ShellResult("cp: directory scan exceeds filesystem limits", 1, True)
+        made = self.kernel.call_filesystem(
+            self.session_id,
+            "mkdir",
+            {"path": destination, "parents": True, "exist_ok": True},
+        )
+        if not made["ok"]:
+            return ShellResult(_error_text(made), 1)
+        entries = sorted(
+            value["entries"],
+            key=lambda entry: (entry["type"] != "directory", entry["path"]),
+        )
+        transferred = 0
+        for entry in entries:
+            relative = entry["path"][len(prefix) :]
+            target = posixpath.join(destination, relative)
+            if entry["type"] == "directory":
+                result = self.kernel.call_filesystem(
+                    self.session_id,
+                    "mkdir",
+                    {"path": target, "parents": True, "exist_ok": True},
+                )
+                if not result["ok"]:
+                    return ShellResult(_error_text(result), 1)
+                continue
+            if entry["type"] != "file":
+                return ShellResult("cp: symbolic links are not supported", 1)
+            try:
+                content = self.kernel.download_file(entry["path"])
+                transferred += len(content)
+                if transferred > self.kernel.filesystem_config.max_transfer_bytes:
+                    return ShellResult("cp: directory transfer exceeds byte limit", 1)
+                self.kernel.upload_file(target, content)
+            except _SHELL_ERRORS as exc:
+                return ShellResult(str(exc), 1)
+        return None
 
     def _command_text(
         self,
@@ -1010,6 +1849,10 @@ class VirtualShell:
             Input text or an error result.
         """
         _expect_count(paths, 0, 1, f"{command} [-n COUNT] [FILE]")
+        if paths and paths[0] == "-":
+            if stdin is None:
+                return ShellResult(f"{command}: standard input is not available", 2)
+            return stdin
         if paths:
             return self._read_text(self._path(paths[0], cwd))
         if stdin is None:
@@ -1045,6 +1888,93 @@ class VirtualShell:
         )
         return None if result["ok"] else ShellResult(_error_text(result), 1)
 
+    def _load_shell_state(
+        self,
+        cwd: str,
+    ) -> tuple[dict[str, str], str, int] | ShellResult:
+        """Load or initialize persistent variables and the last exit status.
+
+        Args:
+            cwd: Current working directory used as the initial previous directory.
+
+        Returns:
+            Variables, previous directory, and previous exit status, or an error.
+        """
+
+        initial = {"variables": {}, "oldpwd": cwd, "status": 0}
+        captured: dict[str, Any] = {}
+
+        def arenero_capture_shell_state(value: dict[str, Any]) -> bool:
+            """Copy internal shell state across the Monty host boundary.
+
+            Args:
+                value: Persisted virtual shell state.
+
+            Returns:
+                Always ``True`` after the value is captured.
+            """
+
+            captured["value"] = value
+            return True
+
+        code = (
+            f"try:\n    {_STATE_NAME}\n"
+            f"except NameError:\n    {_STATE_NAME} = {initial!r}\n"
+            f"arenero_capture_shell_state(value={_STATE_NAME})"
+        )
+        result = self.kernel.execute(
+            self.session_id,
+            code,
+            self.kernel.config.max_output_limit_chars,
+            hosted_tools=HostedToolSet.from_callables([arenero_capture_shell_state]),
+        )
+        if not result["ok"]:
+            return ShellResult(_error_text(result), 1, _was_truncated(result))
+        value = captured.get("value")
+        if not isinstance(value, dict):
+            return ShellResult("The virtual shell variable state is invalid", 1)
+        variables = value.get("variables")
+        oldpwd = value.get("oldpwd")
+        status = value.get("status")
+        if (
+            not isinstance(variables, dict)
+            or len(variables) > self.kernel.config.max_shell_variables
+            or any(
+                not isinstance(name, str)
+                or _VARIABLE_NAME.fullmatch(name) is None
+                or name in {"OLDPWD", "PWD"}
+                or not isinstance(item, str)
+                or len(item) > self.kernel.config.max_shell_command_chars
+                for name, item in variables.items()
+            )
+            or not isinstance(oldpwd, str)
+            or not oldpwd.startswith("/")
+            or not isinstance(status, int)
+        ):
+            return ShellResult("The virtual shell variable state is invalid", 1)
+        return dict(variables), oldpwd, status
+
+    def _save_shell_state(self) -> ShellResult | None:
+        """Save current virtual variables, previous directory, and exit status.
+
+        Returns:
+            ``None`` on success or an error result.
+        """
+
+        state = {
+            "variables": self._variables,
+            "oldpwd": self._oldpwd,
+            "status": self._last_status,
+        }
+        result = self.kernel.execute(
+            self.session_id,
+            f"{_STATE_NAME} = {state!r}",
+            self.kernel.config.max_output_limit_chars,
+        )
+        if result["ok"]:
+            return None
+        return ShellResult(_error_text(result), 1, _was_truncated(result))
+
     def _load_cwd(self) -> str | ShellResult:
         """Load or initialize the persistent virtual working directory."""
         code = (
@@ -1064,6 +1994,34 @@ class VirtualShell:
         if not isinstance(value, str) or not value.startswith("/"):
             return ShellResult("The virtual working directory state is invalid", 1)
         return value
+
+    def _path_kind(self, path: str) -> str | None:
+        """Return whether one exact virtual path is a file or directory.
+
+        Args:
+            path: Absolute normalized virtual path.
+
+        Returns:
+            ``file``, ``directory``, or ``None`` when the path does not exist.
+        """
+
+        if path == "/":
+            return "directory"
+        parent = posixpath.dirname(path) or "/"
+        name = posixpath.basename(path)
+        found = self.kernel.call_filesystem(
+            self.session_id,
+            "glob",
+            {"pattern": name, "root": parent, "limit": 2},
+        )
+        if not found["ok"] or path not in found["result"]["matches"]:
+            return None
+        listed = self.kernel.call_filesystem(
+            self.session_id,
+            "ls",
+            {"path": path, "recursive": False, "limit": 1},
+        )
+        return "directory" if listed["ok"] else "file"
 
     def _path(self, path: str, cwd: str) -> str:
         """Resolve one path against the virtual working directory."""
@@ -1107,7 +2065,7 @@ def shell_result_from_execution(result: ExecutionResult) -> ShellResult:
 
 
 def _parse(command: str) -> list[_Pipeline]:
-    """Parse the small virtual shell grammar.
+    """Parse the Bash-like virtual shell grammar.
 
     Args:
         command: Raw command text.
@@ -1118,39 +2076,47 @@ def _parse(command: str) -> list[_Pipeline]:
     Raises:
         _UsageError: If syntax is empty, incomplete, or unsupported.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars="|<>&;")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    try:
-        tokens = list(lexer)
-    except ValueError as exc:
-        raise _UsageError(str(exc)) from exc
+    prepared, heredocs = _extract_heredocs(command)
+    tokens = _lex(prepared)
     if not tokens:
         raise _UsageError("command must not be empty")
 
     pipelines: list[_Pipeline] = []
     commands: list[_Command] = []
     pipeline_operator: str | None = None
-    arguments: list[str] = []
-    input_path: str | None = None
-    output_path: str | None = None
+    arguments: list[_Word] = []
+    input_path: _Word | None = None
+    output_path: _Word | None = None
     append = False
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in {"|", ";", "&&", "||"}:
+        if isinstance(token, str) and token in {"|", ";", "&&", "||", "\n"}:
+            separator = ";" if token == "\n" else token
             if not arguments:
-                raise _UsageError(f"{token} needs a command on each side")
-            commands.append(_Command(arguments, input_path, output_path, append))
+                if token == "\n" or (commands and separator == "|"):
+                    index += 1
+                    continue
+                raise _UsageError(f"{separator} needs a command on each side")
+            commands.append(
+                _parsed_command(
+                    arguments,
+                    input_path,
+                    output_path,
+                    append,
+                    heredocs,
+                )
+            )
             arguments, input_path, output_path, append = [], None, None, False
-            if token != "|":
+            if separator != "|":
                 pipelines.append(_Pipeline(commands, pipeline_operator))
                 commands = []
-                pipeline_operator = token
-        elif token in {"<", ">", ">>"}:
-            if index + 1 >= len(tokens) or _is_operator(tokens[index + 1]):
+                pipeline_operator = separator
+        elif isinstance(token, str) and token in {"<", ">", ">>"}:
+            if index + 1 >= len(tokens) or not isinstance(tokens[index + 1], _Word):
                 raise _UsageError(f"{token} needs a virtual file path")
             path = tokens[index + 1]
+            assert isinstance(path, _Word)
             index += 1
             if token == "<":
                 if input_path is not None:
@@ -1164,19 +2130,433 @@ def _parse(command: str) -> list[_Pipeline]:
         elif _is_operator(token):
             raise _UsageError(f"unsupported shell operator: {token}")
         else:
+            assert isinstance(token, _Word)
             arguments.append(token)
         index += 1
 
     if not arguments:
+        if pipelines and pipeline_operator == ";" and not commands:
+            return pipelines
         raise _UsageError("an operator needs a command on each side")
-    commands.append(_Command(arguments, input_path, output_path, append))
+    commands.append(
+        _parsed_command(arguments, input_path, output_path, append, heredocs)
+    )
     pipelines.append(_Pipeline(commands, pipeline_operator))
     return pipelines
 
 
-def _is_operator(token: str) -> bool:
-    """Return whether one token contains shell punctuation."""
-    return bool(token) and all(character in "|<>&;" for character in token)
+def _lex(command: str) -> list[_Word | str]:
+    """Tokenize shell source while preserving quote modes.
+
+    Args:
+        command: Source with extracted here-document bodies.
+
+    Returns:
+        Words, operators, and newline separators.
+
+    Raises:
+        _UsageError: If a quote or escape is incomplete.
+    """
+
+    tokens: list[_Word | str] = []
+    parts: list[_WordPart] = []
+    quote: str | None = None
+    word_started = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if quote == "single":
+            if character == "'":
+                quote = None
+            else:
+                _append_word_part(parts, character, "single")
+            index += 1
+            continue
+        if quote == "double":
+            if character == '"':
+                quote = None
+            elif character == "\\":
+                if index + 1 >= len(command):
+                    raise _UsageError("shell escape is incomplete")
+                if command[index + 1] == "\n":
+                    index += 2
+                    continue
+                if command[index + 1] in {'"', "$", "`", "\\"}:
+                    _append_word_part(parts, command[index + 1], "single")
+                    index += 2
+                    continue
+                _append_word_part(parts, "\\", "double")
+            else:
+                _append_word_part(parts, character, "double")
+            index += 1
+            continue
+
+        if character in {"'", '"'}:
+            quote = "single" if character == "'" else "double"
+            word_started = True
+            _append_word_part(parts, "", quote)
+        elif character == "\\":
+            if index + 1 >= len(command):
+                raise _UsageError("shell escape is incomplete")
+            if command[index + 1] == "\n":
+                index += 2
+                continue
+            word_started = True
+            _append_word_part(parts, command[index + 1], "single")
+            index += 2
+            continue
+        elif character == "#" and not word_started:
+            while index < len(command) and command[index] != "\n":
+                index += 1
+            continue
+        elif character.isspace():
+            if word_started:
+                tokens.append(_Word(tuple(parts)))
+                parts = []
+                word_started = False
+            if character == "\n":
+                tokens.append("\n")
+        elif character in "|<>&;":
+            if word_started:
+                tokens.append(_Word(tuple(parts)))
+                parts = []
+                word_started = False
+            pair = command[index : index + 2]
+            if pair in {"&&", "||", ">>", "<<"}:
+                tokens.append(pair)
+                index += 2
+                continue
+            tokens.append(character)
+        else:
+            word_started = True
+            _append_word_part(parts, character, "none")
+        index += 1
+    if quote is not None:
+        raise _UsageError(f"shell {quote} quote is not closed")
+    if word_started:
+        tokens.append(_Word(tuple(parts)))
+    return tokens
+
+
+def _append_word_part(parts: list[_WordPart], text: str, quote: str) -> None:
+    """Append text and merge adjacent fragments with the same quote mode.
+
+    Args:
+        parts: Word fragments to update.
+        text: Text to append. Empty text preserves empty quoted words.
+        quote: ``none``, ``single``, or ``double``.
+    """
+
+    if parts and parts[-1].quote == quote and text:
+        previous = parts[-1]
+        parts[-1] = _WordPart(previous.text + text, quote)
+    elif text or not parts or parts[-1].quote != quote:
+        parts.append(_WordPart(text, quote))
+
+
+def _extract_heredocs(command: str) -> tuple[str, dict[str, _HereDocument]]:
+    """Replace supported here documents with internal input placeholders.
+
+    Args:
+        command: Raw multiline shell source.
+
+    Returns:
+        Source without bodies and the extracted document mapping.
+
+    Raises:
+        _UsageError: If a terminator is missing.
+    """
+
+    lines = command.splitlines(keepends=True)
+    output: list[str] = []
+    documents: dict[str, _HereDocument] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        marker = _heredoc_marker(line)
+        if marker is None:
+            output.append(line)
+            index += 1
+            continue
+        start, end, delimiter, expand = marker
+        placeholder = f"{_HEREDOC_PREFIX}{len(documents)}__"
+        output.append(line[:start] + "< " + placeholder + line[end:])
+        body: list[str] = []
+        index += 1
+        while index < len(lines) and lines[index].rstrip("\r\n") != delimiter:
+            body.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise _UsageError(f"here document is missing terminator: {delimiter}")
+        documents[placeholder] = _HereDocument("".join(body), expand)
+        index += 1
+    return "".join(output), documents
+
+
+def _heredoc_marker(line: str) -> tuple[int, int, str, bool] | None:
+    """Find one unquoted ``<<WORD`` marker in a command line.
+
+    Args:
+        line: One source line including its optional newline.
+
+    Returns:
+        Marker bounds, delimiter, and expansion flag, or ``None``.
+
+    Raises:
+        _UsageError: If the delimiter is empty or not closed.
+    """
+
+    quote: str | None = None
+    index = 0
+    while index + 1 < len(line):
+        character = line[index]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif character == "\\" and quote == '"':
+                index += 1
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if line[index : index + 2] != "<<" or line[index : index + 3] == "<<<":
+            index += 1
+            continue
+        start = index
+        index += 2
+        while index < len(line) and line[index] in " \t":
+            index += 1
+        if index >= len(line) or line[index] in "\r\n|<>&;":
+            raise _UsageError("<< needs a here-document delimiter")
+        quoted = line[index] in {"'", '"'}
+        if quoted:
+            delimiter_quote = line[index]
+            delimiter_start = index + 1
+            delimiter_end = line.find(delimiter_quote, delimiter_start)
+            if delimiter_end < 0:
+                raise _UsageError("here-document delimiter quote is not closed")
+            delimiter = line[delimiter_start:delimiter_end]
+            end = delimiter_end + 1
+        else:
+            delimiter_start = index
+            while (
+                index < len(line)
+                and not line[index].isspace()
+                and line[index] not in "|<>&;"
+            ):
+                index += 1
+            delimiter = line[delimiter_start:index]
+            end = index
+        if not delimiter:
+            raise _UsageError("here-document delimiter must not be empty")
+        return start, end, delimiter, not quoted
+    return None
+
+
+def _parsed_command(
+    arguments: list[_Word],
+    input_path: _Word | None,
+    output_path: _Word | None,
+    append: bool,
+    heredocs: dict[str, _HereDocument],
+) -> _Command:
+    """Build one parsed command and attach an extracted here document.
+
+    Args:
+        arguments: Unexpanded command words.
+        input_path: Optional input path or internal here-document placeholder.
+        output_path: Optional output path.
+        append: Whether output redirection appends.
+        heredocs: Extracted documents by placeholder.
+
+    Returns:
+        Parsed immutable command.
+    """
+
+    document = None
+    if input_path is not None and input_path.literal() in heredocs:
+        document = heredocs[input_path.literal()]
+        input_path = None
+    return _Command(arguments, input_path, output_path, document, append)
+
+
+def _is_operator(token: _Word | str) -> bool:
+    """Return whether one token contains shell punctuation.
+
+    Args:
+        token: Parsed word or punctuation token.
+
+    Returns:
+        Whether the token is unsupported or handled shell punctuation.
+    """
+
+    return (
+        isinstance(token, str)
+        and bool(token)
+        and all(character in "|<>&;" for character in token)
+    )
+
+
+def _split_assignment(value: str) -> tuple[str, str] | None:
+    """Split one valid ``NAME=VALUE`` shell assignment.
+
+    Args:
+        value: Expanded command word.
+
+    Returns:
+        Name and value, or ``None`` when the word is not an assignment.
+    """
+
+    name, separator, content = value.partition("=")
+    if not separator or _VARIABLE_NAME.fullmatch(name) is None:
+        return None
+    return name, content
+
+
+def _copy_arguments(args: list[str], command: str) -> tuple[bool, list[str], str]:
+    """Parse bounded ``cp`` or ``mv`` source and destination arguments.
+
+    Args:
+        args: Expanded command arguments.
+        command: ``cp`` or ``mv`` for usage text and flag rules.
+
+    Returns:
+        Recursive flag, source paths, and destination path.
+
+    Raises:
+        _UsageError: If flags or the path count are invalid.
+    """
+
+    recursive = False
+    values = list(args)
+    while values and values[0].startswith("-") and values[0] != "-":
+        option = values.pop(0)
+        if option == "--":
+            break
+        flags = option[1:]
+        if command != "cp" or not flags or any(flag not in "rR" for flag in flags):
+            usage = (
+                "cp [-r] SOURCE... DESTINATION"
+                if command == "cp"
+                else "mv SOURCE... DESTINATION"
+            )
+            raise _UsageError(f"Usage: {usage}")
+        recursive = True
+    if len(values) < 2:
+        usage = (
+            "cp [-r] SOURCE... DESTINATION"
+            if command == "cp"
+            else "mv SOURCE... DESTINATION"
+        )
+        raise _UsageError(f"Usage: {usage}")
+    return recursive, values[:-1], values[-1]
+
+
+def _ls_line(path: str, kind: str, long_format: bool) -> str:
+    """Format one virtual ``ls`` entry.
+
+    Args:
+        path: Absolute virtual path.
+        kind: Filesystem entry type.
+        long_format: Whether to add the small type marker.
+
+    Returns:
+        One output line without its final newline.
+    """
+
+    display = path + ("/" if kind == "directory" and path != "/" else "")
+    if not long_format:
+        return display
+    return ("d " if kind == "directory" else "- ") + display
+
+
+def _format_printf(format_text: str, arguments: list[str]) -> str:
+    """Format text with the supported virtual ``printf`` conversions.
+
+    Args:
+        format_text: Format containing ``%s``, ``%d``, ``%f``, ``%b``, or ``%%``.
+        arguments: Values consumed by conversions.
+
+    Returns:
+        Formatted text. The format repeats while arguments remain.
+
+    Raises:
+        _UsageError: If a conversion or numeric value is invalid.
+    """
+
+    decoded_format = _decode_backslash_escapes(format_text)
+    output: list[str] = []
+    argument_index = 0
+    first_pass = True
+    while first_pass or argument_index < len(arguments):
+        first_pass = False
+        index = 0
+        consumed = False
+        while index < len(decoded_format):
+            if decoded_format[index] != "%":
+                output.append(decoded_format[index])
+                index += 1
+                continue
+            if index + 1 >= len(decoded_format):
+                raise _UsageError("printf format ends with %")
+            conversion = decoded_format[index + 1]
+            index += 2
+            if conversion == "%":
+                output.append("%")
+                continue
+            if conversion not in {"b", "d", "f", "s"}:
+                raise _UsageError(f"printf conversion is not supported: %{conversion}")
+            value = arguments[argument_index] if argument_index < len(arguments) else ""
+            if argument_index < len(arguments):
+                argument_index += 1
+            consumed = True
+            if conversion == "s":
+                output.append(value)
+            elif conversion == "b":
+                output.append(_decode_backslash_escapes(value))
+            elif conversion == "d":
+                try:
+                    output.append(str(int(value or "0")))
+                except ValueError as exc:
+                    raise _UsageError(f"printf integer is invalid: {value}") from exc
+            else:
+                try:
+                    output.append(str(float(value or "0")))
+                except ValueError as exc:
+                    raise _UsageError(f"printf number is invalid: {value}") from exc
+        if not consumed:
+            break
+    return "".join(output)
+
+
+def _decode_backslash_escapes(value: str) -> str:
+    """Decode the small escape set supported by virtual ``printf``.
+
+    Args:
+        value: Format or ``%b`` argument text.
+
+    Returns:
+        Text with newline, tab, carriage-return, and backslash escapes decoded.
+    """
+
+    replacements = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\\" and index + 1 < len(value):
+            next_character = value[index + 1]
+            if next_character in replacements:
+                output.append(replacements[next_character])
+                index += 2
+                continue
+        output.append(value[index])
+        index += 1
+    return "".join(output)
 
 
 def _line_arguments(args: list[str], command: str) -> tuple[int, list[str]]:

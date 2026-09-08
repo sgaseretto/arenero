@@ -16,44 +16,72 @@ Arenero virtual filesystem. This is not an operating-system shell and it never
 starts a process or arbitrary executable.
 
 Supported commands and forms:
-- help [COMMAND]; which COMMAND...; pwd; cd [PATH]; ls [PATH...]
-- mkdir [-p] PATH...; rm [-r] [-f] PATH...; cp SOURCE DESTINATION;
-  mv SOURCE DESTINATION
+- help [COMMAND]; which COMMAND...; pwd; cd [PATH|-]; ls [-aA1ldR] [PATH...]
+- env; export [NAME[=VALUE] ...]; unset NAME...; true; false;
+  test EXPRESSION; [ EXPRESSION ]
+- mkdir [-p] PATH...; touch FILE...; rm [-r] [-f] PATH...;
+  cp [-r] SOURCE... DESTINATION; mv SOURCE... DESTINATION
 - cat [FILE...]; head [-n COUNT] [FILE]; tail [-n COUNT] [FILE]
-- grep [-i] [-n] LITERAL [FILE...]; sort [-r] [FILE]; uniq [-c] [FILE];
-  rev [FILE]; wc [-lwc] [FILE]; echo [-n] [TEXT...]
+- grep [-EFinvcqlrR] PATTERN [FILE...]; sort [-r] [FILE];
+  uniq [-c] [FILE]; rev [FILE]; wc [-lwc] [FILE]; echo [-n] [TEXT...];
+  printf FORMAT [ARGUMENT ...]
 - find [PATH] [GLOB]; glob GLOB [PATH]; basename PATH; dirname PATH
-- tee [-a] FILE...; base64 [FILE]; sha256sum [FILE...]
+- tee [-a] FILE...; base64 [-d] [FILE]; sha256sum [FILE...]
+- source FILE or . FILE for a straight-line virtual shell script
 - curl [-fLsiI] [-X METHOD] [-H 'NAME: VALUE'] [-d DATA] [-o FILE]
   [--max-time SECONDS] URL
 - python -c CODE or python FILE.py. python3 and monty are aliases.
 
-Grammar: | is a UTF-8 text pipe. ; always runs the next pipeline. && runs after
-success. || runs after failure. < reads a virtual UTF-8 file. > replaces a virtual
-text file. >> appends. Paths are POSIX virtual paths. Relative paths use a working
-directory that persists with the session.
+Grammar and state:
+- Single and double quotes, backslash escaping, # comments at word boundaries,
+  newlines, and backslash-newline continuation are supported.
+- | is a UTF-8 text pipe. ; or a newline always starts the next pipeline. && runs
+  after success. || runs after failure. A failed command stops its pipeline.
+- < reads a virtual UTF-8 file. > replaces a virtual text file. >> appends.
+  <<WORD supplies one here document. A quoted delimiter disables $ expansion.
+- NAME=VALUE and export set persistent virtual variables. $NAME, ${NAME}, $?,
+  PWD, OLDPWD, HOME, ~, and ~/path are supported. cd - uses OLDPWD.
+- Unquoted *, ?, and ** expand against virtual paths. Quoted wildcards stay
+  literal. An unmatched wildcard also stays literal. Expansion is bounded.
+- Paths use POSIX syntax. Relative paths use the session working directory.
+- Shell variables, PWD, OLDPWD, and $? use the same session snapshot as Python
+  state. SQLite makes that state durable across kernel restarts. Virtual files
+  have their own lifetime and are not stored inside the snapshot.
 
 Important limits: use help to discover commands because the application can
-disable commands. grep is literal substring search, not regex. glob and find
-support only *, ?, and **. Wildcards are never expanded in normal command
-arguments. Pipes and redirection are text-only. base64 only encodes. cp and mv
-handle one regular file and mv is not atomic. Python runs Monty's limited Python
-subset, not CPython; it has no third-party packages or normal file imports. curl
-allows public HTTP and HTTPS URLs by default. NetworkConfig can restrict exact URL
-origins, path prefixes, and methods, or disable curl. Each redirect is checked
-again. Private, local, and reserved addresses are blocked by default. Use -o FILE
-for a binary response; normal curl output is UTF-8 text.
+disable commands. grep uses fixed text unless -E is set; -E uses Python regular
+expression syntax, not exact POSIX ERE syntax. find, glob, and argument expansion
+support only *, ?, and **. Pipes and normal output are text-only. base64 -d can
+put only UTF-8 output in a pipe. cp -r and mv are bounded, do not preserve file
+metadata, reject symbolic links, and can leave partial output after an error. mv
+is a copy-then-delete operation and is not atomic. ls -l reports only the entry
+type and path. touch creates missing files but does not change timestamps. test
+supports only the documented small expression subset. source runs the same small
+grammar and shares the command, output, filesystem, and nesting limits.
+
+Python runs Monty's limited Python subset, not CPython; it has no third-party
+packages or normal file imports. curl allows public HTTP and HTTPS URLs by
+default. NetworkConfig can restrict exact URL origins, path prefixes, and methods,
+or disable curl. Each redirect is checked again. Private, local, and reserved
+addresses are blocked by default. Use -o FILE for a binary response; normal curl
+output is UTF-8 text.
 --max-time lowers connection and between-read idle timeouts; it is not a strict
 wall-clock limit for DNS or a response that keeps sending small data.
 
-Not supported: unlisted flags or commands, shell scripts, subprocesses, Git,
-package managers, compilers, environment or tilde expansion, command substitution,
-automatic glob expansion, background jobs, process control, file descriptors,
-binary pipes, interactive input, network access from Monty code, unrestricted
-network access, or extra Python script arguments. Use a real container or managed
-sandbox for those tasks. Results have output, exit_code, and truncated fields.
-Check truncated before treating output as complete. Set output_file to an absolute
-virtual path to save larger bounded output when the response is trimmed."""
+Not supported: full Bash scripts or control flow such as if, for, while, case,
+functions, arrays, aliases, or traps; command substitution with $(...) or
+backticks; arithmetic, brace, pathname class, field-splitting, process, or advanced
+parameter expansion; assignment prefixes before a command; stderr or file-
+descriptor redirection; here strings; multiple here documents on one command
+line; background jobs; process control; binary pipes; interactive input;
+subprocesses; Git; package managers; compilers; unlisted commands or flags;
+network access from Monty code; unrestricted network access; or extra Python
+script arguments. A shebang has no special meaning. Use a real container or
+managed sandbox for those tasks.
+
+Results have output, exit_code, and truncated fields. Check truncated before you
+treat output as complete. Set output_file to an absolute virtual path to save
+larger bounded output when the response is trimmed."""
 
 MONTY_SANDBOX_INSTRUCTIONS = (
     "## Arenero virtual shell\n\n" + VIRTUAL_SHELL_TOOL_DESCRIPTION

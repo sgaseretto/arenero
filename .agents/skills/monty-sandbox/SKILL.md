@@ -32,6 +32,15 @@ not a wheel, Python sdist, package install, or build backend.
 
 Do not describe a Monty-backed `execute` operation as shell execution. Name it `execute_python`, `python_repl`, or clearly state that it accepts only Monty's Python subset.
 
+Arenero also has a host-side virtual shell. It is not part of Monty and does not
+start operating-system processes. Its supported subset includes allowlisted file
+and text commands, UTF-8 pipes and redirection, persistent virtual variables,
+`PWD`, `OLDPWD`, `$?`, `~`, bounded `*`, `?`, and `**` expansion, here documents,
+and straight-line files through `source`. It does not support full Bash control
+flow, command substitution, field or brace expansion, descriptor redirection,
+binary pipes, arbitrary commands, or host environment variables. Read
+`docs/virtual-shell.md` before changing or describing the shell.
+
 For a new Arenero application, start with `open_sandbox()` and a
 `SandboxConfig` preset. Use `open_sandbox_manager()` for several bound session
 IDs on one worker pool. These APIs already own lifecycle, relative workspace

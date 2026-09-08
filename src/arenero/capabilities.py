@@ -125,6 +125,30 @@ def capability_report(
             "commands": shell_commands,
             "supports_pipes": not is_async,
             "supports_redirection": not is_async,
+            "supports_here_documents": not is_async,
+            "supports_persistent_variables": not is_async,
+            "supports_bounded_glob_expansion": not is_async,
+            "supports_straight_line_source_scripts": not is_async,
+            "operators": ["|", ";", "newline", "&&", "||"] if not is_async else [],
+            "redirections": ["<", ">", ">>", "<<"] if not is_async else [],
+            "parameter_expansion": (
+                ["$NAME", "${NAME}", "$?", "~", "~/path"] if not is_async else []
+            ),
+            "state_in_session_snapshot": (
+                ["variables", "PWD", "OLDPWD", "$?"] if not is_async else []
+            ),
+            "does_not_support": [
+                "operating-system processes",
+                "full Bash control flow",
+                "command substitution",
+                "field splitting",
+                "brace expansion",
+                "advanced parameter expansion",
+                "stderr or file-descriptor redirection",
+                "binary pipes",
+                "interactive input",
+                "arbitrary commands or flags",
+            ],
             "is_real_os_shell": False,
         },
         "network": network,
