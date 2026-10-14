@@ -82,7 +82,7 @@ flowchart TD
 | Network | Host-side public HTTP and HTTPS through virtual `curl` | No direct Monty sockets or general network client. |
 | Binary and images | Upload, download, Base64 data URL, and LangChain image block | The host must create the model content block. |
 | Output control | Caller-selected lower limits, application hard caps, truncation data, and optional file offload | Offloaded output is still bounded. |
-| Async use | Full thread-based sandbox facade or native async Python worker pool | The native adapter does not include the virtual shell. Shared files serialize work. |
+| Async use | Full thread-based facade or native async Python/files/artifacts utilities | Native async has no shell; shared file calls serialize, while explicit Python-only calls can overlap. |
 | MCP tools | Initial or hot-loaded stdio and Streamable HTTP servers, host-supplied in-process servers, progressive discovery, and calls from persistent Python | Tools only; no resources, prompts, SSE, durable dynamic registry, or input-required flow. |
 
 ### Discover and compose MCP tools inside Python
@@ -564,7 +564,10 @@ Shell `grep` searches for the literal text `A.*a`, so this returns exit code `1`
 Use `grep -E 'A.*a'` for the supported Python regular-expression syntax. This is
 not exact POSIX ERE syntax. A direct Monty `re` operation or structured
 `fs_grep(..., regex=True)` gives more explicit control. The
-`AreneroSandbox.grep()` facade stays literal.
+`AreneroSandbox.grep()` and managed `grep()` accept `regex=True` and
+`case_sensitive=False`. They use Monty's regex engine, not host Python or POSIX
+ERE. Literal matching remains the default. Use a text-file selection glob in a
+mixed binary/text tree.
 
 ### Normal file iteration and CPython modes
 
@@ -752,7 +755,10 @@ Monty instance attributes are copies, not live objects. Methods, identity, and
 cyclic references do not round-trip. Monty can replace cyclic or deep values
 with text placeholders before the host receives them. Stringifying mapping keys
 can merge different keys with the same text; set order is not guaranteed. There
-is no automatic input decoder for these records. Native values inside the REPL
+is no automatic input decoder for these records. Host callers can explicitly use
+`decode_value(result["result"])` for exact bytes and complex records, then pass
+native values through `inputs`. Other lossy conversions remain lossy. Do not
+decode trimmed previews. Native values inside the REPL
 are unchanged. Raw `kernel.download_file()` and managed `read(encoding=None)`
 still return bytes to the host; managed `to_dict()` then encodes those bytes.
 

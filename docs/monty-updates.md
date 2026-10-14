@@ -374,9 +374,13 @@ time. This is not host filesystem access.
 
 A 1.1.0 dump carries its own resource settings. Restoring it does **not** apply
 new memory or duration settings from the checkout. Only a stricter suspension
-cap is applied. Reset low-level sessions after changes to limits, OS policy, or
-type-check settings. Capability reports describe the configured new-session
-policy, not an inspection of limits inside each saved dump. Managed checkpoint
+cap is applied. Arenero now records configured interpreter policy inside new
+snapshots. Known changes to interpreter limits, OS policy, or stable checking
+declarations return `session_policy_changed` before user code; reset or use
+`restart=True`. Legacy policy stays `unknown` until reset. Host-side caps can
+still change without changing interpreter policy. Capability reports describe
+new-session configuration; `session.policy()` reads recorded provenance, not
+every internal dump setting. Managed checkpoint
 restore still checks its configuration digest. Old signed graph snapshots also
 require a reset; there is no cross-version state conversion.
 
@@ -406,6 +410,15 @@ packages use raw inventory and verifier data and can opt into `assets/` bytes.
 The trusted file-reading feed skips checking, but file source still follows its
 configured type policy. No runtime upgrade, full import engine, or second shell
 is added.
+
+The ten small sandbox changes also reuse released 1.1.0 mechanisms. Static export
+collection handles unpacking and compound blocks but only copies bound names.
+Flat-file metadata uses native inputs, not assignments to read-only module
+attributes. Shared inspection selects bounded public values; explicit decoding
+handles bytes/complex tags. Native async file utilities and artifact writers
+reuse existing helpers. Sync gains the same direct-file opt-out as native async.
+Policy provenance stays inside snapshots without a store migration. See
+[utility APIs](quality-of-life.md) for behavior and limits.
 
 The static resolver, filesystem helpers, source-package workflow, RLM, speculation,
 stores, and fixed agent tool schemas remain in place. We do not add a remote

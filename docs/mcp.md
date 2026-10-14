@@ -354,12 +354,18 @@ content block when the complete result fits the limit.
 If a result is too large, Arenero removes large structured values and binary data
 and keeps a small text preview when possible. Always check `truncated`.
 
-The synchronous kernel can write image, audio, and embedded-resource Base64 blocks
+Both kernels can write image, audio, and embedded-resource Base64 blocks
 to virtual files. Use `kernel.materialize_mcp_artifacts(result, directory)` for a
 host-side MCP result. Set `mcp_artifact_directory="/mcp-artifacts"` on the kernel
 to materialize supported blocks that become the final Python result. Written
 blocks contain `virtual_path` and `size_bytes`, and the execution result contains
 `mcp_artifacts`.
+On native async use `await kernel.materialize_mcp_artifacts(...)` or the same
+`mcp_artifact_directory=` setting. The shared decoder is used by both writers.
+Native async extraction runs after the checkout and file lock end, before result
+trimming; the session lock remains held. Failed blocks keep data and add
+`artifact_error`. `filesystem=False` skips automatic extraction. Cancellation can
+leave Python state already committed; file writes are not a transaction.
 
 Automatic materialization happens after the Monty checkout ends. It does not
 re-enter an active persistent session. It scans only the final Python value, not

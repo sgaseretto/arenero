@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict, get_args
 
@@ -55,6 +55,17 @@ if TYPE_CHECKING:
     from .session import SessionHandle
 
 StatePolicy = Literal["always", "success", "never"]
+
+_SESSION_METADATA_SOURCE = (
+    "{'filesystem_version': locals().get('_arenero_fs_version'), "
+    "'policy': locals().get('_arenero_session_policy')}"
+)
+
+
+class SessionPolicyChanged(ValueError):
+    """Require an explicit reset when saved interpreter configuration changes."""
+
+
 RecoveryAction = Literal[
     "none", "retry_same_call", "revise_code", "restart_session", "retry_later", "stop"
 ]
@@ -606,6 +617,37 @@ class PersistentMontyKernel:
         """
         return self._inspect_session(session_id, _variables_source(self)) or {}
 
+    def inspect_values(
+        self, session_id: str, names: list[str], output_limit_chars: int | None = None
+    ) -> dict[str, Any]:
+        """Read selected saved public values without callbacks or state changes.
+
+        Args:
+            session_id: Session to inspect.
+            names: Up to 100 public identifiers, not expressions. Hidden names are omitted.
+            output_limit_chars: Optional aggregate JSON limit below the kernel cap.
+
+        Returns:
+            Values, truncation status, and applied limit. Oversized values become JSON text previews.
+        """
+        source = _values_source(self, names)
+        limit, capped = self._output_limit(output_limit_chars)
+        return _inspection_result(
+            self._inspect_session(session_id, source) or {}, limit, capped
+        )
+
+    def session_policy(self, session_id: str) -> dict[str, Any]:
+        """Compare the saved interpreter policy with the current configuration.
+
+        Args:
+            session_id: Session to inspect.
+
+        Returns:
+            Saved/current policy and match, changed, unknown, or absent status. No state is saved.
+        """
+        metadata = self._inspect_session(session_id, _SESSION_METADATA_SOURCE)
+        return _policy_report(metadata, self)
+
     def _inspect_session(self, session_id: str, code: str) -> Any:
         """Read trusted metadata from a disposable copy of a saved session.
 
@@ -647,6 +689,7 @@ class PersistentMontyKernel:
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Execute one code snippet in a persistent session.
 
@@ -659,6 +702,7 @@ class PersistentMontyKernel:
             restart: Reset state before this execution when true.
             hosted_tools: Optional tools available for this operation only.
             inputs: Optional host values bound before this user feed, after bootstrap.
+            filesystem: Attach direct file access when true; false also skips file bootstrap and the shared file lock. Hosted tools retain their authority.
 
         Returns:
             A structured execution result.
@@ -673,6 +717,7 @@ class PersistentMontyKernel:
             restart=restart,
             hosted_tools=hosted_tools,
             inputs=inputs,
+            filesystem=filesystem,
         )
 
     def execute_file(
@@ -911,6 +956,7 @@ class PersistentMontyKernel:
         hosted_tools: HostedToolSet | None,
         skip_type_check: bool = False,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Run one measured kernel operation.
 
@@ -925,6 +971,7 @@ class PersistentMontyKernel:
             hosted_tools: Optional operation-only hosted tools.
             skip_type_check: Disable checking for generated support code.
             inputs: Values bound once before the first user-code feed.
+            filesystem: Allow direct file access and take the shared file lock.
 
         Returns:
             A structured execution result with stable statistics.
@@ -951,6 +998,7 @@ class PersistentMontyKernel:
             skip_type_check=skip_type_check,
             metrics=metrics,
             inputs=inputs,
+            filesystem=filesystem,
         )
         result["session_restarted"] = metrics.session_restarted
         result["host_calls"] = (
@@ -992,6 +1040,7 @@ class PersistentMontyKernel:
         skip_type_check: bool,
         metrics: _ExecutionMetrics,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Run feeds and save their final state once.
 
@@ -1007,6 +1056,7 @@ class PersistentMontyKernel:
             skip_type_check: Disable checking for generated support code.
             metrics: Mutable execution statistics.
             inputs: Values bound once before the first user-code feed.
+            filesystem: Allow direct file access and take the shared file lock.
 
         Returns:
             A structured execution result.
@@ -1029,7 +1079,10 @@ class PersistentMontyKernel:
             )
 
         limit, limit_was_capped = self._output_limit(output_limit_chars)
-        with self._lock_for(session_id), self.filesystem_guard():
+        with (
+            self._lock_for(session_id),
+            self.filesystem_guard() if filesystem else nullcontext(),
+        ):
             if restart:
                 existed = self.store.delete(session_id)
                 metrics.session_restarted = True
@@ -1074,6 +1127,7 @@ class PersistentMontyKernel:
                 )
             except (TypeError, ValueError) as exc:
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type="HostedToolConfigurationError",
@@ -1113,10 +1167,17 @@ class PersistentMontyKernel:
                             streams,
                             external_lookup,
                             new_session=stored is None,
+                            filesystem=filesystem,
                         )
                         phase = "execution"
                         result = self._run(
-                            session, streams, code, file_path, external_lookup, inputs
+                            session,
+                            streams,
+                            code,
+                            file_path,
+                            external_lookup,
+                            inputs,
+                            filesystem,
                         )
                     except InfrastructureErrors:
                         raise
@@ -1136,10 +1197,27 @@ class PersistentMontyKernel:
                     ):
                         state = session.dump()
                         metrics.state_after_bytes = len(state)
+            except SessionPolicyChanged as exc:
+                return self._result(
+                    result=None,
+                    streams=streams,
+                    error_type="SessionPolicyChanged",
+                    error_message=str(exc),
+                    retryable=False,
+                    limit=limit,
+                    limit_was_capped=limit_was_capped,
+                    state_saved=False,
+                    state_restored=restored,
+                    revision=stored.revision if stored else None,
+                    state_policy=state_policy,
+                    output_file=output_file,
+                    filesystem=filesystem,
+                )
             except InfrastructureErrors as exc:
                 if isinstance(exc, MontyCrashedError):
                     self.store.delete(session_id)
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type=type(exc).__name__,
@@ -1156,6 +1234,7 @@ class PersistentMontyKernel:
             except TimeoutError as exc:
                 metrics.checkout_wait_seconds = time.monotonic() - checkout_started
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type="WorkerCheckoutTimeout",
@@ -1171,6 +1250,7 @@ class PersistentMontyKernel:
                 )
             except MontyError as exc:
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type="SessionRestoreError",
@@ -1188,6 +1268,7 @@ class PersistentMontyKernel:
             if terminal_resource_error:
                 self.store.delete(session_id)
                 return self._result(
+                    filesystem=filesystem,
                     result=result,
                     streams=streams,
                     error_type=type(execution_error).__name__,
@@ -1204,6 +1285,7 @@ class PersistentMontyKernel:
 
             if state is None:
                 return self._result(
+                    filesystem=filesystem,
                     result=result,
                     streams=streams,
                     error_type=(
@@ -1223,6 +1305,7 @@ class PersistentMontyKernel:
 
             if len(state) > self.config.max_state_bytes:
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type="SessionStateTooLarge",
@@ -1250,6 +1333,7 @@ class PersistentMontyKernel:
                 )
             except ConcurrentSessionUpdate:
                 return self._result(
+                    filesystem=filesystem,
                     result=None,
                     streams=streams,
                     error_type="ConcurrentSessionUpdate",
@@ -1267,6 +1351,7 @@ class PersistentMontyKernel:
                 )
 
             return self._result(
+                filesystem=filesystem,
                 result=result,
                 streams=streams,
                 error_type=type(execution_error).__name__ if execution_error else None,
@@ -1288,6 +1373,7 @@ class PersistentMontyKernel:
         external_lookup: dict[str, Any] | None,
         *,
         new_session: bool,
+        filesystem: bool = True,
     ) -> None:
         """Install helpers and run configured startup sources for a new session.
 
@@ -1296,17 +1382,17 @@ class PersistentMontyKernel:
             streams: Output collector shared by all feeds.
             external_lookup: Host functions for the operation.
             new_session: Whether no saved snapshot was loaded.
+            filesystem: Attach direct file access and run file bootstrap when true.
         """
+        metadata = (
+            {}
+            if new_session
+            else session.feed_run(_SESSION_METADATA_SOURCE, skip_type_check=True)
+        )
+        _check_session_policy(metadata.get("policy"), self)
         if (
             new_session
-            or self._feed(
-                session,
-                streams,
-                "locals().get('_arenero_fs_version')",
-                external_lookup,
-                skip_type_check=True,
-            )
-            != self._filesystem_version
+            or metadata.get("filesystem_version") != self._filesystem_version
         ):
             self._feed(
                 session,
@@ -1315,10 +1401,19 @@ class PersistentMontyKernel:
                 + f"\n_arenero_fs_version = {self._filesystem_version!r}",
                 external_lookup,
                 skip_type_check=True,
+                filesystem=filesystem,
             )
         if not new_session:
             return
-        if self.default_working_directory != "/":
+        self._feed(
+            session,
+            streams,
+            f"_arenero_session_policy = {_session_policy(self)!r}",
+            None,
+            skip_type_check=True,
+            filesystem=filesystem,
+        )
+        if filesystem and self.default_working_directory != "/":
             self._feed(
                 session,
                 streams,
@@ -1326,16 +1421,16 @@ class PersistentMontyKernel:
                 external_lookup,
                 skip_type_check=True,
             )
-        for path in self.bootstrap_files:
-            source = self._feed(
+        for path in self.bootstrap_files if filesystem else ():
+            self._run(session, streams, None, path, external_lookup)
+        if self.bootstrap_code:
+            self._feed(
                 session,
                 streams,
-                f"open({json.dumps(path)}).read()",
+                self.bootstrap_code,
                 external_lookup,
+                filesystem=filesystem,
             )
-            self._feed(session, streams, source, external_lookup)
-        if self.bootstrap_code:
-            self._feed(session, streams, self.bootstrap_code, external_lookup)
 
     def _run(
         self,
@@ -1345,6 +1440,7 @@ class PersistentMontyKernel:
         file_path: str | None,
         external_lookup: dict[str, Any] | None,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> Any:
         """Run direct code or a virtual file followed by direct code.
 
@@ -1355,25 +1451,41 @@ class PersistentMontyKernel:
             file_path: Optional virtual file to read and execute first.
             external_lookup: Host functions for this complete operation.
             inputs: Values bound once before the first user-code feed.
+            filesystem: Attach configured mounts and OS callbacks when true.
 
         Returns:
             The value of the last feed that ran.
         """
         if file_path is None:
             return self._feed(
-                session, streams, code or "", external_lookup, inputs=inputs
+                session,
+                streams,
+                code or "",
+                external_lookup,
+                inputs=inputs,
+                filesystem=filesystem,
             )
 
-        source = self._feed(
+        path, source = self._feed(
             session,
             streams,
-            f"open({json.dumps(file_path)}).read()",
+            _file_read_source(file_path),
             external_lookup,
             skip_type_check=True,
+            filesystem=filesystem,
         )
-        result = self._feed(session, streams, source, external_lookup, inputs=inputs)
+        result = self._feed(
+            session,
+            streams,
+            source,
+            external_lookup,
+            inputs={**(inputs or {}), "__file__": path, "__name__": "__main__"},
+            filesystem=filesystem,
+        )
         if code is not None:
-            result = self._feed(session, streams, code, external_lookup)
+            result = self._feed(
+                session, streams, code, external_lookup, filesystem=filesystem
+            )
         return result
 
     def _feed(
@@ -1385,6 +1497,7 @@ class PersistentMontyKernel:
         *,
         skip_type_check: bool = False,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> Any:
         """Run one feed with the kernel's host access settings.
 
@@ -1395,6 +1508,7 @@ class PersistentMontyKernel:
             external_lookup: Host functions for this complete operation.
             skip_type_check: Skip checking for trusted generated support code.
             inputs: Optional host values bound before execution.
+            filesystem: Attach configured mounts and OS callbacks when true.
 
         Returns:
             The feed result.
@@ -1404,8 +1518,8 @@ class PersistentMontyKernel:
             inputs=dict(inputs) if inputs is not None else None,
             external_lookup=external_lookup,
             print_callback=streams,
-            mount=self.mounts,
-            os=self.os_handler,
+            mount=self.mounts if filesystem else None,
+            os=self.os_handler if filesystem else None,
             skip_type_check=skip_type_check,
         )
 
@@ -1644,6 +1758,7 @@ class PersistentMontyKernel:
         revision: int | None,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Build and trim the public execution result.
 
@@ -1660,12 +1775,17 @@ class PersistentMontyKernel:
             revision: Saved session revision, when available.
             output_file: Optional virtual path for bounded untrimmed output.
             state_policy: State save policy for this operation.
+            filesystem: Allow artifact and overflow writes when true.
 
         Returns:
             A structured execution result.
         """
         artifacts: list[str] = []
-        if self.mcp_artifact_directory is not None and result is not None:
+        if (
+            filesystem
+            and self.mcp_artifact_directory is not None
+            and result is not None
+        ):
             result, artifacts = self.materialize_mcp_artifacts(
                 result,
                 self.mcp_artifact_directory,
@@ -1687,6 +1807,8 @@ class PersistentMontyKernel:
         public_result["mcp_artifacts"] = artifacts
         if payload is not None and output_file is not None:
             try:
+                if not filesystem:
+                    raise ValueError("filesystem access is disabled for this operation")
                 self.upload_file(output_file, payload)
             except (MontyError, ValueError, TypeError, RuntimeError) as exc:
                 public_result["output_file_error"] = str(exc)
@@ -1817,11 +1939,15 @@ def _prepare_execution_result(
     )
 
 
-def _variables_source(kernel: Any) -> str:
+def _variables_source(
+    kernel: Any, *, names: list[str] | None = None, values: bool = False
+) -> str:
     """Build the common read-only name inspection used by both kernels.
 
     Args:
         kernel: Kernel whose configured helper and tool names must be hidden.
+        names: Optional selected public identifiers.
+        values: Return copied values rather than type names when true.
 
     Returns:
         Monty source that returns public names and their type names, not values.
@@ -1834,10 +1960,127 @@ def _variables_source(kernel: Any) -> str:
     excluded.add("arenero_capture_shell_state")  # Alias in older snapshots.
     if kernel.mcp_hub is not None:
         excluded.update(kernel.mcp_hub.host_functions())
+    selection = f" and name in {names!r}" if names is not None else ""
+    expression = "value" if values else "type(value).__name__"
     return (
-        "{name: type(value).__name__ for name, value in locals().items() "
-        f"if not name.startswith('_') and name not in {sorted(excluded)!r}}}"
+        f"{{name: {expression} for name, value in locals().items() "
+        f"if not name.startswith('_') and name not in {sorted(excluded)!r}{selection}}}"
     )
+
+
+def _values_source(kernel: Any, names: list[str]) -> str:
+    """Build trusted selection code; never accept an expression.
+
+    Args:
+        kernel: Kernel whose helper/tool names are hidden.
+        names: At most 100 public Python identifiers.
+
+    Returns:
+        Monty source that selects saved values.
+
+    Raises:
+        ValueError: If names are private, invalid, or too numerous.
+    """
+    if len(names) > 100 or any(
+        not isinstance(name, str) or not name.isidentifier() or name.startswith("_")
+        for name in names
+    ):
+        raise ValueError("select at most 100 public identifiers, not expressions")
+    return _variables_source(kernel, names=names, values=True)
+
+
+def _inspection_result(value: Any, limit: int, capped: bool) -> dict[str, Any]:
+    """Apply the common JSON conversion and aggregate output bound.
+
+    Args:
+        value: Raw selected values from a disposable snapshot.
+        limit: Effective output character limit.
+        capped: Whether the host cap lowered the request.
+
+    Returns:
+        Values or a JSON preview, plus explicit truncation and limit fields.
+    """
+    values, truncated = _safe_result(value, limit)
+    return {
+        "values": values,
+        "truncated": truncated,
+        "output_limit_chars": limit,
+        "limit_was_capped": capped,
+    }
+
+
+def _session_policy(kernel: Any) -> dict[str, Any]:
+    """Record configured interpreter settings without live resources or stub text.
+
+    Args:
+        kernel: Kernel with limits, OS policy, and stable checking declarations.
+
+    Returns:
+        Plain versioned policy data that can travel inside a Monty snapshot.
+    """
+    return {
+        "format": 1,
+        "limits": kernel.config.resource_limits(),
+        "os_policy": _json_value(kernel.config.os_policy),
+        "type_check": kernel.config.type_check,
+        "stubs_hash": hashlib.sha256(kernel._type_check_stubs.encode()).hexdigest()
+        if kernel.config.type_check
+        else None,
+    }
+
+
+def _check_session_policy(saved: Any, kernel: Any) -> None:
+    """Refuse known policy drift; leave legacy snapshots unmodified.
+
+    Args:
+        saved: Saved policy, or None for a legacy snapshot.
+        kernel: Kernel with the current configured interpreter settings.
+
+    Raises:
+        SessionPolicyChanged: If the recorded settings differ.
+    """
+    if saved is not None and saved != _session_policy(kernel):
+        raise SessionPolicyChanged(
+            "Saved interpreter policy differs from current configuration. Use restart=True or reset the session."
+        )
+
+
+def _policy_report(metadata: Any, kernel: Any) -> dict[str, Any]:
+    """Describe saved-policy provenance, including legacy snapshots.
+
+    Args:
+        metadata: Raw snapshot metadata, or None when state is absent.
+        kernel: Kernel whose current interpreter policy is compared.
+
+    Returns:
+        Status, saved/current data, and whether an explicit reset is required.
+    """
+    saved = metadata.get("policy") if metadata is not None else None
+    current = _session_policy(kernel)
+    if metadata is None:
+        status = "absent"
+    elif saved is None:
+        status = "unknown"
+    else:
+        status = "match" if saved == current else "changed"
+    return {
+        "status": status,
+        "saved": saved,
+        "configured": current,
+        "reset_required": status == "changed",
+    }
+
+
+def _file_read_source(path: str) -> str:
+    """Read source and resolve its path using the session's native directory.
+
+    Args:
+        path: Relative or absolute virtual source path.
+
+    Returns:
+        Trusted Monty source that returns absolute path and UTF-8 content.
+    """
+    return f"from pathlib import Path as _arenero_source_path\n(str(_arenero_source_path({path!r}).absolute()), open({path!r}).read())"
 
 
 def _mount_list(mounts: MountDir | list[MountDir] | None) -> list[MountDir]:
@@ -1947,6 +2190,7 @@ def _error_hint(error_type: str, message: str, retryable: bool) -> str:
         "InvalidSessionId": "Use a session ID with 1 to 255 characters.",
         "InvalidStatePolicy": "Use state_policy='always', 'success', or 'never'.",
         "SessionVersionError": "Reset the session, then run the code again.",
+        "SessionPolicyChanged": "Use restart=True or reset; saved limits, OS policy, or checking declarations changed. Files are not reset.",
         "WorkerCheckoutTimeout": "Retry later or increase the worker pool size.",
         "SessionRestoreError": "Reset the session before you run more code.",
         "SessionStateTooLarge": "Reduce saved values or reset the session.",
@@ -2004,7 +2248,11 @@ def _recovery_action(error_type: str, message: str, retryable: bool) -> Recovery
         return "retry_later"
     if error_type == "ConcurrentSessionUpdate":
         return "retry_same_call"
-    if error_type in {"SessionVersionError", "SessionRestoreError"}:
+    if error_type in {
+        "SessionVersionError",
+        "SessionRestoreError",
+        "SessionPolicyChanged",
+    }:
         return "restart_session"
     lowered = message.lower()
     if "hosted tool" in lowered and (

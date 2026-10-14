@@ -220,7 +220,11 @@ The complete high-level file surface is:
 content with `file_revision_conflict`. This is an application edit guard. It is
 not a cross-process transaction.
 
-`grep()` is literal and UTF-8 only. `glob()` follows Arenero's bounded virtual
+`grep()` is UTF-8 and literal by default. Optional `regex=True`,
+`case_sensitive=False`, and `limit=N` reuse the Monty helper; managed agent file
+tools expose the same options. Regex follows Monty's engine, not exact POSIX ERE
+or the shell's host Python regex engine. Select text files with `pattern` when a
+tree also contains binary files. `glob()` follows Arenero's bounded virtual
 glob rules. Tree imports accept safe regular ZIP entries only. Absolute paths
 and `..` entries are rejected. Tree uploads reject symbolic links. Host tree
 transfer is an application-side operation and must use trusted host paths.
@@ -380,13 +384,37 @@ When a batch uses a shared virtual filesystem, Arenero serializes
 filesystem-capable calls to keep the Monty filesystem handler safe. This includes
 Python calls because they can call `fs_*` helpers. Use Python-only batch mode for
 overlap, or separate managers and workspaces for concurrent file workloads.
+Alternatively, pass `filesystem=False` to `run_python()` in either managed
+surface. It detaches direct files and skips file locking/quota scans for that
+call. Hosted callbacks keep their authority; use this only when their side
+effects do not need workspace coordination. See [Python-only calls](quality-of-life.md#python-only-calls-on-a-file-enabled-kernel).
 
 This is full managed feature parity, not Monty's native async interpreter path.
 Use `AsyncPersistentMontyKernel` when native async hosted functions are more
 important than the complete managed file, shell, package, and checkpoint API.
 That native kernel now has host upload/download, session listing, percent cells,
-and execution overflow files. It still has no native virtual shell or managed
+execution overflow files, structured file calls, ordered batch transfers,
+expiry cleanup, bounded value/policy inspection, and MCP artifact extraction.
+It still has no native virtual shell or managed
 package/checkpoint surface.
+
+```python
+async with AsyncPersistentMontyKernel(os_handler=OSAccess()) as kernel:
+    uploaded = await kernel.upload_files([("/notes.txt", b"Alpha\n")])
+    searched = await kernel.call_filesystem(
+        "agent", "grep", {"query": "alpha", "case_sensitive": False}
+    )
+    downloaded = await kernel.download_files(["/notes.txt", "/missing.txt"])
+    deleted = await kernel.delete_expired()
+```
+
+`call_filesystem()` has the same result/state/output rules as the sync kernel.
+Batch transfers return ordered `FileUploadResult`/`FileDownloadResult` records,
+continue after per-file errors, enforce per-file transfer limits, and do not form
+a transaction or aggregate byte budget. Native files still serialize per kernel.
+`delete_expired()` uses the store in a host thread; it returns zero when expiry is
+disabled and does not remove workspace files. Imports for this example are
+`AsyncPersistentMontyKernel` from `arenero` and `OSAccess` from `pydantic_monty`.
 
 ## Agent tool bundle
 

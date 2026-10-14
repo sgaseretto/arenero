@@ -39,6 +39,7 @@ class SessionHandle:
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Execute code in this bound session.
 
@@ -50,6 +51,7 @@ class SessionHandle:
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
             inputs: Optional host values bound before this user feed.
+            filesystem: Allow direct files when true; false skips file bootstrap and the shared file lock.
 
         Returns:
             Structured execution result.
@@ -63,6 +65,7 @@ class SessionHandle:
             restart=restart,
             hosted_tools=hosted_tools,
             inputs=inputs,
+            filesystem=filesystem,
         )
 
     def execute_file(
@@ -188,6 +191,28 @@ class SessionHandle:
         """
         return self.kernel.variables(self.session_id)
 
+    def inspect_values(
+        self, names: list[str], output_limit_chars: int | None = None
+    ) -> dict[str, Any]:
+        """Read selected saved public values without changing state.
+
+        Args:
+            names: Up to 100 public identifiers, not expressions.
+            output_limit_chars: Optional aggregate JSON limit.
+
+        Returns:
+            Values or a JSON preview, plus truncation and limit fields.
+        """
+        return self.kernel.inspect_values(self.session_id, names, output_limit_chars)
+
+    def policy(self) -> dict[str, Any]:
+        """Read saved/configured interpreter policy and reset guidance.
+
+        Returns:
+            Policy data with match, changed, unknown, or absent status.
+        """
+        return self.kernel.session_policy(self.session_id)
+
     def reset(self) -> bool:
         """Delete this session's saved Python state.
 
@@ -241,6 +266,7 @@ class AsyncSessionHandle:
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> ExecutionResult:
         """Execute code in this bound session.
 
@@ -252,6 +278,7 @@ class AsyncSessionHandle:
             hosted_tools: Optional tools for this operation only.
             inputs: Optional host values bound before this user feed.
             output_file: Optional virtual path for bounded untrimmed output.
+            filesystem: Allow direct files when true; false skips file bootstrap and the shared file lock.
 
         Returns:
             Structured execution result.
@@ -265,6 +292,7 @@ class AsyncSessionHandle:
             restart=restart,
             hosted_tools=hosted_tools,
             inputs=inputs,
+            filesystem=filesystem,
         )
 
     async def execute_file(
@@ -343,6 +371,30 @@ class AsyncSessionHandle:
             Name-to-type mapping, or an empty mapping when no state is saved.
         """
         return await self.kernel.variables(self.session_id)
+
+    async def inspect_values(
+        self, names: list[str], output_limit_chars: int | None = None
+    ) -> dict[str, Any]:
+        """Read selected saved public values without changing state.
+
+        Args:
+            names: Up to 100 public identifiers, not expressions.
+            output_limit_chars: Optional aggregate JSON limit.
+
+        Returns:
+            Values or a JSON preview, plus truncation and limit fields.
+        """
+        return await self.kernel.inspect_values(
+            self.session_id, names, output_limit_chars
+        )
+
+    async def policy(self) -> dict[str, Any]:
+        """Read saved/configured interpreter policy and reset guidance.
+
+        Returns:
+            Policy data with match, changed, unknown, or absent status.
+        """
+        return await self.kernel.session_policy(self.session_id)
 
     async def reset(self) -> bool:
         """Delete this session's saved Python state.

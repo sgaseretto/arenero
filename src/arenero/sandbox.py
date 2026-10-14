@@ -267,6 +267,7 @@ class AreneroSandbox:
         inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        filesystem: bool = True,
     ) -> SandboxExecuteResult:
         """Execute Monty-compatible Python directly.
 
@@ -278,6 +279,7 @@ class AreneroSandbox:
             restart: Reset state before execution when true.
             hosted_tools: Optional tools for this operation only.
             inputs: Values bound once before the first user-code feed.
+            filesystem: Allow direct files when true; false skips file bootstrap and the shared file lock.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -292,6 +294,7 @@ class AreneroSandbox:
                 inputs=inputs,
                 restart=restart,
                 hosted_tools=hosted_tools,
+                filesystem=filesystem,
             )
         )
 
@@ -608,14 +611,18 @@ class AreneroSandbox:
         glob: str = "**/*",
         *,
         max_count: int | None = None,
+        regex: bool = False,
+        case_sensitive: bool = True,
     ) -> SandboxSearchResult:
-        """Search for literal text in bounded virtual text files.
+        """Search bounded UTF-8 files with the existing Monty grep helper.
 
         Args:
             pattern: Literal text to find.
             path: Absolute virtual search root.
             glob: File-selection glob pattern.
             max_count: Optional requested match cap below the hard maximum.
+            regex: Use Monty regular expressions when true; otherwise literal text.
+            case_sensitive: Match case when true.
 
         Returns:
             Structured line matches.
@@ -627,8 +634,8 @@ class AreneroSandbox:
                 "query": pattern,
                 "root": path,
                 "pattern": glob,
-                "regex": False,
-                "case_sensitive": True,
+                "regex": regex,
+                "case_sensitive": case_sensitive,
                 "limit": max_count,
             },
         )
@@ -741,6 +748,7 @@ class AsyncAreneroSandbox:
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> SandboxExecuteResult:
         """Execute Monty Python without blocking the event loop.
 
@@ -750,6 +758,7 @@ class AsyncAreneroSandbox:
             output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
             inputs: Values bound once before the first user-code feed.
+            filesystem: Allow direct files when true; false skips file bootstrap and the shared file lock.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -761,6 +770,7 @@ class AsyncAreneroSandbox:
             output_file=output_file,
             state_policy=state_policy,
             inputs=inputs,
+            filesystem=filesystem,
         )
 
     async def execute_cell(
@@ -957,6 +967,8 @@ class AsyncAreneroSandbox:
         glob: str = "**/*",
         *,
         max_count: int | None = None,
+        regex: bool = False,
+        case_sensitive: bool = True,
     ) -> SandboxSearchResult:
         """Search virtual text files without blocking the event loop.
 
@@ -965,6 +977,8 @@ class AsyncAreneroSandbox:
             path: Absolute virtual search root.
             glob: File-selection glob pattern.
             max_count: Optional requested match cap.
+            regex: Use Monty regular expressions when true.
+            case_sensitive: Match case when true.
 
         Returns:
             Structured line matches.
@@ -975,6 +989,8 @@ class AsyncAreneroSandbox:
             path,
             glob,
             max_count=max_count,
+            regex=regex,
+            case_sensitive=case_sensitive,
         )
 
     async def upload_files(

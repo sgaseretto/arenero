@@ -224,24 +224,40 @@ def _file_tools(sandbox: ManagedSandbox) -> list[BaseTool]:
 
         return sandbox.glob(pattern, path).to_dict()
 
-    @tool("grep_files", description="Find literal text in bounded UTF-8 sandbox files.")
+    @tool(
+        "grep_files",
+        description="Search bounded UTF-8 files; literal by default, optional Monty regex and case selection.",
+    )
     def grep_files(
         query: str,
         path: str = ".",
         pattern: str = "**/*",
+        regex: bool = False,
+        case_sensitive: bool = True,
+        limit: int | None = None,
     ) -> dict[str, Any]:
-        """Find literal text in virtual files.
+        """Search virtual files through the same bounded grep helper.
 
         Args:
-            query: Literal text, not a regular expression.
+            query: Literal text or a Monty regex when regex is true.
             path: Relative or workspace-absolute search root.
             pattern: Glob used to select files.
+            regex: Use Monty regular expressions when true.
+            case_sensitive: Match case when true.
+            limit: Optional result count below the host maximum.
 
         Returns:
             Common result with bounded line matches.
         """
 
-        return sandbox.grep(query, path, pattern).to_dict()
+        return sandbox.grep(
+            query,
+            path,
+            pattern,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            limit=limit,
+        ).to_dict()
 
     return [
         read_file,

@@ -720,6 +720,17 @@ await lookup(prompt=content)
         attempts = 0
         started = asyncio.Event()
         release = asyncio.Event()
+        claimed = asyncio.Event()
+
+        def record_event(event: AreneroEvent) -> None:
+            """Record events and signal when the real caller starts waiting.
+
+            Args:
+                event: Safe execution/speculation metadata.
+            """
+            events.append(event)
+            if event.category == "speculation" and event.action == "claim_hit":
+                claimed.set()
 
         async def lookup(prompt: str) -> str:
             """Fail one key and block another until the real claim waits.
@@ -744,14 +755,14 @@ await lookup(prompt=content)
             return prompt
 
         tools = HostedToolSet.from_callables([lookup])
-        async with _kernel(event_sink=events.append) as kernel:
+        async with _kernel(event_sink=record_event) as kernel:
             await kernel.execute("real", "seed = 1")
             failed = SpeculativeTurn(
                 kernel,
                 "real",
                 tools,
                 _config("lookup"),
-                event_sink=events.append,
+                event_sink=record_event,
             )
             await failed.start()
             await failed.feed("```python\nawait lookup(prompt='fail')\n```")
@@ -763,13 +774,14 @@ await lookup(prompt=content)
                 hosted_tools=failed.real_tools,
             )
             failed_usage = await failed.close()
+            claimed.clear()
 
             waiting = SpeculativeTurn(
                 kernel,
                 "real",
                 tools,
                 _config("lookup"),
-                event_sink=events.append,
+                event_sink=record_event,
             )
             await waiting.start()
             await waiting.feed("```python\nawait lookup(prompt='wait')\n```")
@@ -781,6 +793,7 @@ await lookup(prompt=content)
                     hosted_tools=waiting.real_tools,
                 )
             )
+            await asyncio.wait_for(claimed.wait(), timeout=1)
             await asyncio.sleep(0.02)
             release.set()
             waited_result = await execution

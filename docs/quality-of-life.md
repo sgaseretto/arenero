@@ -14,7 +14,7 @@ flowchart LR
     Runtime --> Hub["Optional MCP hub"]
     Kernel --> Handle["Bound SessionHandle"]
     Handle --> Execute["Execute with inputs, execute file, reset, info, fork"]
-    Handle --> Inspect["Saved names and types; no state save"]
+    Handle --> Inspect["Saved names/types, selected values, and policy; no state save"]
     Inspect --> Store
     Kernel --> Report["Capabilities and model instructions"]
     Kernel --> Events["Optional event sink"]
@@ -39,6 +39,10 @@ flowchart LR
 | Hosted call records | `result["host_calls"]` | Show bounded nested-call identity, status, timing, and possible side effects. |
 | Execution statistics | `result["stats"]` | Show operation identity, timing, state sizes, and original output sizes. |
 | Read-only names | `kernel.variables()` or `session.variables()` | Read saved public names and types without bootstrap or state changes. |
+| Selected saved values | `session.inspect_values(names, output_limit_chars)` | Read bounded copies without callbacks or state saves. |
+| Saved interpreter policy | `session.policy()` | Compare recorded limits, OS policy, and checking configuration. |
+| Explicit result decoder | `decode_value(value)` | Decode exact bytes/complex records for later host inputs. |
+| Python-only operation | `execute(..., filesystem=False)` | Detach direct file access and avoid the shared file lock. |
 | REPL commands | `%run`, `%reset`, `%limits`, `%sessions`, `%mcp`, `%who`, `%whos` | Perform common control actions before Monty parses the cell. |
 | State save policy | `state_policy=` | Select when Python state is saved. |
 | Session forking | `kernel.fork_session()` or `handle.fork()` | Copy Python state for an isolated experiment. |
@@ -132,6 +136,127 @@ while an execution is active. It uses a short worker checkout and can fail when
 the pool is busy or state is incompatible. Do not expose it as a host function
 that re-enters the active interpreter. This is a convenience API, not a secret
 filter or live debugger.
+
+### Read selected values
+
+Both kernels and bound handles provide `inspect_values()`. It uses the same
+disposable snapshot as name inspection. Supply at most 100 public identifiers,
+not Python expressions. Private names are rejected; missing names and configured
+helpers/tools are omitted. It reads the last saved state, needs a free worker,
+applies store expiry, and does not run callbacks, bootstrap, or a state save.
+
+```python
+from arenero import PersistentMontyKernel, decode_value
+
+with PersistentMontyKernel() as kernel:
+    session = kernel.session("agent")
+    session.execute("answer = 42\nblob = b'OK'")
+    selected = session.inspect_values(["answer", "blob"])
+    assert decode_value(selected["values"]) == {"answer": 42, "blob": b"OK"}
+    assert not selected["truncated"]
+```
+
+The result has `values`, `truncated`, `output_limit_chars`, and `limit_was_capped`.
+The limit applies to the whole serialized mapping, not each variable. An
+oversized mapping becomes a JSON text preview. Do not decode that preview or
+treat it as complete data. Instance attributes are copies, not methods or live
+objects. A selected secret is not removed automatically.
+Managed callers use `sandbox.inspect_values(names)` and get `SandboxResult`.
+Threaded async callers use `await sandbox.call("inspect_values", names)`.
+Native async callers await the kernel or bound-handle method.
+
+### Decode a result explicitly
+
+`decode_value(value)` recursively decodes exact Base64 bytes records and exact
+`{"type": "complex", "real": ..., "imag": ...}` records. It returns copied lists
+and dictionaries. Invalid recognized records raise `ValueError`; records with
+extra fields stay ordinary data. It never runs automatically.
+
+```python
+result = session.execute("{'blob': b'OK', 'number': 1 + 2j}")
+values = decode_value(result["result"])
+session.execute("len(blob)", inputs={"blob": values["blob"]})
+```
+
+Pass the result value, not a trimmed preview. Dates remain text; tuples/sets
+remain lists; instance records remain data. Lost key distinctions or identity
+cannot be recovered. A caller that chooses to decode must accept that an exact
+matching user dictionary is a tag.
+
+## Saved interpreter policy
+
+New sessions record configured Monty limits, OS policy, the checking flag, and a
+hash of stable checking declarations in `_arenero_session_policy`. This travels
+in the Monty snapshot, without a table migration or custom-store API change.
+It excludes stub text, callbacks, credentials, mounts, and connections. It records
+configured settings, not whether every individual feed was checked.
+
+```python
+report = session.policy()  # kernel.session_policy(session_id) also works
+assert report["status"] == "match"
+assert not report["reset_required"]
+```
+
+The report has `saved`, `configured`, `status`, and `reset_required`.
+
+| Status | Meaning |
+| --- | --- |
+| `absent` | No saved snapshot exists. |
+| `unknown` | The snapshot predates recording or has no marker. |
+| `match` | Recorded settings equal current interpreter configuration. |
+| `changed` | Recorded settings differ; execution requires an explicit reset. |
+
+A known mismatch returns `session_policy_changed` with
+`recovery="restart_session"` before bootstrap or user code. The old snapshot is
+kept. Use `restart=True` or `reset()` to apply new settings; files and external
+effects are not reset. The comparison is conservative: changed stub whitespace
+or a different OS-policy representation can require a reset.
+
+Legacy snapshots stay `unknown` and remain usable under Monty's old restore
+rules. Arenero does not claim that today's settings created their saved limits.
+Reset them to establish provenance. Output, stream, transfer, saved-size, TTL,
+worker-pool, and filesystem-helper limits are host-side settings, outside this
+comparison. Managed checkpoint policy checks remain broader. Reserve the private
+marker: it is provenance for trusted state, not a security boundary against code
+that changes its globals. Inspection needs a free worker.
+Managed callers use `sandbox.session_policy()`; threaded async callers use
+`await sandbox.call("session_policy")`.
+
+## Python-only calls on a file-enabled kernel
+
+Both kernels, bound handles, Python facades, and managed `run_python()` accept
+`filesystem=False`. The default is `True`. It is a host option, not a new agent
+tool argument.
+
+```python
+result = session.execute("sum([20, 22])", filesystem=False)
+assert result["result"] == 42
+```
+
+False detaches direct mounts/OS callbacks, skips bootstrap files and initial
+file-root `chdir`, and avoids the kernel-wide file lock. Trusted bootstrap code,
+Python state, session ordering, and execution limits still apply. Different IDs
+can overlap if workers are available. Managed calls also skip workspace quota
+capture/recount. Direct `open()`/`Path`/`fs_*` I/O is denied; automatic artifacts
+are skipped and trimmed overflow writes report `output_file_error`.
+
+Hosted functions and MCP tools keep their host authority. Existing Python data,
+including cached file data, is not erased. Use this option only when those host
+effects are acceptable without workspace coordination. Skipped bootstrap files
+do not run on a later restore; reset when file bootstrap is required.
+
+```mermaid
+flowchart TD
+    Call["Python operation; session lock always held"] --> Mode{"filesystem?"}
+    Mode -->|true| Files["File lock; mounts; file bootstrap; managed quota checks"]
+    Mode -->|false| Plain["No file lock, direct file callbacks, or file bootstrap"]
+    Files --> Worker["Monty checkout"]
+    Plain --> Worker
+    Worker --> Save["State policy save"]
+    Worker -. "both modes" .-> Tools["Hosted tools retain host authority"]
+```
+
+## Session fork boundaries
 
 A fork copies only the opaque Monty snapshot, including native directory, RNG,
 and resource settings. The next feed starts a new duration clock. It does not
@@ -368,10 +493,15 @@ important: a hosted MCP function must not re-enter the active persistent session
 Only binary blocks present in the final returned Python value are materialized.
 Intermediate MCP results are not scanned. Data removed by `McpHubConfig` result
 limits cannot be materialized. Each file must also fit
-`FilesystemConfig.max_transfer_bytes`. The native async kernel has raw upload
-and download, but still has no automatic MCP artifact materialization. That
-feature remains synchronous. Binary transfers and execution overflow are not
-automatic MCP artifact extraction.
+`FilesystemConfig.max_transfer_bytes`. Both kernels support explicit and
+automatic materialization. Native async uses
+`await kernel.materialize_mcp_artifacts(value, directory)` or the same
+`mcp_artifact_directory=` configuration. It waits until the execution checkout
+and async file lock end, while the session lock stays held. Writes occur before
+public trimming and overflow preparation, so a zero-character view does not hide
+artifact data. Failed blocks keep Base64 and gain `artifact_error`; successful
+paths appear in `mcp_artifacts`. Cancellation propagates without undoing Python
+state already saved.
 
 ## What these APIs do not add
 

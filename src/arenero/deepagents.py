@@ -59,6 +59,10 @@ class AreneroEvalInput(BaseModel):
         ge=0,
         description="Optional maximum characters for each returned output field.",
     )
+    output_file: str | None = Field(
+        default=None,
+        description="Optional absolute virtual path for full bounded JSON when output is trimmed. Check output_file_error.",
+    )
 
 
 class AreneroModuleInput(BaseModel):
@@ -76,6 +80,10 @@ class AreneroModuleInput(BaseModel):
         default=None,
         ge=0,
         description="Optional maximum characters for each returned output field.",
+    )
+    output_file: str | None = Field(
+        default=None,
+        description="Optional absolute virtual path for full bounded JSON when output is trimmed. Check output_file_error.",
     )
 
 
@@ -369,6 +377,7 @@ class AreneroInterpreterMiddleware(
             runtime: ToolRuntime,
             code: str,
             output_limit_chars: int | None = None,
+            output_file: str | None = None,
         ) -> ToolMessage:
             """Return guidance when an agent uses synchronous invocation.
 
@@ -376,6 +385,7 @@ class AreneroInterpreterMiddleware(
                 runtime: Active outer tool runtime.
                 code: Unused Monty source.
                 output_limit_chars: Unused requested output limit.
+                output_file: Unused overflow destination.
 
             Returns:
                 Error ToolMessage that requests asynchronous invocation.
@@ -402,6 +412,7 @@ class AreneroInterpreterMiddleware(
             runtime: ToolRuntime,
             code: str,
             output_limit_chars: int | None = None,
+            output_file: str | None = None,
         ) -> ToolMessage:
             """Run one asynchronous persistent Monty cell.
 
@@ -409,6 +420,7 @@ class AreneroInterpreterMiddleware(
                 runtime: Active outer tool runtime.
                 code: Monty-compatible Python source.
                 output_limit_chars: Optional caller output limit.
+                output_file: Optional absolute virtual overflow destination.
 
             Returns:
                 ToolMessage with the JSON execution result.
@@ -422,6 +434,7 @@ class AreneroInterpreterMiddleware(
                     code,
                     output_limit_chars,
                     hosted_tools=hosted,
+                    output_file=output_file,
                 )
             finally:
                 if middleware._mode == "call":
@@ -466,6 +479,7 @@ class AreneroInterpreterMiddleware(
             entry_path: str,
             code: str | None = None,
             output_limit_chars: int | None = None,
+            output_file: str | None = None,
         ) -> ToolMessage:
             """Return guidance for unsupported synchronous module execution.
 
@@ -474,6 +488,7 @@ class AreneroInterpreterMiddleware(
                 entry_path: Unused virtual entry path.
                 code: Unused follow-up code.
                 output_limit_chars: Unused requested output limit.
+                output_file: Unused overflow destination.
 
             Returns:
                 Error ToolMessage that requests asynchronous invocation.
@@ -501,6 +516,7 @@ class AreneroInterpreterMiddleware(
             entry_path: str,
             code: str | None = None,
             output_limit_chars: int | None = None,
+            output_file: str | None = None,
         ) -> ToolMessage:
             """Resolve and run one static virtual module graph.
 
@@ -509,6 +525,7 @@ class AreneroInterpreterMiddleware(
                 entry_path: Absolute virtual entry ``.py`` file.
                 code: Optional follow-up code.
                 output_limit_chars: Optional caller output limit.
+                output_file: Optional absolute virtual overflow destination.
 
             Returns:
                 ToolMessage with the JSON execution result.
@@ -523,6 +540,7 @@ class AreneroInterpreterMiddleware(
                     code,
                     output_limit_chars,
                     hosted_tools=hosted,
+                    output_file=output_file,
                 )
             finally:
                 if middleware._mode == "call":

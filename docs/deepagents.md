@@ -11,6 +11,13 @@ The middleware also adds current limits and hosted-function signatures to every
 model request. It reads the live tool list after other middleware changes it, so
 the instructions match the functions that the next interpreter call can use.
 
+Both interpreter tools accept optional `output_file`, an absolute virtual path
+for full bounded JSON when public output is trimmed. This reuses the native
+kernel writer; it does not change the tool names or add an extra agent call.
+Check `output_file_error` separately from Python success. No filesystem means the
+write fails, not that the kernel gains file access. Stream and transfer caps still
+apply. Inputs and the Python-only filesystem flag remain host options.
+
 Install the optional integration:
 
 ```console
@@ -255,3 +262,7 @@ agent when the kernel or tool list can change.
   filesystem mounts.
 - The full runtime injection uses LangGraph's current injection metadata. Keep
   the pinned LangChain, LangGraph, and Deep Agents versions covered by tests.
+
+The output-file and module-export tests run a complete mocked model-driven graph
+over two human turns. The second call keeps Python state and loads a module, then
+writes its full result through the same two fixed interpreter tool names.

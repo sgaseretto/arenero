@@ -153,7 +153,10 @@ class VirtualModuleResolver:
             "",
             *(self._compiled[path] for path in self._order),
             f"{entry_name} = {entry_symbol}",
-            *(f"{name} = {entry_symbol}.{name}" for name in exports),
+            *(
+                f"if hasattr({entry_symbol}, {name!r}):\n    {name} = {entry_symbol}.{name}"
+                for name in exports
+            ),
         ]
         if followup_code is not None:
             lines.extend(("", followup_code))
@@ -212,13 +215,27 @@ class VirtualModuleResolver:
         ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
         function_name = f"_arenero_load_{self._digest(path)}"
         module_symbol = self._symbol(path)
-        source_lines = [f"def {function_name}():", f"    __file__ = {path!r}"]
+        module_name = PurePosixPath(path).stem
+        if module_name == "__init__":
+            module_name = PurePosixPath(path).parent.name
+        source_lines = [
+            f"def {function_name}():",
+            f"    __file__ = {path!r}",
+            f"    __name__ = {module_name!r}",
+        ]
         if body:
             for statement in body:
                 rendered = ast.unparse(statement)
                 source_lines.extend(f"    {line}" for line in rendered.splitlines())
+        source_lines.append("    _arenero_export_values = locals()")
         source_lines.append("    _module = _AreneroVirtualModule()")
-        source_lines.extend(f"    _module.{name} = {name}" for name in exports)
+        source_lines.extend(
+            ("    _module.__file__ = __file__", "    _module.__name__ = __name__")
+        )
+        source_lines.extend(
+            f"    if {name!r} in _arenero_export_values:\n        _module.{name} = {name}"
+            for name in exports
+        )
         source_lines.append("    return _module")
         source_lines.append(f"{module_symbol} = {function_name}()")
         self._compiled[path] = "\n".join(source_lines) + "\n"
@@ -402,32 +419,22 @@ class VirtualModuleResolver:
     def _public_names(
         self, body: list[ast.stmt], imported_names: list[str]
     ) -> tuple[str, ...]:
-        """Collect public names made by direct module statements.
+        """Collect possible public exports without entering function/class scopes.
 
         Args:
             body: Rewritten direct statements.
             imported_names: Local names created by import statements.
 
         Returns:
-            Stable public export names.
+            Stable candidate names; generated code exports only bound values.
         """
 
-        names = list(imported_names)
+        collector = _ExportNames(list(imported_names))
         for statement in body:
-            if isinstance(
-                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                names.append(statement.name)
-            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
-                targets = (
-                    statement.targets
-                    if isinstance(statement, ast.Assign)
-                    else [statement.target]
-                )
-                names.extend(
-                    target.id for target in targets if isinstance(target, ast.Name)
-                )
-        return tuple(dict.fromkeys(name for name in names if not name.startswith("_")))
+            collector.visit(statement)
+        return tuple(
+            dict.fromkeys(name for name in collector.names if not name.startswith("_"))
+        )
 
     def _normalize_path(self, path: str) -> str:
         """Normalize one absolute POSIX path without allowing traversal.
@@ -483,3 +490,55 @@ class VirtualModuleResolver:
         """
 
         return hashlib.sha256(path.encode()).hexdigest()[:12]
+
+
+class _ExportNames(ast.NodeVisitor):
+    """Collect names bound at module scope, including compound statements."""
+
+    def __init__(self, names: list[str]) -> None:
+        """Start with imported names.
+
+        Args:
+            names: Mutable list that receives candidate export names.
+        """
+        self.names = names
+
+    def visit_Name(self, node: ast.Name) -> None:
+        """Record an assignment target.
+
+        Args:
+            node: Name expression to inspect.
+        """
+        if isinstance(node.ctx, ast.Store):
+            self.names.append(node.id)
+
+    def visit_FunctionDef(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+    ) -> None:
+        """Record a definition without inspecting its separate local scope.
+
+        Args:
+            node: Function or class definition.
+        """
+        self.names.append(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """Record bundled-module imports in supported compound statements.
+
+        Args:
+            node: Import statement.
+        """
+        self.names.extend(
+            alias.asname or alias.name.split(".")[0] for alias in node.names
+        )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """Record names bound by a bundled-module from-import.
+
+        Args:
+            node: From-import statement.
+        """
+        self.names.extend(alias.asname or alias.name for alias in node.names)

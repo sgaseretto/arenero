@@ -42,8 +42,11 @@ Arenero passes nested bundled-standard-module imports through in supported
 Monty scopes. Nested virtual-file imports and wildcard imports remain rejected.
 This does not enable unsupported submodules or class-body imports.
 Explicit `from . import helper` binds sibling module objects through the same
-bounded static resolver. Each loader has a virtual `__file__` for nearby asset
-reads; it is not exported as general module metadata.
+bounded static resolver. Each loader and module object has virtual `__file__`
+and a filename/package-stem `__name__`. Only bound candidates are exported,
+including unpacking and compound statements, not nested scopes. Flat files bind
+absolute `__file__` and script-style `__name__` through native inputs; Python
+assignments to module-level metadata are read-only.
 
 Arenero can wrap this static graph in its own dependency-free source package
 format. The host checks the fixed JSON manifest and bounded UTF-8 files, then runs
@@ -146,6 +149,8 @@ operations. Host wrapper retention is outside `max_memory`.
 Arenero's public result converter emits Base64 bytes records, complex records,
 ISO date text, and Monty instance class/attribute records. This does not grant
 host-object access, preserve identity or methods, or decode inputs automatically.
+Host `decode_value` explicitly decodes exact bytes/complex tags, not dates,
+instances, lost collection types, or trimmed previews.
 Raw file transfers still use bytes. Monty's deep/cyclic export placeholders
 remain possible.
 
@@ -256,16 +261,23 @@ hash after restore. A changed helper source or helper limits refreshes them once
 Read-only name/type and managed-directory inspection load a disposable dump,
 attach no host/file callbacks, and save nothing. They read the last commit, need
 a worker, and must not re-enter an active parent interpreter.
-Native async percent cells reuse the shared parser/result format. Raw uploads and
-overflow output use isolated checkouts without bootstrap or saved state. Overflow
-starts after the execution checkout and async filesystem lock end; a failed write
-does not roll back Python state. No native async shell is added.
+Native async percent cells reuse the shared parser/result format. Raw uploads,
+batch transfers, and overflow use isolated checkouts without bootstrap or state
+saves. Structured file calls use the persistent helper path. Final MCP artifacts
+are extracted after the checkout/file lock end and before trimming/overflow
+formatting. Failed blocks retain data; cancellation does not undo saved Python
+state. No native async shell is added. Bounded value/policy inspection uses a
+disposable snapshot without callbacks or saves. Python-only calls can detach
+direct files and skip the shared lock; hosted tools retain their authority.
 
 Released `1.1.0` uses CBOR and an upstream dump-format version. Arenero still
 requires an exact package-version match. Do not infer that old `0.0.21` snapshots
 can be loaded by a new wheel. In `1.1.0`, dump resource limits replace checkout
 limits apart from the suspension cap. Reviewed `main` caps every restored limit
 at the restoring checkout's limit; this is another unreleased change.
+Arenero records configured interpreter policy inside new dumps and rejects known
+drift before bootstrap/user code. Legacy dumps remain usable with unknown policy
+until reset. This avoids store migrations and does not authenticate the marker.
 
 Arenero RLM recursion uses a new temporary snapshot for each child. It does not
 copy the parent namespace. The parent checkout stays active during the child, so

@@ -41,6 +41,19 @@ relative sibling imports and graph limits; opt-in binary assets, virtual
 native async agent runs `%run`, inspects state on the second human turn, and uses
 the existing module tool to write full output. No live model is called.
 
+`tests/test_small_sandbox_gaps.py` validates all ten small sandbox changes through
+real workers: compound/unpacking exports and scope isolation; flat/module
+metadata; facade and agent grep options; bounded non-mutating value inspection;
+strict opt-in decoding; concurrent sync Python-only calls with denied files;
+managed forwarding; native async file helpers, partial batch transfers, expiry
+cleanup; one-worker MCP artifact extraction before trimming, failures and
+cancellation; saved-policy restore, fork, SQLite, drift rejection and legacy
+unknown status. Its complete mocked Deep Agents graph uses both unchanged
+interpreter names across two human turns and writes full output files.
+The native Monty restore-limit test stays separate from Arenero's new guard.
+Speculative wait timing starts at the observed real claim, not task creation;
+MCP budget tests accept exhaustion before or during the next call.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -98,6 +111,12 @@ Run the API-completion checks only:
 
 ```console
 uv run --frozen python -m unittest tests.test_api_completion -v
+```
+
+Run the ten small sandbox change checks only:
+
+```console
+uv run --frozen python -m unittest tests.test_small_sandbox_gaps -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

@@ -12,6 +12,35 @@ from typing import Any
 from pydantic_monty import MontyClassProxy
 
 
+def decode_value(value: Any) -> Any:
+    """Explicitly decode Arenero bytes and complex records in JSON data.
+
+    Args:
+        value: Result value, not the complete execution envelope. Exact bytes
+            and complex records are decoded recursively; other data stays data.
+
+    Returns:
+        Copied dictionaries/lists with native bytes and complex values.
+
+    Raises:
+        ValueError: If an exact recognized record has an invalid payload.
+    """
+    if isinstance(value, list):
+        return [decode_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value) == {"encoding", "content"} and value["encoding"] == "base64":
+        try:
+            return base64.b64decode(value["content"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid Arenero Base64 record") from exc
+    if set(value) == {"type", "real", "imag"} and value["type"] == "complex":
+        if any(type(value[key]) not in {int, float} for key in ("real", "imag")):
+            raise ValueError("complex record real and imag must be numbers")
+        return complex(value["real"], value["imag"])
+    return {key: decode_value(item) for key, item in value.items()}
+
+
 def json_value(value: Any) -> Any:
     """Convert a result without changing values inside the interpreter.
 

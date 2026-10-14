@@ -91,11 +91,15 @@ def capability_report(
                 "date_and_time": "ISO 8601 text",
                 "monty_instance": "class and copied attributes; no methods or identity",
             },
-            "session_inspection": "host variables() reads saved public names and types only",
+            "session_inspection": "variables() reads saved names/types; inspect_values(names) copies selected public values with aggregate output limits",
+            "explicit_result_decoder": "decode_value(): exact Base64 bytes and complex records only; never automatic",
+            "file_metadata": "execute_file binds absolute __file__ and __name__='__main__'; static module objects expose __file__ and filename/package-stem __name__",
+            "python_only_operation": "execute(..., filesystem=False) detaches direct mounts/OS callbacks and skips file bootstrap/lock; hosted tools retain authority",
             "stdlib_modules": sorted(MONTY_STDLIB_MODULES),
             "virtual_cwd_shared_with_shell": not is_async,
             "os_policy": _os_policy_report(kernel),
             "policy_report_scope": "configured new sessions, not saved dump inspection",
+            "saved_policy_api": "session_policy(session_id) or session.policy(); recorded policy changes require explicit reset",
             "limit_scopes": {
                 "duration": "per feed; optional per interpreter turn",
                 "suspensions": "per checkout; reset on snapshot restore",
@@ -112,6 +116,7 @@ def capability_report(
             "state_policies": ["always", "success", "never"],
             "default_state_policy": "always",
             "files_are_not_rolled_back": True,
+            "interpreter_policy_record": "inside the Monty snapshot; legacy policy status is unknown; no store schema change",
         },
         "filesystem": {
             "enabled": filesystem_enabled,
@@ -132,6 +137,15 @@ def capability_report(
             ],
             "limits": asdict(kernel.filesystem_config),
             "helpers_installation": "once per session; refresh on source or helper-limit change",
+            "native_async_utilities": [
+                "call_filesystem",
+                "upload_files",
+                "download_files",
+                "delete_expired",
+            ]
+            if is_async
+            else [],
+            "facade_grep": "literal by default; optional Monty regex, case sensitivity, and bounded result count",
         },
         "virtual_modules": {
             "enabled": filesystem_enabled,
@@ -147,6 +161,8 @@ def capability_report(
                 "explicit sibling imports: from . import helper",
                 "configured aliases",
                 "same-call follow-up code",
+                "bound exports from unpacking and supported compound statements",
+                "module __file__ and __name__ metadata",
             ],
             "does_not_support": [
                 "dynamic imports",
@@ -219,6 +235,7 @@ def capability_report(
             "dynamic_server_transports": ["stdio", "streamable-http"],
             "dynamic_server_configuration_is_durable": False,
             "artifact_directory": getattr(kernel, "mcp_artifact_directory", None),
+            "artifact_materialization": "sync or native async, after execution checkout; final returned blocks only",
             "limits": mcp_limits,
         },
         "limits": _kernel_limits(kernel),
@@ -256,7 +273,7 @@ def capability_report(
             "Use execute_file or %run for one flat virtual Python file.",
             "Use execute_module for a bounded static virtual module graph.",
             "Session snapshots do not contain virtual files or host functions.",
-            "Reset saved sessions after changes to resource limits or OS policy.",
+            "Recorded saved-policy changes return session_policy_changed; use restart=True or reset. Legacy policy is unknown until reset.",
             "Dynamic MCP server configuration lasts only while its hub is alive.",
             "One execution at a time is allowed for each session.",
         ],

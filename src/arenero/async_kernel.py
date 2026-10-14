@@ -23,21 +23,37 @@ from pydantic_monty import (
 )
 
 from .events import EventSink, emit_event
-from .filesystem import FilesystemConfig, build_filesystem_prelude, build_upload_source
+from .filesystem import (
+    FilesystemConfig,
+    FilesystemOperation,
+    FilesystemValue,
+    build_filesystem_call,
+    build_filesystem_prelude,
+    build_upload_source,
+)
 from .hosted_tools import HostedToolSet
 from .kernel import (
+    _SESSION_METADATA_SOURCE,
     ExecutionResult,
     InfrastructureErrors,
     KernelConfig,
+    SessionPolicyChanged,
     StatePolicy,
+    _check_session_policy,
     _ExecutionMetrics,
+    _file_read_source,
+    _inspection_result,
     _is_terminal_resource_error,
     _mount_list,
+    _policy_report,
     _prepare_execution_result,
+    _session_policy,
     _type_check_stubs,
     _validate_session_id,
+    _values_source,
     _variables_source,
 )
+from .mcp_artifacts import async_materialize_mcp_artifacts
 from .modules import VirtualModuleConfig, VirtualModuleResolver
 from .store import (
     ConcurrentSessionUpdate,
@@ -49,6 +65,7 @@ from .workspace import WorkspaceConfig
 
 if TYPE_CHECKING:
     from .mcp import McpHub
+    from .sandbox import FileDownloadResult, FileUploadResult
     from .session import AsyncSessionHandle
 
 
@@ -80,6 +97,7 @@ class AsyncPersistentMontyKernel:
         bootstrap_code: str | None = None,
         bootstrap_files: tuple[str, ...] = (),
         event_sink: EventSink | None = None,
+        mcp_artifact_directory: str | None = None,
     ) -> None:
         """Create a native asynchronous persistent kernel.
 
@@ -96,6 +114,7 @@ class AsyncPersistentMontyKernel:
             bootstrap_code: Trusted code run once when a new session starts.
             bootstrap_files: Virtual Python files run once for each new session.
             event_sink: Optional observer for safe execution and session metadata.
+            mcp_artifact_directory: Optional absolute virtual directory for final MCP binary blocks.
         """
         self.store = store if store is not None else InMemorySessionStore()
         self.config = config or KernelConfig()
@@ -108,7 +127,11 @@ class AsyncPersistentMontyKernel:
         self.bootstrap_code = bootstrap_code
         self.bootstrap_files = tuple(bootstrap_files)
         self.event_sink = event_sink
-        self.mcp_artifact_directory: str | None = None
+        self.mcp_artifact_directory = mcp_artifact_directory
+        if mcp_artifact_directory is not None and not mcp_artifact_directory.startswith(
+            "/"
+        ):
+            raise ValueError("mcp_artifact_directory must be an absolute virtual path")
         if any(not path.startswith("/") for path in self.bootstrap_files):
             raise ValueError("bootstrap file paths must be absolute virtual paths")
         if mcp_hub is not None:
@@ -381,6 +404,50 @@ class AsyncPersistentMontyKernel:
             Name-to-type mapping, excluding private names and configured tools.
             Missing, expired, or stateless sessions return an empty mapping.
         """
+        return await self._inspect_session(session_id, _variables_source(self)) or {}
+
+    async def inspect_values(
+        self, session_id: str, names: list[str], output_limit_chars: int | None = None
+    ) -> dict[str, Any]:
+        """Read selected saved values without callbacks, bootstrap, or state saves.
+
+        Args:
+            session_id: Session to inspect.
+            names: Up to 100 public identifiers, not expressions.
+            output_limit_chars: Optional aggregate JSON limit below the kernel cap.
+
+        Returns:
+            Copied values or a JSON preview, plus truncation and limit fields.
+        """
+        source = _values_source(self, names)
+        limit, capped = self._output_limit(output_limit_chars)
+        return _inspection_result(
+            await self._inspect_session(session_id, source) or {}, limit, capped
+        )
+
+    async def session_policy(self, session_id: str) -> dict[str, Any]:
+        """Compare recorded interpreter settings without changing the session.
+
+        Args:
+            session_id: Session to inspect.
+
+        Returns:
+            Saved/current policy and match, changed, unknown, or absent status.
+        """
+        return _policy_report(
+            await self._inspect_session(session_id, _SESSION_METADATA_SOURCE), self
+        )
+
+    async def _inspect_session(self, session_id: str, source: str) -> Any:
+        """Run trusted inspection source in a disposable saved snapshot.
+
+        Args:
+            session_id: Session whose last saved state is read.
+            source: Generated inspection source, never caller-supplied code.
+
+        Returns:
+            Raw result, or None when state is absent. No callbacks are attached.
+        """
         _validate_session_id(session_id)
         if self._closed:
             raise RuntimeError("the kernel is closed")
@@ -390,7 +457,7 @@ class AsyncPersistentMontyKernel:
             max_age_seconds=self.config.session_ttl_seconds,
         )
         if stored is None:
-            return {}
+            return None
         if stored.monty_version != self.monty_version:
             raise ValueError(
                 "the session uses another Monty version; reset it before inspection"
@@ -402,7 +469,111 @@ class AsyncPersistentMontyKernel:
             os_policy=self.config.os_policy,
         ) as session:
             await session.load_session(stored.state)
-            return await session.feed_run(_variables_source(self), skip_type_check=True)
+            return await session.feed_run(source, skip_type_check=True)
+
+    async def call_filesystem(
+        self,
+        session_id: str,
+        operation: FilesystemOperation,
+        arguments: Mapping[str, FilesystemValue],
+        output_limit_chars: int | None = None,
+    ) -> ExecutionResult:
+        """Call the existing bounded Monty file helper in a persistent session.
+
+        Args:
+            session_id: Bound session key.
+            operation: read, write, edit, mkdir, delete, ls, glob, or grep.
+            arguments: Plain helper keyword arguments.
+            output_limit_chars: Optional lower result limit.
+
+        Returns:
+            Normal execution result, including state and truncation fields.
+        """
+        result = await self.execute(
+            session_id, build_filesystem_call(operation, arguments), output_limit_chars
+        )
+        emit_event(
+            self.event_sink,
+            "filesystem",
+            "operation",
+            session_id=session_id,
+            operation=operation,
+            ok=result["ok"],
+        )
+        return result
+
+    async def delete_expired(self) -> int:
+        """Delete expired stored sessions without blocking the event loop.
+
+        Returns:
+            Deleted count, or zero when session expiry is disabled.
+        """
+        if self.config.session_ttl_seconds is None:
+            return 0
+        return await asyncio.to_thread(
+            self.store.delete_expired, self.config.session_ttl_seconds
+        )
+
+    async def upload_files(
+        self, files: list[tuple[str, bytes]]
+    ) -> list[FileUploadResult]:
+        """Upload ordered files and report each failure without stopping the batch.
+
+        Args:
+            files: Absolute virtual path and bytes pairs.
+
+        Returns:
+            One FileUploadResult per input. The batch is not transactional.
+        """
+        from .sandbox import FileUploadResult, SandboxErrors
+
+        results = []
+        for path, content in files:
+            try:
+                await self.upload_file(path, content)
+            except SandboxErrors as exc:
+                results.append(FileUploadResult(path=path, error=str(exc)))
+            else:
+                results.append(FileUploadResult(path=path))
+        return results
+
+    async def download_files(
+        self, paths: list[str], max_bytes: int | None = None
+    ) -> list[FileDownloadResult]:
+        """Download ordered files and report each failure without stopping the batch.
+
+        Args:
+            paths: Absolute virtual file paths.
+            max_bytes: Optional lower per-file transfer limit.
+
+        Returns:
+            One FileDownloadResult per path. Successful content remains bytes.
+        """
+        from .sandbox import FileDownloadResult, SandboxErrors
+
+        results = []
+        for path in paths:
+            try:
+                content = await self.download_file(path, max_bytes)
+            except SandboxErrors as exc:
+                results.append(FileDownloadResult(path=path, error=str(exc)))
+            else:
+                results.append(FileDownloadResult(path=path, content=content))
+        return results
+
+    async def materialize_mcp_artifacts(
+        self, value: Any, directory: str = "/mcp-artifacts"
+    ) -> tuple[Any, list[str]]:
+        """Save MCP binary blocks only outside an active execution checkout.
+
+        Args:
+            value: Normalized MCP result, or a value that contains one.
+            directory: Absolute virtual destination directory.
+
+        Returns:
+            Copied result with successful paths; failed blocks retain payloads.
+        """
+        return await async_materialize_mcp_artifacts(value, self.upload_file, directory)
 
     async def execute(
         self,
@@ -738,7 +909,7 @@ class AsyncPersistentMontyKernel:
         file_guard = self.filesystem_guard() if filesystem else _no_filesystem_guard()
         async with self._lock_for(session_id):
             async with file_guard:
-                result, payload = await self._execute_locked(
+                data = await self._execute_locked(
                     session_id,
                     code,
                     file_path,
@@ -753,6 +924,17 @@ class AsyncPersistentMontyKernel:
                     metrics,
                     output_file,
                 )
+            artifacts: list[str] = []
+            if (
+                filesystem
+                and self.mcp_artifact_directory is not None
+                and data["result"] is not None
+            ):
+                data["result"], artifacts = await self.materialize_mcp_artifacts(
+                    data["result"], self.mcp_artifact_directory
+                )
+            result, payload = _prepare_execution_result(**data)
+            result["mcp_artifacts"] = artifacts
             if payload is not None and output_file is not None:
                 try:
                     if not filesystem:
@@ -787,7 +969,7 @@ class AsyncPersistentMontyKernel:
         skip_type_check: bool,
         metrics: _ExecutionMetrics,
         output_file: str | None,
-    ) -> tuple[ExecutionResult, bytes | None]:
+    ) -> dict[str, Any]:
         """Execute while the session and optional file locks are held.
 
         Args:
@@ -806,7 +988,7 @@ class AsyncPersistentMontyKernel:
             output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
-            Public execution result and optional raw overflow payload.
+            Raw result fields for formatting after the checkout/file lock end.
         """
         if restart:
             existed = await asyncio.to_thread(self.store.delete, session_id)
@@ -916,6 +1098,17 @@ class AsyncPersistentMontyKernel:
                 ):
                     state = await session.dump()
                     metrics.state_after_bytes = len(state)
+        except SessionPolicyChanged as exc:
+            return self._result(
+                error_type="SessionPolicyChanged",
+                error_message=str(exc),
+                limit=limit,
+                limit_was_capped=limit_was_capped,
+                state_restored=restored,
+                revision=stored.revision if stored else None,
+                state_policy=state_policy,
+                output_file=output_file,
+            )
         except InfrastructureErrors as exc:
             if isinstance(exc, MontyCrashedError):
                 await asyncio.to_thread(self.store.delete, session_id)
@@ -1053,17 +1246,15 @@ class AsyncPersistentMontyKernel:
             filesystem: Allow configured mounts and virtual file callbacks.
             new_session: Whether no saved snapshot was loaded.
         """
+        metadata = (
+            {}
+            if new_session
+            else await session.feed_run(_SESSION_METADATA_SOURCE, skip_type_check=True)
+        )
+        _check_session_policy(metadata.get("policy"), self)
         if (
             new_session
-            or await self._feed(
-                session,
-                streams,
-                "locals().get('_arenero_fs_version')",
-                external_lookup,
-                filesystem=filesystem,
-                skip_type_check=True,
-            )
-            != self._filesystem_version
+            or metadata.get("filesystem_version") != self._filesystem_version
         ):
             await self._feed(
                 session,
@@ -1076,6 +1267,14 @@ class AsyncPersistentMontyKernel:
             )
         if not new_session:
             return
+        await self._feed(
+            session,
+            streams,
+            f"_arenero_session_policy = {_session_policy(self)!r}",
+            None,
+            skip_type_check=True,
+            filesystem=filesystem,
+        )
         if filesystem and self.default_working_directory != "/":
             await self._feed(
                 session,
@@ -1085,19 +1284,8 @@ class AsyncPersistentMontyKernel:
                 skip_type_check=True,
             )
         for path in self.bootstrap_files if filesystem else ():
-            source = await self._feed(
-                session,
-                streams,
-                f"open({json.dumps(path)}).read()",
-                external_lookup,
-                filesystem=filesystem,
-            )
-            await self._feed(
-                session,
-                streams,
-                source,
-                external_lookup,
-                filesystem=filesystem,
+            await self._run(
+                session, streams, None, path, external_lookup, None, filesystem
             )
         if self.bootstrap_code:
             await self._feed(
@@ -1141,10 +1329,10 @@ class AsyncPersistentMontyKernel:
                 inputs=inputs,
                 filesystem=filesystem,
             )
-        source = await self._feed(
+        path, source = await self._feed(
             session,
             streams,
-            f"open({json.dumps(file_path)}).read()",
+            _file_read_source(file_path),
             external_lookup,
             filesystem=filesystem,
             skip_type_check=True,
@@ -1154,7 +1342,7 @@ class AsyncPersistentMontyKernel:
             streams,
             source,
             external_lookup,
-            inputs=inputs,
+            inputs={**(inputs or {}), "__file__": path, "__name__": "__main__"},
             filesystem=filesystem,
         )
         if code is not None:
@@ -1335,12 +1523,14 @@ class AsyncPersistentMontyKernel:
             A structured failed execution result.
         """
         limit, limit_was_capped = self._output_limit(requested_limit)
-        result, _ = self._result(
-            error_type=error_type,
-            error_message=message,
-            limit=limit,
-            limit_was_capped=limit_was_capped,
-            state_policy=state_policy,
+        result, _ = _prepare_execution_result(
+            **self._result(
+                error_type=error_type,
+                error_message=message,
+                limit=limit,
+                limit_was_capped=limit_was_capped,
+                state_policy=state_policy,
+            )
         )
         return result
 
@@ -1359,8 +1549,8 @@ class AsyncPersistentMontyKernel:
         revision: int | None = None,
         state_policy: StatePolicy = "always",
         output_file: str | None = None,
-    ) -> tuple[ExecutionResult, bytes | None]:
-        """Build and trim one native async execution result.
+    ) -> dict[str, Any]:
+        """Defer result formatting until filesystem work can run outside its lock.
 
         Args:
             result: Value returned by the final Monty feed.
@@ -1377,22 +1567,23 @@ class AsyncPersistentMontyKernel:
             output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
-            Public execution result and optional raw overflow payload.
+            Raw keyword fields accepted by the shared result formatter.
         """
-        return _prepare_execution_result(
-            result=result,
-            streams=streams or CollectStreams(max_bytes=self.config.max_stream_bytes),
-            error_type=error_type,
-            error_message=error_message,
-            retryable=retryable,
-            limit=limit,
-            limit_was_capped=limit_was_capped,
-            state_saved=state_saved,
-            state_restored=state_restored,
-            revision=revision,
-            output_file=output_file,
-            state_policy=state_policy,
-        )
+        return {
+            "result": result,
+            "streams": streams
+            or CollectStreams(max_bytes=self.config.max_stream_bytes),
+            "error_type": error_type,
+            "error_message": error_message,
+            "retryable": retryable,
+            "limit": limit,
+            "limit_was_capped": limit_was_capped,
+            "state_saved": state_saved,
+            "state_restored": state_restored,
+            "revision": revision,
+            "output_file": output_file,
+            "state_policy": state_policy,
+        }
 
     def _finish_result(
         self,

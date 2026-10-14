@@ -168,9 +168,11 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   within the checkout and reset on restore.
 - Initial feed compilation is outside duration. Runtime `eval`/`exec`
   compilation counts. Keep compilation behind the worker boundary.
-- A restored dump supplies its resource limits except for the restoring
-  checkout's stricter suspension cap. Reset low-level sessions after changing
-  limits or OS policy; managed checkpoints also check the policy digest.
+- A restored 1.1.0 dump supplies its limits except for a stricter suspension cap.
+  Arenero records configured interpreter policy in new snapshots and refuses
+  known drift with `session_policy_changed`. Use `restart=True` or reset. Legacy
+  policy stays unknown until reset; the marker is not a security boundary.
+  Managed checkpoints check a broader policy digest.
 - Treat `MemoryError`, `TimeoutError`, and worker crashes as terminal for that session. Delete its saved state and start a fresh session. `RecursionError` is not terminal.
 - Keep one execution at a time per persistent session. Use an optimistic revision check as a second guard when state is shared across processes.
 - Use `state_policy="always"` to keep valid changes before normal errors,
@@ -204,8 +206,11 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   scope. This does not add unsupported submodules or APIs. The generated
   module feed skips Monty type checking.
   Explicit `from . import helper` siblings work within the same limits. Each
-  static loader binds its virtual `__file__` for asset reads; it is not an export
-  or a promise of general module metadata.
+  static loader and module object have virtual `__file__` and a filename/package
+  stem `__name__`. Bound exports include unpacking and compound blocks, not inner
+  function/class scope. Flat files use native inputs for absolute `__file__` and
+  script-style `__name__`; Python assignments to module metadata are read-only.
+  This is not general import metadata.
 - For an Arenero source package, keep `arenero-package.json` dependencies empty.
   Use `NAME/__init__.py` as `entry` and `verify.py` as `verify`. Write plain
   assertions in `verify.py`, then set public `passed = True`. Always test in the
@@ -223,20 +228,30 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   marker refreshes them after helper-source or `FilesystemConfig` changes.
   Reserve `fs_*` and `_arenero_*` names. Ordinary feeds still grow snapshot size.
 - Use `variables()` or `%who`/`%whos` for public names and type names only.
+  Use `inspect_values(names)` for up to 100 selected public names with an aggregate
+  output bound; trimmed mappings become JSON previews. No expressions or live
+  access are allowed. Use `session.policy()` for recorded settings.
   Inspection uses a disposable saved snapshot without bootstrap, callbacks, or
   state saves. It needs a free worker and must not re-enter its active parent.
   Keep inspection builtins such as `locals` and `type` unchanged.
 - Native async supports raw host upload/download, session listing, percent cells,
   and output-file offloading. Use `session.execute_cell()` or the native async
   LangChain REPL tool for percent commands; direct `execute()` remains Python.
-  Keep native async shell and automatic MCP artifact materialization unsupported.
+  Native async also has structured file calls, ordered batch transfers, expiry
+  cleanup, and explicit/automatic MCP artifact materialization. Keep the native
+  async shell unsupported.
   Write overflow only after the active checkout and async file lock end. The
   session lock stays held; failed writes do not undo Python state.
 - Arenero normalizes public results to Base64 bytes records, complex records,
   ISO date text, and copied Monty instance attributes. It does not preserve
-  methods or object identity, or decode those records on input. Native REPL
+  methods or identity, or decode input records automatically. Host `decode_value`
+  explicitly decodes exact bytes/complex tags only. Native REPL
   values and raw file downloads are unchanged.
 - Some familiar operations are eager. In particular, `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions materialize lists and can consume large memory.
+- Both kernels and managed Python calls accept `filesystem=False` to detach
+  direct files, skip file bootstrap/locking, and let separate IDs overlap.
+  Managed quota scans are skipped. Hosted tools keep their authority and cached
+  Python data remains; this option does not confine host tools.
 - Files have no live OS descriptor. Do not use file iteration. Use `read()`, `readline()`, or `readlines()`.
 - The file-iteration rule applies to `0.0.21` and `1.1.0`. Development `main`
   supports `for` and `next` on unread files; other consumers need the full-file

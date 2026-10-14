@@ -65,8 +65,8 @@ flowchart TD
     Limits --> Dependency["Build dependency-first module loader"]
     Dependency --> Namespace["Create isolated simple module object"]
     Keep --> Namespace
-    Namespace --> Exports["Copy public exports; __file__ stays local"]
-    Exports --> Followup["Run optional follow-up in the same Monty feed"]
+    Namespace --> Exports["Module path/name metadata; bound public exports"]
+    Exports --> Followup["Copy only bound exports; run same-call follow-up"]
     Followup --> Snapshot["Save normal persistent session snapshot"]
 ```
 
@@ -142,10 +142,44 @@ explicit names work; each counts toward the same graph limits. Parent levels
 still must remain inside allowed roots. There is no implicit parent-package
 execution, runtime module lookup, or import cache.
 
-Inside each static module, `__file__` is its absolute virtual source path. A
-function can keep that value in its closure and use `Path(__file__).parent` to
-read nearby assets. It is not copied to the REPL or exported on module objects.
-This rule is for `execute_module()`, not the flat `execute_file()` operation.
+Inside each static module, `__file__` is its absolute virtual source path.
+`__name__` is the filename stem, or the parent directory name for `__init__.py`.
+Both are also readable on the generated module object. A function keeps the
+file-local path in its closure and can use `Path(__file__).parent` for assets.
+Metadata is not copied into the REPL's public entry exports. The name is a small
+label, not a fully qualified import name; there is no `__package__`, `__spec__`,
+`__path__`, implicit parent package initialization, or import runtime.
+
+Flat `execute_file()` binds absolute `__file__` and `__name__="__main__"` through
+Monty's native `inputs` before the file feed. Source and follow-up remain checked
+when configured. Metadata overrides those two input keys and persists with flat
+REPL globals. A later flat file replaces it; flat helper functions use those
+shared globals. Static module functions keep their separate file-local closure.
+Monty makes module-level metadata read-only for Python assignments; the host
+uses the supported input-binding path instead of rewriting user source.
+
+### Compound exports
+
+Public assignments, tuple/list/starred unpacking, and definitions inside supported
+`if`, `for`, `while`, `try`, and `with` statements can be exports. Collection stops
+at function/class scopes. Generated code tests whether a name was actually bound
+before copying it. An unexecuted branch or an annotation-only name does not make
+loading fail. Comprehension-local and nested function/class-local names do not
+leak. The bundle's export metadata lists static candidates, not proof that every
+branch ran. Importing an unbound candidate still fails at runtime.
+
+```python
+A, B = (20, 22)
+if True:
+    TOTAL = A + B
+if False:
+    UNUSED = 0
+```
+
+The module exposes `A`, `B`, and `TOTAL`; it has no `UNUSED` attribute. Re-running
+a bundle does not delete old REPL bindings for candidates absent on the new run.
+Private names and `__all__` remain outside the export contract. Wildcard, nested
+virtual-file, and circular imports remain rejected.
 
 Both kernels accept `inputs=` and `output_file=` for module execution. Inputs
 bind once after bootstrap, before the generated bundle. Full bounded overflow

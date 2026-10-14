@@ -23,7 +23,7 @@ flowchart LR
     Cell -->|Sync shell cell| Shell["Virtual shell"]
     Shell --> Kernel
     Kernel --> Worker["Monty worker pool"]
-    Kernel <--> Store["Snapshot: Python state, directory, and installed helpers"]
+    Kernel <--> Store["Snapshot: Python state, directory, helpers, and interpreter policy"]
     Kernel <--> Files["Virtual files or persistent workspace"]
     Kernel --> MCP["Optional initial or hot-loaded MCP tools"]
     Kernel --> Hosted["Selected application and framework tools"]
@@ -31,7 +31,7 @@ flowchart LR
     Interface --> Packages["Monty source package workflow"]
     Packages --> Modules
     Packages --> Files
-    Kernel --> QoL["Capabilities, saved-name inspection, statistics, and bound sessions"]
+    Kernel --> QoL["Capabilities, bounded value/policy inspection, statistics, and bound sessions"]
     Kernel --> Result["Shared JSON result conversion"]
     Result --> Overflow["Optional bounded full JSON file"]
     Overflow --> Files
@@ -360,7 +360,7 @@ limits, and promotion rules.
 | Source packages | Build, check, test, and export dependency-free Monty source ZIP files, with opt-in binary files under `assets/`. | No wheels, sdists, installers, or third-party dependencies. |
 | Concurrent agents | Use separate IDs with the batch preset and one worker pool. | Shared filesystem work is serialized in one kernel. |
 | Bounded results | Limit output, save larger bounded output to a file, and inspect statistics. | Hard stream, result, state, and transfer caps still apply. |
-| Session inspection | Use `%who`, `%whos`, or `session.variables()` to read saved names and types. | No values or live interpreter handles; no state save or bootstrap. |
+| Session inspection | Use `%who`/`%whos` for names/types; `session.inspect_values(names)` for bounded copied values; `session.policy()` for saved settings. | Reads saved state, needs a free worker, and does not save state or expose a live interpreter. |
 
 ### Common workarounds
 
@@ -407,8 +407,10 @@ limits, and promotion rules.
   limit. There is no session-lifetime time budget. Time and memory failures
   discard Python state. Host work needs its own deadline.
 - Old Monty snapshots cannot be used after this upgrade. Reset them. Also reset
-  low-level sessions after changing resource limits or OS policy; a restored
-  1.1.0 dump keeps its saved settings, except for a stricter suspension cap.
+  sessions after changing interpreter limits, OS policy, or stable checking
+  declarations. Recorded policy drift returns `session_policy_changed` before
+  user code. Legacy snapshots report `unknown` until reset; native 1.1.0 restore
+  retains saved settings, except for a stricter suspension cap.
 - Hosted functions and MCP tools run outside Monty's isolation. Validate their
   inputs and keep secrets in trusted host code.
 
@@ -421,6 +423,40 @@ To include binary package assets, use
 `PackageConfig(allow_binary_assets=True)`. All `.py` files remain UTF-8 source.
 Assets count toward existing file, byte, revision, and ZIP limits. See the
 [source-package guide](docs/monty-source-packages.md#binary-assets).
+
+### Small host-side utilities
+
+The kernels and managed API reuse the same helpers:
+
+```python
+from arenero import decode_value, open_sandbox
+
+with open_sandbox() as sandbox:
+    sandbox.write("notes.txt", "Alpha\nALPHA\n")
+    matches = sandbox.grep("a.*a", regex=True, case_sensitive=False, limit=10)
+    sandbox.run_python("answer = 42\nblob = b'OK'", filesystem=False)
+    selected = sandbox.inspect_values(["answer", "blob"])
+    assert decode_value(selected.value)["blob"] == b"OK"
+    assert sandbox.session_policy().value["status"] == "match"
+```
+
+`filesystem=False` disables direct file access for that Python call and avoids
+the shared file lock and managed quota scans. Hosted tools keep their authority;
+this option does not isolate their side effects. Inspection does not run
+bootstrap or change state. Check truncation before decoding selected values.
+
+Flat files receive absolute `__file__` and `__name__="__main__"` through native
+inputs. Static module objects expose their own path and filename/package-stem
+name. Unpacking and supported compound statements export only names that were
+actually bound. This remains a bounded loader, not normal Python imports.
+
+Native async adds `call_filesystem()`, ordered `upload_files()`/`download_files()`,
+`delete_expired()`, and explicit/automatic MCP artifact materialization. The
+Deep Agents interpreter and module tools accept optional `output_file` without
+changing their names. These features do not add an async shell or package manager.
+Read [the utility guide](docs/quality-of-life.md),
+[static module rules](docs/virtual-modules.md), and
+[native async use](docs/managed-sandbox.md#async-applications).
 
 ## Terminal REPL
 

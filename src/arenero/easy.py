@@ -410,6 +410,7 @@ class ManagedSandbox:
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
         inputs: Mapping[str, Any] | None = None,
+        filesystem: bool = True,
     ) -> SandboxResult:
         """Run one Monty Python feed in this persistent session.
 
@@ -421,6 +422,7 @@ class ManagedSandbox:
             restart: Reset Python state before execution when true.
             hosted_tools: Optional operation-only host tools.
             inputs: Optional values bound before this user feed, after bootstrap.
+            filesystem: Allow direct files when true. False skips file bootstrap and workspace quota scans; trusted hosted tools keep their authority.
 
         Returns:
             Common managed sandbox result.
@@ -440,6 +442,7 @@ class ManagedSandbox:
                     restart=restart,
                     hosted_tools=hosted_tools,
                     inputs=inputs,
+                    filesystem=filesystem,
                 )
             except _MANAGED_ERRORS as exc:
                 return _failure(
@@ -449,7 +452,46 @@ class ManagedSandbox:
                 )
             return _from_execution(result)
 
-        return self._guard_workspace(operation)
+        return self._guard_workspace(operation) if filesystem else operation()
+
+    def inspect_values(
+        self, names: list[str], output_limit_chars: int | None = None
+    ) -> SandboxResult:
+        """Read bounded saved values without changing Python or files.
+
+        Args:
+            names: Up to 100 public identifiers, not expressions.
+            output_limit_chars: Optional aggregate JSON limit.
+
+        Returns:
+            Common result containing values or a JSON preview and truncation status.
+        """
+        try:
+            result = self.kernel.inspect_values(
+                self.session_id, names, output_limit_chars
+            )
+        except _MANAGED_ERRORS as exc:
+            return _failure(
+                "inspection_failed",
+                str(exc),
+                "Select public names from saved state; the inspection needs a free worker.",
+            )
+        return SandboxResult(True, result["values"], truncated=result["truncated"])
+
+    def session_policy(self) -> SandboxResult:
+        """Read the saved interpreter policy and reset guidance.
+
+        Returns:
+            Common result with saved/current policy and provenance status.
+        """
+        try:
+            return SandboxResult(True, self.kernel.session_policy(self.session_id))
+        except _MANAGED_ERRORS as exc:
+            return _failure(
+                "policy_inspection_failed",
+                str(exc),
+                "Check the Monty version and worker availability.",
+            )
 
     def run_shell(
         self,
@@ -1096,13 +1138,25 @@ class ManagedSandbox:
         value = result["result"]
         return SandboxResult(True, value["matches"], truncated=bool(value["truncated"]))
 
-    def grep(self, query: str, path: str = ".", pattern: str = "**/*") -> SandboxResult:
-        """Find literal text in bounded virtual UTF-8 files.
+    def grep(
+        self,
+        query: str,
+        path: str = ".",
+        pattern: str = "**/*",
+        *,
+        regex: bool = False,
+        case_sensitive: bool = True,
+        limit: int | None = None,
+    ) -> SandboxResult:
+        """Find bounded UTF-8 lines with the existing Monty grep helper.
 
         Args:
             query: Literal text to find.
             path: Relative or absolute search root.
             pattern: File-selection glob.
+            regex: Use Monty regular expressions when true; otherwise literal text.
+            case_sensitive: Match case when true.
+            limit: Optional result count below the configured maximum.
 
         Returns:
             Matching line records and truncation status.
@@ -1116,14 +1170,16 @@ class ManagedSandbox:
                     "query": query,
                     "root": self.resolve_path(path),
                     "pattern": pattern,
-                    "regex": False,
-                    "case_sensitive": True,
-                    "limit": None,
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                    "limit": limit,
                 },
             )
         except _MANAGED_ERRORS as exc:
             return _failure(
-                "grep_failed", str(exc), "Use literal text and a supported glob."
+                "grep_failed",
+                str(exc),
+                "Check the query, regex, root, and result limit.",
             )
         if not result["ok"]:
             return _from_error_mapping(result.get("error"), "grep_failed")

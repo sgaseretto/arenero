@@ -87,6 +87,7 @@ from .store import (
     SQLiteSessionStore,
     StatelessSessionStore,
 )
+from .values import decode_value
 from .workspace import WorkspaceConfig
 
 __all__ = [
@@ -162,6 +163,7 @@ __all__ = [
     "create_deepagents_middleware",
     "create_package_tools",
     "create_python_repl_tools",
+    "decode_value",
     "execute_repl_cell",
     "model_instructions",
     "open_async_sandbox",

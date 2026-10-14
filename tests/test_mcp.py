@@ -180,7 +180,8 @@ second["error"]["type"]
                 "thread", 'mcp_call("demo__add", {"a": 1, "b": 2})["ok"]'
             )
 
-        self.assertEqual(limited["result"], "McpCallTimeout")
+        # Scheduling can exhaust the budget before the second call starts.
+        self.assertIn(limited["result"], {"McpCallTimeout", "McpOperationTimeout"})
         self.assertIs(next_operation["result"], True)
 
     def test_search_is_capped_and_unknown_names_are_structured(self) -> None:

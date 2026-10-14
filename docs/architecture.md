@@ -149,6 +149,10 @@ sequenceDiagram
     K->>S: Load snapshot and revision
     alt Saved compatible state exists
         K->>M: Restore a fresh checkout
+        K->>M: Read recorded interpreter policy
+        break Recorded policy differs
+            K-->>C: session_policy_changed, keep saved state, require reset
+        end
         K->>M: Check helper version and refresh only if changed
     else New, expired, or stateless session
         K->>M: Create a fresh checkout
@@ -175,6 +179,10 @@ sequenceDiagram
         K->>K: Keep the previous snapshot
     end
     K->>M: Release execution checkout
+    opt Final result contains MCP binary blocks
+        K->>F: Materialize sync/async artifacts before output trimming
+        F-->>K: Paths or per-block artifact_error
+    end
     K->>K: Convert result to JSON data and trim public output
     opt Public output is trimmed and output_file is set
         K->>F: Write bounded full JSON after the execution checkout closes
@@ -190,6 +198,9 @@ feed. It does not perform a Python import.
 Inputs bind once after bootstrap, before the file source, not again for follow-up
 code. Direct code, static modules, and Python/`%run` cells use the same rule.
 Both kernels support full bounded output files for direct/file/module execution.
+Flat file inputs also bind the absolute `__file__` and script-style `__name__`.
+Static loaders expose their local metadata on module objects and copy only
+actually bound public names, including unpacking and supported compound blocks.
 
 `execute_module()` reads and parses a bounded static file graph on the host. It
 rewrites supported top-level imports into simple isolated module objects and runs
@@ -205,6 +216,11 @@ Filesystem helpers and their private source-version marker live in the snapshot.
 The next call reuses them unless the source or helper limits change. Bootstrap
 runs only for a new session. This removes repeated helper compilation without a
 live interpreter cache or another persistence format.
+The recorded interpreter policy lives in the same snapshot. New known policy
+changes require an explicit reset; legacy snapshots report unknown provenance.
+Selected value/policy inspection uses the existing disposable checkout path and
+saves nothing. Python-only `filesystem=False` operations retain the session
+lock but skip direct files and the shared file lock. See [utility boundaries](quality-of-life.md).
 
 `variables()` and the managed `cwd` property inspect a disposable copy of the
 last saved snapshot. They attach no files or host tools, run no bootstrap, and

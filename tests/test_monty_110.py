@@ -7,7 +7,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic_monty import MemoryFile, OSAccess
+from pydantic_monty import MemoryFile, Monty, MontyError, OSAccess
 
 from arenero import (
     AreneroSandbox,
@@ -265,28 +265,27 @@ class Monty110Tests(unittest.TestCase):
             self.assertEqual(later["result"], [7, 42, 42])
 
     def test_restoring_checkout_caps_suspensions_but_not_other_limits(self) -> None:
-        """Expose the released dump contract when host configuration changes."""
-        store = InMemorySessionStore()
-        with PersistentMontyKernel(
-            store,
-            config=KernelConfig(
-                max_suspensions=10, os_policy={"process_time": "elapsed"}
-            ),
-            external_lookup={"ping": lambda: 1},
-        ) as kernel:
-            kernel.execute("agent", "answer = 42")
-        config = KernelConfig(max_suspensions=1, max_feed_duration_seconds=0.001)
-        with PersistentMontyKernel(
-            store, config=config, external_lookup={"ping": lambda: 1}
-        ) as kernel:
-            # The dump still has the previous five-second feed limit.
-            result = kernel.execute(
-                "agent",
-                "import time\nwhile time.process_time() < 0.01:\n    pass\nanswer",
-            )
-            self.assertTrue(result["ok"], result["error"])
-            failed = kernel.execute("agent", "ping()\nping()")
-            self.assertEqual(failed["error"]["code"], "suspension_limit")
+        """Check native restore behavior separately from Arenero's policy guard."""
+        with Monty() as pool:
+            with pool.checkout(
+                limits={"max_feed_duration_secs": 5, "max_suspensions": 10},
+                os_policy={"process_time": "elapsed"},
+            ) as session:
+                session.feed_run("answer = 42")
+                state = session.dump()
+            with pool.checkout(
+                limits={"max_feed_duration_secs": 0.001, "max_suspensions": 1}
+            ) as session:
+                session.load_session(state)
+                result = session.feed_run(
+                    "import time\nwhile time.process_time() < 0.01:\n    pass\nanswer"
+                )
+                self.assertEqual(result, 42)
+                with self.assertRaises(MontyError) as failed:
+                    session.feed_run(
+                        "ping()\nping()", external_lookup={"ping": lambda: 1}
+                    )
+                self.assertIn("suspension limit", str(failed.exception).lower())
 
     def test_host_wait_is_outside_interpreter_duration(self) -> None:
         """Do not count a host callback's delay as interpreter work."""

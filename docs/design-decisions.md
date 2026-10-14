@@ -200,7 +200,8 @@ the existing `fs_*` helpers. This keeps one shell implementation and makes the
 smaller tool scope explicit. The native kernel reuses binary transfer source,
 store metadata, shared percent parsing/results, and JSON overflow preparation.
 It supports host upload/download, session listing, percent cells, and output-file
-offloading. It still omits the virtual shell and automatic MCP artifact materialization. It
+offloading, structured file calls, ordered batch transfers, expiry cleanup,
+and MCP artifact materialization. It still omits the virtual shell. It
 supports bound sessions, current-session info, forking, bootstrap, state policies,
 capability reports, statistics, and events. The full sync facade remains the one
 complete sandbox API.
@@ -214,7 +215,8 @@ flowchart TB
     Choice -->|No, batch Python| Native["AsyncPersistentMontyKernel"]
     Native --> Pool["Shared AsyncMonty worker pool"]
     Pool --> Sessions["Concurrent isolated session IDs"]
-    Native --> Utilities["Shared transfers, percent controls, and overflow JSON"]
+    Native --> Utilities["Shared files, transfers, inspection, percent controls, and JSON"]
+    Native --> Artifacts["Release checkout/file lock; save final MCP blocks before trimming"]
 ```
 
 ## Shared-file locking is process-local
@@ -225,6 +227,11 @@ lock for their full read-modify-write operation.
 
 The lock cannot coordinate two application processes. Applications that mount the
 same host directory in separate processes must supply external coordination.
+Both kernels accept `filesystem=False` for direct Python calls. They detach
+mounts/OS callbacks and skip file bootstrap/locking. Managed Python calls also
+skip workspace quota scans. Session ordering remains mandatory. This is an
+explicit host choice, not source inspection or a per-path scheduler. Hosted tools
+keep their authority and cached Python data is not removed.
 
 ## Monty compatibility is an exact tested version
 
@@ -268,10 +275,11 @@ assignments, infer types, or disable checking for inputs. Stable input names nee
 stubs when type checking is enabled. The outer agent tool schema stays unchanged.
 Native async and sync module tools gain only the optional overflow path.
 
-Native async result preparation returns the public fields and raw overflow bytes
-together. The outer operation writes bytes after the worker and file lock are
-released, while the session lock remains held. This reuses the existing formatter
-and transfer source without a second output format or a reentrant async lock.
+Native async defers result formatting until the worker and file lock are
+released, while the session lock remains held. It first materializes final MCP
+blocks through the shared decoder and async upload, then uses the common
+formatter once and writes any overflow. This preserves raw artifact data under
+tiny output caps without a second format or a reentrant async lock.
 Write errors stay separate from execution and state-save outcomes.
 
 One small result converter replaces separate kernel and managed conversion
@@ -290,8 +298,14 @@ unreleased `ExternalModule` APIs; their restore behavior needs a separate design
 
 Old snapshots require an explicit reset. No conversion is attempted. A released
 1.1.0 dump keeps its resource configuration, except for the current stricter
-suspension cap. Low-level callers must reset after policy changes. Managed
-checkpoint policy checks remain in place.
+suspension cap. New sessions record configured interpreter policy in a reserved
+snapshot global. Known drift returns `session_policy_changed` before bootstrap
+or user code; reset is explicit and old state is kept. Legacy snapshots remain
+usable with unknown provenance until reset. The record contains limits, OS
+policy, checking configuration and a declaration hash, not stub text, secrets,
+or live resources. Host-side caps remain changeable. This avoids a SQLite
+migration and custom-store API changes. Managed checkpoint checks stay broader.
+The marker is not a security barrier against code that edits its own globals.
 
 ## Control APIs stay outside Monty
 
@@ -405,8 +419,12 @@ already implements them in supported scopes. No lazy virtual loader or new
 import cache is needed. Unsupported standard APIs still fail at runtime.
 Explicit `from . import sibling` forms use the same dependency resolver, root
 checks, and generated module bindings. Each loader binds its virtual `__file__`
-so code can find nearby assets. We do not add implicit parent-package execution,
-module metadata exports, or runtime import resolution.
+so code can find nearby assets. Module objects expose `__file__` and a small
+filename/package-stem `__name__`, but not full import metadata. Flat file feeds
+bind metadata through native inputs because module-level Python assignments to
+these names are read-only. Export collection stops at function/class scopes and
+checks actual binding before copying names. This fixes unpacking and compound
+statements without an import runtime or implicit parent loading.
 
 ## Monty packages use one source-only format
 
