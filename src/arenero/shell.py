@@ -1893,7 +1893,7 @@ class VirtualShell:
 
         captured: dict[str, Any] = {}
 
-        def arenero_capture_shell_state(value: dict[str, Any], cwd: str) -> bool:
+        def _arenero_capture_shell_state(value: dict[str, Any], cwd: str) -> bool:
             """Copy internal shell state across the Monty host boundary.
 
             Args:
@@ -1913,13 +1913,13 @@ class VirtualShell:
             f"try:\n    {_STATE_NAME}\n"
             f"except NameError:\n    {_STATE_NAME} = "
             "{'variables': {}, 'oldpwd': _arenero_os.getcwd(), 'status': 0}\n"
-            f"arenero_capture_shell_state(value={_STATE_NAME}, cwd=_arenero_os.getcwd())"
+            f"_arenero_capture_shell_state(value={_STATE_NAME}, cwd=_arenero_os.getcwd())"
         )
         result = self.kernel.execute(
             self.session_id,
             code,
             self.kernel.config.max_output_limit_chars,
-            hosted_tools=HostedToolSet.from_callables([arenero_capture_shell_state]),
+            hosted_tools=HostedToolSet.from_callables([_arenero_capture_shell_state]),
         )
         if not result["ok"]:
             return ShellResult(_error_text(result), 1, _was_truncated(result))

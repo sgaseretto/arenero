@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, StatePolicy, _validate_session_id
@@ -37,6 +38,7 @@ class SessionHandle:
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute code in this bound session.
 
@@ -47,6 +49,7 @@ class SessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Optional host values bound before this user feed.
 
         Returns:
             Structured execution result.
@@ -59,6 +62,7 @@ class SessionHandle:
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
 
     def execute_file(
@@ -164,6 +168,14 @@ class SessionHandle:
             hosted_tools=hosted_tools,
         )
 
+    def variables(self) -> dict[str, str]:
+        """Read saved public names and types without saving or running startup.
+
+        Returns:
+            Name-to-type mapping, or an empty mapping when no state is saved.
+        """
+        return self.kernel.variables(self.session_id)
+
     def reset(self) -> bool:
         """Delete this session's saved Python state.
 
@@ -215,6 +227,7 @@ class AsyncSessionHandle:
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute code in this bound session.
 
@@ -224,6 +237,7 @@ class AsyncSessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Optional host values bound before this user feed.
 
         Returns:
             Structured execution result.
@@ -235,6 +249,7 @@ class AsyncSessionHandle:
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
 
     async def execute_file(
@@ -269,6 +284,14 @@ class AsyncSessionHandle:
             restart=restart,
             hosted_tools=hosted_tools,
         )
+
+    async def variables(self) -> dict[str, str]:
+        """Read saved public names and types without saving or running startup.
+
+        Returns:
+            Name-to-type mapping, or an empty mapping when no state is saved.
+        """
+        return await self.kernel.variables(self.session_id)
 
     async def reset(self) -> bool:
         """Delete this session's saved Python state.

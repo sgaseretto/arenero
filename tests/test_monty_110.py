@@ -76,7 +76,7 @@ class Monty110Tests(unittest.TestCase):
                 [1, 2],
                 [3],
             ],
-            "(1 + 2j) * (1 - 2j)": "(5+0j)",
+            "(1 + 2j) * (1 - 2j)": {"type": "complex", "real": 5.0, "imag": 0.0},
             "from dataclasses import dataclass\n@dataclass(frozen=True)\nclass Point:\n    x: int\nPoint(1) == Point(1)": True,
             "[type(value).__name__ for value in [map(str, [1]), (x for x in [1])]]": [
                 "list",

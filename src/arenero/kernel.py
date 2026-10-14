@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import re
@@ -9,7 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict, get_args
 
 from pydantic_monty import (
     CollectStreams,
@@ -45,6 +46,7 @@ from .store import (
     SessionInfo,
     SessionStore,
 )
+from .values import json_value as _json_value
 from .workspace import WorkspaceConfig
 
 if TYPE_CHECKING:
@@ -354,6 +356,9 @@ class PersistentMontyKernel:
             workspace.virtual_path if workspace is not None else "/"
         )
         self._filesystem_prelude = build_filesystem_prelude(self.filesystem_config)
+        self._filesystem_version = hashlib.sha256(
+            self._filesystem_prelude.encode()
+        ).hexdigest()
         host_stubs = self.config.type_check_stubs
         if mcp_hub is not None:
             host_stubs = "\n".join(
@@ -571,6 +576,65 @@ class PersistentMontyKernel:
             SessionInfo.from_stored(session_id, stored) if stored is not None else None
         )
 
+    def get_working_directory(self, session_id: str) -> str:
+        """Read the saved virtual directory without executing startup code.
+
+        Args:
+            session_id: Session to inspect.
+
+        Returns:
+            Last saved directory, or the configured initial directory.
+        """
+        return (
+            self._inspect_session(
+                session_id,
+                "import os as _arenero_inspect_os\n_arenero_inspect_os.getcwd()",
+            )
+            or self.default_working_directory
+        )
+
+    def variables(self, session_id: str) -> dict[str, str]:
+        """Inspect saved public names and types without bootstrap or a state save.
+
+        Args:
+            session_id: Session to inspect.
+
+        Returns:
+            Name-to-type mapping, excluding private names and configured tools.
+            An absent, expired, or stateless session returns an empty mapping.
+        """
+        return self._inspect_session(session_id, _variables_source(self)) or {}
+
+    def _inspect_session(self, session_id: str, code: str) -> Any:
+        """Read trusted metadata from a disposable copy of a saved session.
+
+        Args:
+            session_id: Session to read; no session is created when absent.
+            code: Trusted metadata source, not caller-supplied Python.
+
+        Returns:
+            Raw metadata, or None when no snapshot exists. No state is saved.
+        """
+        _validate_session_id(session_id)
+        if self._closed:
+            raise RuntimeError("the kernel is closed")
+        stored = self.store.load(
+            session_id, max_age_seconds=self.config.session_ttl_seconds
+        )
+        if stored is None:
+            return None
+        if stored.monty_version != self.monty_version:
+            raise ValueError(
+                "the session uses another Monty version; reset it before inspection"
+            )
+        with self._pool.checkout(
+            script_name=f"<arenero:inspect:{session_id}>",
+            limits=self.config.resource_limits(),
+            os_policy=self.config.os_policy,
+        ) as session:
+            session.load_session(stored.state)
+            return session.feed_run(code, skip_type_check=True)
+
     def execute(
         self,
         session_id: str,
@@ -581,6 +645,7 @@ class PersistentMontyKernel:
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute one code snippet in a persistent session.
 
@@ -592,6 +657,7 @@ class PersistentMontyKernel:
             state_policy: Save state ``always``, only on ``success``, or ``never``.
             restart: Reset state before this execution when true.
             hosted_tools: Optional tools available for this operation only.
+            inputs: Optional host values bound before this user feed, after bootstrap.
 
         Returns:
             A structured execution result.
@@ -605,6 +671,7 @@ class PersistentMontyKernel:
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
 
     def execute_file(
@@ -845,6 +912,7 @@ class PersistentMontyKernel:
         restart: bool,
         hosted_tools: HostedToolSet | None,
         skip_type_check: bool = False,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Run one measured kernel operation.
 
@@ -858,6 +926,7 @@ class PersistentMontyKernel:
             restart: Whether to reset state before this operation.
             hosted_tools: Optional operation-only hosted tools.
             skip_type_check: Disable checking for generated support code.
+            inputs: Optional values bound for the direct user feed.
 
         Returns:
             A structured execution result with stable statistics.
@@ -883,6 +952,7 @@ class PersistentMontyKernel:
             hosted_tools=hosted_tools,
             skip_type_check=skip_type_check,
             metrics=metrics,
+            inputs=inputs,
         )
         result["session_restarted"] = metrics.session_restarted
         result["host_calls"] = (
@@ -923,6 +993,7 @@ class PersistentMontyKernel:
         hosted_tools: HostedToolSet | None,
         skip_type_check: bool,
         metrics: _ExecutionMetrics,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Run feeds and save their final state once.
 
@@ -937,6 +1008,7 @@ class PersistentMontyKernel:
             hosted_tools: Optional operation-only hosted tools.
             skip_type_check: Disable checking for generated support code.
             metrics: Mutable execution statistics.
+            inputs: Optional values bound for the direct user feed.
 
         Returns:
             A structured execution result.
@@ -1046,7 +1118,7 @@ class PersistentMontyKernel:
                         )
                         phase = "execution"
                         result = self._run(
-                            session, streams, code, file_path, external_lookup
+                            session, streams, code, file_path, external_lookup, inputs
                         )
                     except InfrastructureErrors:
                         raise
@@ -1227,13 +1299,25 @@ class PersistentMontyKernel:
             external_lookup: Host functions for the operation.
             new_session: Whether no saved snapshot was loaded.
         """
-        self._feed(
-            session,
-            streams,
-            self._filesystem_prelude,
-            external_lookup,
-            skip_type_check=True,
-        )
+        if (
+            new_session
+            or self._feed(
+                session,
+                streams,
+                "locals().get('_arenero_fs_version')",
+                external_lookup,
+                skip_type_check=True,
+            )
+            != self._filesystem_version
+        ):
+            self._feed(
+                session,
+                streams,
+                self._filesystem_prelude
+                + f"\n_arenero_fs_version = {self._filesystem_version!r}",
+                external_lookup,
+                skip_type_check=True,
+            )
         if not new_session:
             return
         if self.default_working_directory != "/":
@@ -1262,6 +1346,7 @@ class PersistentMontyKernel:
         code: str | None,
         file_path: str | None,
         external_lookup: dict[str, Any] | None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> Any:
         """Run direct code or a virtual file followed by direct code.
 
@@ -1271,12 +1356,15 @@ class PersistentMontyKernel:
             code: Direct or follow-up code to execute.
             file_path: Optional virtual file to read and execute first.
             external_lookup: Host functions for this complete operation.
+            inputs: Optional values for a direct code feed.
 
         Returns:
             The value of the last feed that ran.
         """
         if file_path is None:
-            return self._feed(session, streams, code or "", external_lookup)
+            return self._feed(
+                session, streams, code or "", external_lookup, inputs=inputs
+            )
 
         source = self._feed(
             session,
@@ -1297,6 +1385,7 @@ class PersistentMontyKernel:
         external_lookup: dict[str, Any] | None,
         *,
         skip_type_check: bool = False,
+        inputs: Mapping[str, Any] | None = None,
     ) -> Any:
         """Run one feed with the kernel's host access settings.
 
@@ -1306,12 +1395,14 @@ class PersistentMontyKernel:
             code: Monty-compatible Python code to execute.
             external_lookup: Host functions for this complete operation.
             skip_type_check: Skip checking for trusted generated support code.
+            inputs: Optional host values bound before execution.
 
         Returns:
             The feed result.
         """
         return session.feed_run(
             code,
+            inputs=dict(inputs) if inputs is not None else None,
             external_lookup=external_lookup,
             print_callback=streams,
             mount=self.mounts,
@@ -1707,6 +1798,29 @@ def _prepare_execution_result(
     )
 
 
+def _variables_source(kernel: Any) -> str:
+    """Build the common read-only name inspection used by both kernels.
+
+    Args:
+        kernel: Kernel whose configured helper and tool names must be hidden.
+
+    Returns:
+        Monty source that returns public names and their type names, not values.
+    """
+    excluded = {
+        name for name, value in kernel.external_lookup.items() if callable(value)
+    }
+    excluded.update(tool.alias for tool in kernel._operation_hosted_tools(None).tools)
+    excluded.update(f"fs_{name}" for name in get_args(FilesystemOperation))
+    excluded.add("arenero_capture_shell_state")  # Alias in older snapshots.
+    if kernel.mcp_hub is not None:
+        excluded.update(kernel.mcp_hub.host_functions())
+    return (
+        "{name: type(value).__name__ for name, value in locals().items() "
+        f"if not name.startswith('_') and name not in {sorted(excluded)!r}}}"
+    )
+
+
 def _mount_list(mounts: MountDir | list[MountDir] | None) -> list[MountDir]:
     """Normalize optional user mounts to a new list.
 
@@ -1747,31 +1861,12 @@ def _safe_result(value: Any, limit: int) -> tuple[Any, bool]:
     """
     if value is None:
         return None, False
-
-    try:
-        serialized = json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return _trim(repr(value), limit)
+    value = _json_value(value)
+    serialized = json.dumps(value, ensure_ascii=False)
 
     if len(serialized) <= limit:
         return value, False
     return _trim(serialized, limit)
-
-
-def _json_value(value: Any) -> Any:
-    """Return a JSON-safe value for bounded output offloading.
-
-    Args:
-        value: Monty result value.
-
-    Returns:
-        Original JSON value or its representation.
-    """
-    try:
-        json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return repr(value)
-    return value
 
 
 def _result_length(value: Any) -> int:
@@ -1785,10 +1880,7 @@ def _result_length(value: Any) -> int:
     """
     if value is None:
         return 0
-    try:
-        return len(json.dumps(value, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return len(repr(value))
+    return len(json.dumps(_json_value(value), ensure_ascii=False))
 
 
 def _error_code(error_type: str, message: str) -> str:

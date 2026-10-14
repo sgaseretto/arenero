@@ -30,6 +30,7 @@ flowchart LR
     Dispatch --> Monty["Persistent Monty session"]
     Monty --> CWD["Native virtual directory"]
     Dispatch -->|"cd and pwd"| CWD
+    Managed["Managed cwd, chdir, and file tools"] --> CWD
     CWD -->|"relative paths"| VFS
     Dispatch --> HTTP["Bounded HTTP client"]
     VFS --> Result["Bounded text result"]
@@ -333,8 +334,11 @@ a bounded Monty-compatible virtual source package.
 
 Native `eval` and `exec` run Monty source, not CPython. Their strings bypass static
 checking. Python `os.chdir()` and shell `cd` change the same saved virtual
-directory; relative Python file reads use it. The host process directory is not
-changed. See [the migration and limit guide](monty-updates.md).
+directory; relative Python and managed file reads use it. Managed `run_shell()`
+starts there without inserting an extra `cd`. New file-enabled managed sessions
+start at their configured root; stateless calls return there for every call.
+The host process directory is not changed. See
+[the migration and limit guide](monty-updates.md).
 
 ## Examples that work
 

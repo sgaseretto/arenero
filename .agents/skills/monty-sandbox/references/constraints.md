@@ -38,6 +38,10 @@ reload, a module cache, dynamic imports, or third-party packages. Generated
 module feeds disable type checking because the simple objects need dynamic
 attributes.
 
+Arenero passes nested bundled-standard-module imports through in supported
+Monty scopes. Nested virtual-file imports and wildcard imports remain rejected.
+This does not enable unsupported submodules or class-body imports.
+
 Arenero can wrap this static graph in its own dependency-free source package
 format. The host checks the fixed JSON manifest and bounded UTF-8 files, then runs
 `verify.py` in a fresh Monty session. The file must export `passed = True` after
@@ -110,6 +114,9 @@ Type checking can resolve some stub-support modules that the runtime cannot impo
 ## Boundary values and host functions
 
 - `inputs` bind eagerly. `external_lookup` resolves lazily when a name is read. Callables become host functions only through `external_lookup`.
+- Monty's static checker needs input names in stubs; binding alone does not
+  declare them. Arenero forwards native inputs after bootstrap without type
+  inference or automatic checking bypass.
 - Sync `Monty` cannot drive coroutine host functions. Use `AsyncMonty` or manual suspension handling.
 - Payloads and dumps have a 256 MiB wire-frame limit. Export depth is bounded by
   the remaining recursion limit; deep values can become placeholder strings.
@@ -126,6 +133,12 @@ and optionally host class construction. Sandbox writes change its copy only.
 Host wrapper state does not survive dump/restore; method calls and lazy reads
 then fail unless reattached. This matters because Arenero restores before later
 operations. Host wrapper retention is outside `max_memory`.
+
+Arenero's public result converter emits Base64 bytes records, complex records,
+ISO date text, and Monty instance class/attribute records. This does not grant
+host-object access, preserve identity or methods, or decode inputs automatically.
+Raw file transfers still use bytes. Monty's deep/cyclic export placeholders
+remain possible.
 
 Most builtin methods are call-only: `items.append` cannot be kept as a callback.
 Synchronous nested interpreter callbacks such as sort keys, iterator predicates,
@@ -228,6 +241,12 @@ Monty can dump an idle session or a suspended mid-feed snapshot to opaque bytes.
 - Store the Monty version with every dump and reject or reset incompatible state.
 - Apply a comparable memory limit while restoring large dumps.
 - Files in host memory or host storage have a separate lifecycle from the interpreter dump unless the application stores them together.
+
+Arenero reuses filesystem helpers from idle dumps and checks a private source
+hash after restore. A changed helper source or helper limits refreshes them once.
+Read-only name/type and managed-directory inspection load a disposable dump,
+attach no host/file callbacks, and save nothing. They read the last commit, need
+a worker, and must not re-enter an active parent interpreter.
 
 Released `1.1.0` uses CBOR and an upstream dump-format version. Arenero still
 requires an exact package-version match. Do not infer that old `0.0.21` snapshots

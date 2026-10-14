@@ -360,20 +360,31 @@ class VirtualModuleResolver:
         )
 
     def _reject_nested_imports(self, tree: ast.Module) -> None:
-        """Reject imports that are not direct module statements.
+        """Allow nested bundled imports but reject nested virtual-file imports.
 
         Args:
             tree: Parsed Python module.
         """
 
         top_level = {id(statement) for statement in tree.body}
-        if any(
-            isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in top_level
-            for node in ast.walk(tree)
-        ):
-            raise VirtualModuleError(
-                "imports inside functions or blocks are not supported"
-            )
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, (ast.Import, ast.ImportFrom))
+                or id(node) in top_level
+            ):
+                continue
+            if any(alias.name == "*" for alias in node.names):
+                raise VirtualModuleError("wildcard imports are not supported")
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            else:
+                names = [] if node.level else [node.module or ""]
+            if not names or any(
+                name.split(".")[0] not in MONTY_STDLIB_MODULES for name in names
+            ):
+                raise VirtualModuleError(
+                    "virtual imports inside functions or blocks are not supported"
+                )
 
     def _public_names(
         self, body: list[ast.stmt], imported_names: list[str]

@@ -3,8 +3,10 @@ import shlex
 from dataclasses import asdict
 from typing import Any
 
+from pydantic_monty import MontyError
+
 from .hosted_tools import HostedToolSet
-from .kernel import PersistentMontyKernel, StatePolicy
+from .kernel import PersistentMontyKernel, StatePolicy, _safe_result, _trim
 from .shell import ShellResult, VirtualShell
 
 
@@ -117,7 +119,7 @@ def _magic_command(
             None,
             "Percent commands must use one line.",
             "invalid_repl_command",
-            "Use one of %run, %reset, %limits, %sessions, or %mcp.",
+            "Use %run, %reset, %limits, %sessions, %mcp, %who, or %whos.",
         )
     try:
         arguments = shlex.split(code[1:])
@@ -135,7 +137,7 @@ def _magic_command(
             None,
             "Missing percent command.",
             "invalid_repl_command",
-            "Use one of %run, %reset, %limits, %sessions, or %mcp.",
+            "Use %run, %reset, %limits, %sessions, %mcp, %who, or %whos.",
         )
     name, values = arguments[0], arguments[1:]
     if name == "run" and len(values) == 1:
@@ -161,6 +163,24 @@ def _magic_command(
     if name == "reset" and not values:
         existed = kernel.reset(session_id)
         return _command_result(True, {"reset": existed})
+    if name in {"who", "whos"} and not values:
+        try:
+            variables = kernel.variables(session_id)
+        except (MontyError, OSError, RuntimeError, ValueError) as exc:
+            return _command_result(
+                False,
+                None,
+                str(exc),
+                "session_inspection_failed",
+                "Check the session version and reset incompatible state.",
+            )
+        limit, capped = kernel._output_limit(output_limit_chars)
+        return _command_result(
+            True,
+            sorted(variables) if name == "who" else variables,
+            output_limit_chars=limit,
+            limit_was_capped=capped,
+        )
     if name == "limits" and not values:
         return _command_result(True, kernel.capabilities())
     if name == "sessions" and not values:
@@ -184,7 +204,7 @@ def _magic_command(
         None,
         f"Unsupported percent command or arguments: %{name}",
         "invalid_repl_command",
-        "Use %run FILE, %reset, %limits, %sessions, or %mcp.",
+        "Use %run FILE, %reset, %limits, %sessions, %mcp, %who, or %whos.",
     )
 
 
@@ -194,6 +214,9 @@ def _command_result(
     message: str | None = None,
     code: str = "repl_command_error",
     hint: str = "Check the command and try again.",
+    *,
+    output_limit_chars: int | None = None,
+    limit_was_capped: bool = False,
 ) -> dict[str, Any]:
     """Build one stable small REPL command result.
 
@@ -203,6 +226,8 @@ def _command_result(
         message: Optional error message.
         code: Stable error code.
         hint: Recovery guidance.
+        output_limit_chars: Optional bound for inspection results; None is untrimmed.
+        limit_was_capped: Whether the configured hard limit changed the request.
 
     Returns:
         Common REPL result fields.
@@ -210,6 +235,11 @@ def _command_result(
     output = "" if value is None else json.dumps(value, ensure_ascii=False)
     if message is not None:
         output = message
+    trimmed = False
+    if output_limit_chars is not None:
+        value, trimmed = _safe_result(value, output_limit_chars)
+        output, output_trimmed = _trim(output, output_limit_chars)
+        trimmed = trimmed or output_trimmed
     error = None
     if not ok:
         error = {
@@ -230,20 +260,20 @@ def _command_result(
         "error": error,
         "exit_code": 0 if ok else 1,
         "truncated": {
-            "result": False,
-            "stdout": False,
+            "result": trimmed,
+            "stdout": trimmed,
             "stderr": False,
             "error": False,
         },
         "truncation": {
-            "result": False,
-            "output": False,
-            "stdout": False,
+            "result": trimmed,
+            "output": trimmed,
+            "stdout": trimmed,
             "stderr": False,
             "error": False,
         },
-        "output_limit_chars": 0,
-        "limit_was_capped": False,
+        "output_limit_chars": output_limit_chars or 0,
+        "limit_was_capped": limit_was_capped,
         "state_saved": False,
         "state_restored": False,
         "session_revision": None,

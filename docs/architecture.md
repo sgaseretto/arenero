@@ -104,7 +104,7 @@ again.
 | Terminal REPL | `cli.py` | Parse CLI options, select a store, and run or administer a session. |
 | Cell dispatcher | `cell.py` | Route percent commands, normal Python, `!COMMAND`, and `%%shell` cells and return common result fields. |
 | Capability report | `capabilities.py` | Report active limits, commands, storage, network, MCP, bootstrap, and sync or async rules and generate model instructions. |
-| Bound session | `session.py` | Keep one trusted session ID with execute, file, reset, info, and fork operations. |
+| Bound session | `session.py` | Keep one trusted session ID with execute, inputs, file, read-only names, reset, info, and fork operations. |
 | Static virtual modules | `modules.py` | Resolve bounded top-level imports, build isolated module objects, and generate one Monty feed. |
 | Monty source packages | `packages.py` | Create the fixed dependency-free layout, check source and revisions, test in a fresh Monty session, and export a deterministic source ZIP. |
 | Runtime owner | `runtime.py` | Close a kernel and its optional MCP hub in dependency order. |
@@ -119,6 +119,7 @@ again.
 | Persistent async kernel | `async_kernel.py` | Run persistent Python, virtual `fs_*` helpers, file transfer for resolution, `execute_file`, and `execute_module` on native `AsyncMonty` workers. |
 | Session stores | `store.py` | Keep opaque snapshots in memory, SQLite, or nowhere. Apply revision checks and expiry. |
 | Filesystem helpers | `filesystem.py` | Implement bounded `read`, `write`, `edit`, `mkdir`, `delete`, `ls`, `glob`, and `grep`. |
+| Result conversion | `values.py` | Use one JSON representation for kernel output and managed results: Base64 bytes, complex records, ISO dates, and copied Monty instance attributes. |
 | Persistent workspace | `workspace.py` | Own one confined read-write host directory mount. |
 | Virtual shell | `shell.py` | Parse and dispatch the documented command allowlist without starting host processes. |
 | Network policy | `network.py` | Check URLs, addresses, methods, redirects, time, headers, and byte limits for virtual `curl`. |
@@ -143,16 +144,18 @@ sequenceDiagram
     participant T as Hosted tool guard
     participant H as Optional MCP hub
 
-    C->>K: execute(session_id, code, state_policy)
+    C->>K: execute(session_id, code, state_policy, inputs)
     K->>K: Lock the session
     K->>S: Load snapshot and revision
     alt Saved compatible state exists
         K->>M: Restore a fresh checkout
+        K->>M: Check helper version and refresh only if changed
     else New, expired, or stateless session
         K->>M: Create a fresh checkout
+        K->>M: Install helpers and set native directory
         K->>M: Feed configured bootstrap files and code
     end
-    K->>M: Feed user code
+    K->>M: Bind inputs and feed user code
     M->>F: Use only configured access
     F-->>M: Return bounded values
     opt Selected hosted tool call
@@ -171,6 +174,7 @@ sequenceDiagram
     else State policy blocks save
         K->>K: Keep the previous snapshot
     end
+    K->>K: Convert result to JSON data and trim public output
     K-->>C: Structured result, error guidance, and statistics
 ```
 
@@ -183,6 +187,18 @@ rewrites supported top-level imports into simple isolated module objects and run
 the complete generated source as one Monty feed. The generated feed is not type
 checked because its module objects need dynamic attributes. User source never
 executes in the host parser. See [Static virtual modules](virtual-modules.md).
+Nested imports of bundled standard modules stay in the generated source. Nested
+imports of virtual files still fail before execution.
+
+Filesystem helpers and their private source-version marker live in the snapshot.
+The next call reuses them unless the source or helper limits change. Bootstrap
+runs only for a new session. This removes repeated helper compilation without a
+live interpreter cache or another persistence format.
+
+`variables()` and the managed `cwd` property inspect a disposable copy of the
+last saved snapshot. They attach no files or host tools, run no bootstrap, and
+save nothing. They can observe the previous commit during an active feed. These
+APIs need a free worker; do not call them from the active interpreter itself.
 
 Normal code errors can leave useful changes. Arenero saves the valid state that
 exists after the error. A time limit, memory limit, or worker failure makes the
@@ -202,6 +218,7 @@ Python state and file state are intentionally separate:
 | --- | --- | --- |
 | Python globals, functions, classes, native directory, RNG, and resource configuration | Monty snapshot in the selected `SessionStore` | Follows memory, SQLite, or stateless mode. Feed time resets for each new feed. |
 | Virtual shell variables, previous directory, and last status | Reserved values in the Monty session | Follow the Python session. `PWD` uses Monty's native directory. |
+| Filesystem helper definitions and source-version marker | Monty snapshot | Reuse after restore; refresh once when generated helper source changes. |
 | `OSAccess` memory files | The caller-owned `OSAccess` object | Lives while that object lives. It is not in SQLite. |
 | `WorkspaceConfig` files | Dedicated host directory through `MountDir` | Survives process restarts. It is not in SQLite. |
 | Caller-supplied mounts | Caller-owned `MountDir` objects | Follows the selected mount mode and host directory. |
@@ -216,7 +233,12 @@ flowchart LR
     SessionID["session_id"] --> Snapshot["Monty snapshot"]
     Snapshot --> PythonState["Python values and functions"]
     Snapshot --> ShellState["Shell variables, PWD, OLDPWD, and status"]
-    Snapshot --> Config["Resource settings, native directory, and RNG"]
+    Snapshot --> Config["Resource settings and RNG"]
+    Snapshot --> Helpers["Filesystem helpers and source marker"]
+    Snapshot --> Directory["One native virtual directory"]
+    Directory --> PythonPaths["Python relative files"]
+    Directory --> ShellPaths["Shell cd and relative files"]
+    Directory --> ManagedPaths["Managed cwd and relative file tools"]
     Feed["New code feed"] --> Budget["Fresh interpreter-time budget"]
 
     FileConfig["Filesystem configuration"] --> MemoryFiles["OSAccess memory files"]

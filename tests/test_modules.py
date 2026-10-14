@@ -46,7 +46,7 @@ class VirtualModuleResolverTests(unittest.TestCase):
         """Reject graphs that the minimal resolver cannot represent safely."""
 
         cycle = {"/a.py": "from b import value\n", "/b.py": "from a import value\n"}
-        nested = {"/a.py": "def load():\n    import json\n"}
+        nested = {"/a.py": "def load():\n    import helper\n"}
         count = {"/a.py": "from b import value\n", "/b.py": "value = 1\n"}
 
         with self.assertRaisesRegex(VirtualModuleError, "circular"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import json
 import time
@@ -35,6 +36,7 @@ from .kernel import (
     _prepare_execution_result,
     _type_check_stubs,
     _validate_session_id,
+    _variables_source,
 )
 from .modules import VirtualModuleConfig, VirtualModuleResolver
 from .store import (
@@ -132,6 +134,9 @@ class AsyncPersistentMontyKernel:
             workspace.virtual_path if workspace is not None else "/"
         )
         self._filesystem_prelude = build_filesystem_prelude(self.filesystem_config)
+        self._filesystem_version = hashlib.sha256(
+            self._filesystem_prelude.encode()
+        ).hexdigest()
         host_stubs = self.config.type_check_stubs
         if mcp_hub is not None:
             host_stubs = "\n".join(
@@ -316,6 +321,39 @@ class AsyncPersistentMontyKernel:
             state_size_bytes=len(source.state),
         )
         return info
+
+    async def variables(self, session_id: str) -> dict[str, str]:
+        """Read saved public names and types without running bootstrap or saving.
+
+        Args:
+            session_id: Session to inspect.
+
+        Returns:
+            Name-to-type mapping, excluding private names and configured tools.
+            Missing, expired, or stateless sessions return an empty mapping.
+        """
+        _validate_session_id(session_id)
+        if self._closed:
+            raise RuntimeError("the kernel is closed")
+        stored = await asyncio.to_thread(
+            self.store.load,
+            session_id,
+            max_age_seconds=self.config.session_ttl_seconds,
+        )
+        if stored is None:
+            return {}
+        if stored.monty_version != self.monty_version:
+            raise ValueError(
+                "the session uses another Monty version; reset it before inspection"
+            )
+        await self.open()
+        async with self._require_pool().checkout(
+            script_name=f"<arenero:inspect:{session_id}>",
+            limits=self.config.resource_limits(),
+            os_policy=self.config.os_policy,
+        ) as session:
+            await session.load_session(stored.state)
+            return await session.feed_run(_variables_source(self), skip_type_check=True)
 
     async def execute(
         self,
@@ -875,14 +913,27 @@ class AsyncPersistentMontyKernel:
             filesystem: Allow configured mounts and virtual file callbacks.
             new_session: Whether no saved snapshot was loaded.
         """
-        await self._feed(
-            session,
-            streams,
-            self._filesystem_prelude,
-            external_lookup,
-            filesystem=filesystem,
-            skip_type_check=True,
-        )
+        if (
+            new_session
+            or await self._feed(
+                session,
+                streams,
+                "locals().get('_arenero_fs_version')",
+                external_lookup,
+                filesystem=filesystem,
+                skip_type_check=True,
+            )
+            != self._filesystem_version
+        ):
+            await self._feed(
+                session,
+                streams,
+                self._filesystem_prelude
+                + f"\n_arenero_fs_version = {self._filesystem_version!r}",
+                external_lookup,
+                filesystem=filesystem,
+                skip_type_check=True,
+            )
         if not new_session:
             return
         if filesystem and self.default_working_directory != "/":

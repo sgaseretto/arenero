@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import builtins
 import hashlib
 import io
@@ -36,6 +35,7 @@ from .store import (
     SQLiteSessionStore,
     StatelessSessionStore,
 )
+from .values import json_value as _json_value
 from .workspace import WorkspaceConfig
 
 PersistenceMode = Literal["stateless", "memory", "durable"]
@@ -308,10 +308,18 @@ class ManagedSandbox:
         self.session_id = sandbox_id
         self.config = config
         self.root = config.workspace_root
-        self.cwd = self.root
         self._owns_runtime = owns_runtime
         self._closed = False
         self._ensure_root()
+
+    @property
+    def cwd(self) -> str:
+        """Read the last saved Monty directory shared by all sandbox APIs.
+
+        Returns:
+            Native virtual directory, or the configured root for a new session.
+        """
+        return self.kernel.get_working_directory(self.session_id)
 
     @property
     def id(self) -> str:
@@ -378,18 +386,16 @@ class ManagedSandbox:
 
         try:
             resolved = self.resolve_path(path)
-            listed = self.kernel.call_filesystem(
+            changed = self.kernel.execute(
                 self.session_id,
-                "ls",
-                {"path": resolved, "recursive": False, "limit": 1},
+                f"import os as _arenero_os\n_arenero_os.chdir({resolved!r})",
             )
         except _MANAGED_ERRORS as exc:
             return _failure(
                 "invalid_path", str(exc), "Choose a directory in the workspace."
             )
-        if not listed["ok"]:
-            return _from_error_mapping(listed.get("error"), "directory_not_found")
-        self.cwd = resolved
+        if not changed["ok"]:
+            return _from_error_mapping(changed.get("error"), "directory_not_found")
         return SandboxResult(True, resolved)
 
     def run_python(
@@ -401,6 +407,7 @@ class ManagedSandbox:
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxResult:
         """Run one Monty Python feed in this persistent session.
 
@@ -411,6 +418,7 @@ class ManagedSandbox:
             state_policy: Python state save policy.
             restart: Reset Python state before execution when true.
             hosted_tools: Optional operation-only host tools.
+            inputs: Optional values bound before this user feed, after bootstrap.
 
         Returns:
             Common managed sandbox result.
@@ -429,6 +437,7 @@ class ManagedSandbox:
                     state_policy=state_policy,
                     restart=restart,
                     hosted_tools=hosted_tools,
+                    inputs=inputs,
                 )
             except _MANAGED_ERRORS as exc:
                 return _failure(
@@ -463,9 +472,8 @@ class ManagedSandbox:
 
             try:
                 overflow = self.resolve_path(output_file) if output_file else None
-                prefixed = f"cd {shlex.quote(self.cwd)} && {command}"
                 result = VirtualShell(self.kernel, self.session_id).execute(
-                    prefixed,
+                    command,
                     output_limit_chars,
                     output_file=overflow,
                 )
@@ -1411,8 +1419,6 @@ class ManagedSandbox:
                             None,
                         )
                     raise
-            cwd = metadata.get("cwd", self.root)
-            self.cwd = self.resolve_path(cwd)
         except (
             KeyError,
             MontyError,
@@ -1461,7 +1467,6 @@ class ManagedSandbox:
             self.config,
             owns_runtime=False,
         )
-        child.cwd = self.cwd
         return SandboxResult(True, child, stats={"session": asdict(info)})
 
     def info(self) -> SandboxResult:
@@ -1601,24 +1606,13 @@ class ManagedSandbox:
         )
 
     def _ensure_root(self) -> None:
-        """Create the managed virtual root through a temporary session."""
+        """Create the virtual root without running bootstrap or saving state."""
 
         if self.config.filesystem == "none":
             return
-        temporary = (
-            f"_arenero_setup_{hashlib.sha256(self.id.encode()).hexdigest()[:16]}"
+        self.kernel._run_isolated(
+            f"from pathlib import Path\nPath({self.root!r}).mkdir(parents=True, exist_ok=True)"
         )
-        try:
-            result = self.kernel.call_filesystem(
-                temporary,
-                "mkdir",
-                {"path": self.root, "parents": True, "exist_ok": True},
-            )
-            if not result["ok"]:
-                error = _error_info(result.get("error"), "workspace_setup_failed")
-                raise RuntimeError(error.message)
-        finally:
-            self.kernel.reset(temporary)
 
     def _capture_files(self, *, root: str | None = None) -> dict[str, bytes]:
         """Read a bounded virtual tree for quota and checkpoint operations.
@@ -1633,19 +1627,11 @@ class ManagedSandbox:
         source_root = root or self.root
         if self.config.filesystem == "none":
             return {}
-        result = self.kernel.call_filesystem(
-            self.session_id,
-            "ls",
-            {
-                "path": source_root,
-                "recursive": True,
-                "limit": self.config.filesystem_limits.max_scan_entries,
-            },
+        value = self.kernel._run_isolated(
+            self.kernel._filesystem_prelude
+            + f"\nfs_ls({source_root!r}, recursive=True, "
+            + f"limit={self.config.filesystem_limits.max_scan_entries})"
         )
-        if not result["ok"]:
-            error = _error_info(result.get("error"), "workspace_read_failed")
-            raise ValueError(error.message)
-        value = result["result"]
         if value["truncated"]:
             raise ValueError("workspace exceeds the filesystem scan limit")
         files: dict[str, bytes] = {}
@@ -2317,6 +2303,8 @@ def _build_runtime(
         mcp_artifact_directory=config.mcp_artifact_directory,
         **kernel_options,
     )
+    if config.filesystem != "none":
+        kernel.default_working_directory = config.workspace_root
     return AreneroRuntime(kernel)
 
 
@@ -2354,7 +2342,7 @@ def _from_execution(result: Mapping[str, Any]) -> SandboxResult:
             exit_code=0,
             truncated=truncated,
             artifacts=artifacts,
-            stats=result.get("stats", {}),
+            stats=result.get("stats") or {},
         )
     return SandboxResult(
         False,
@@ -2365,7 +2353,7 @@ def _from_execution(result: Mapping[str, Any]) -> SandboxResult:
         error=_error_info(error, "python_execution_failed"),
         truncated=truncated,
         artifacts=artifacts,
-        stats=result.get("stats", {}),
+        stats=result.get("stats") or {},
     )
 
 
@@ -2473,38 +2461,6 @@ def _validate_id(sandbox_id: str) -> None:
         raise ValueError(
             "sandbox_id must contain 1 to 128 letters, digits, dots, underscores, or hyphens"
         )
-
-
-def _json_value(value: Any) -> Any:
-    """Convert supported result values to JSON-compatible data.
-
-    Args:
-        value: Result value to convert.
-
-    Returns:
-        JSON-compatible data. Bytes use an explicit Base64 record.
-    """
-
-    if isinstance(value, bytes):
-        return {
-            "encoding": "base64",
-            "content": base64.b64encode(value).decode("ascii"),
-        }
-    if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_value(item) for item in value]
-    if isinstance(value, SandboxError):
-        return asdict(value)
-    if hasattr(value, "__dataclass_fields__"):
-        return _json_value(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if value is None or isinstance(value, (bool, float, int, str)):
-        return value
-    return repr(value)
 
 
 def _policy_value(value: Any) -> Any:

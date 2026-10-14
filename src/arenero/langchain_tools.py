@@ -35,6 +35,9 @@ strings bypass static checking. compile(), globals(), __import__(), normal file
 imports, and third-party packages are unavailable. Python os.chdir() and shell
 cd share one virtual directory. Interpreter time is bounded per code feed, not
 over the session lifetime; host waits need separate deadlines.
+Use %who or %whos to inspect saved public names and types without changing state.
+Bytes and complex numbers use explicit records in results. Monty instances return
+their class name and copied attributes, not callable objects.
 
 """
     + VIRTUAL_SHELL_TOOL_DESCRIPTION
@@ -54,6 +57,8 @@ Native eval(), exec(), and locals() run Monty source, not CPython, and runtime
 strings bypass static checking. Normal file imports, compile(), globals(), and
 __import__() are unavailable. Use os.getcwd()/os.chdir() for virtual relative
 paths. Interpreter duration is per feed; host waits need separate deadlines.
+Percent commands are not supported by this native async tool. Bytes, complex
+values, dates, and Monty instances use the shared JSON result formats.
 """
 
 VIRTUAL_MODULE_TOOL_DESCRIPTION = """Resolve and run a limited static Python
@@ -61,7 +66,8 @@ module graph from the shared virtual filesystem. This is not CPython importlib.
 It supports absolute or relative top-level imports of .py files, package entry
 files named __init__.py, normal Monty standard-library imports, and optional
 follow-up code in the same call. Public entry names remain in the persistent REPL.
-It rejects wildcard imports, imports inside functions or control-flow blocks,
+Nested bundled-standard-module imports are allowed wherever Monty accepts them.
+It rejects wildcard imports and virtual-file imports inside functions or blocks,
 circular imports, dynamic imports, site-packages, native extensions, and paths
 outside configured virtual roots. The default limits are 32 files, depth 8, and
 1,000,000 combined UTF-8 source bytes. Generated module support code is not type

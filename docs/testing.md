@@ -24,6 +24,14 @@ snapshot rejection, and sync/async parity. It uses real Monty workers and no LLM
 The full suite also tests mocked LangGraph agents, MCP reload, source packages,
 RLM recursion, speculative calls, cancellation, and checkpoints on this version.
 
+`tests/test_runtime_simplifications.py` checks helper reuse and refresh, native
+inputs and typed declarations, read-only name/type inspection, one directory
+across Python/shell/managed files, reset/fork/checkpoint/durable directory state,
+small output limits, shared JSON formats, nested standard-module imports and
+rejected nested virtual imports, and native async parity. Its complete mocked
+LangChain graph spans two human turns and reuses supplied values, a saved helper,
+and a directory. Inspection must not change snapshot bytes or revisions.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -69,6 +77,12 @@ Run the managed sandbox tests only:
 
 ```console
 uv run python -m unittest tests.test_easy -v
+```
+
+Run the six runtime-change checks only:
+
+```console
+uv run --frozen python -m unittest tests.test_runtime_simplifications -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

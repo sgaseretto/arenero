@@ -207,7 +207,8 @@ class AreneroInterpreterMiddleware(
                 "imports do not. Use the module tool for small static virtual-file "
                 "imports. It supports top-level import statements, .py files, "
                 "packages through __init__.py, and relative imports. It rejects "
-                "wildcards, nested imports, cycles, and third-party packages. "
+                "wildcards, nested virtual-file imports, cycles, and third-party packages. "
+                "Nested bundled-standard-module imports are allowed. "
                 "Virtual files are separate from Python snapshots."
             ),
             self.kernel.instructions(),

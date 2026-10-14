@@ -355,10 +355,11 @@ double(21)
 ```
 
 Shell `pwd` in that session now reports `/data`; shell `cd` also changes relative
-Python file access. `ManagedSandbox.cwd` is still the separate base for its
-relative host-side file tools. A managed `run_shell` starts at that base. Use
-absolute virtual paths when mixing managed path changes with direct Python
-directory changes. This is not host filesystem access.
+Python file access. Managed file tools use the same saved directory.
+`ManagedSandbox.cwd` is read-only, and `sandbox.chdir()` changes Monty's directory
+instead of a second host-side base. New file-enabled managed sessions start at
+their root before bootstrap. Stateless calls return to that initial root each
+time. This is not host filesystem access.
 
 ## Upgrade existing sessions
 
@@ -383,9 +384,19 @@ require a reset; there is no cross-version state conversion.
 
 The dependency change needs one shared limit builder, policy forwarding, native
 directory use, and three additions to the resolver's built-in module list.
-Native language and library features require no new wrappers. Complex or other
-non-JSON outputs keep the existing bounded text representation. Print buffers
-still use the existing byte-limited collector.
+Native language and library features require no new runtime wrappers. A single
+small output converter now keeps bytes, complex values, dates, and returned
+Monty instance attributes as JSON data instead of flattening the whole result
+to text. Print buffers still use the existing byte-limited collector.
+
+The next six small changes reuse native features: filesystem helpers are
+installed once and checked by a saved source marker; managed paths use native
+directory state; results share the converter; `variables()` and `%who`/`%whos`
+inspect disposable snapshots; sync `execute()` accepts native `inputs=`; and the
+static resolver keeps nested bundled-standard-module imports unchanged.
+Input names still need stubs in typed sessions. Inspection returns names and
+types only. Nested virtual-file imports remain rejected. See
+[quality-of-life APIs](quality-of-life.md) and [static modules](virtual-modules.md).
 
 The static resolver, filesystem helpers, source-package workflow, RLM, speculation,
 stores, and fixed agent tool schemas remain in place. We do not add a remote

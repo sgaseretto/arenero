@@ -35,6 +35,10 @@ flowchart LR
     Factory --> Handle["ManagedSandbox"]
     Handle --> Session["Bound session ID"]
     Handle --> Root["Confined relative workspace root"]
+    Store --> Directory["Saved native directory"]
+    Directory --> Python["Python os.chdir and relative files"]
+    Directory --> Shell["Shell cd and relative files"]
+    Directory --> Root
     Handle --> Result["Common SandboxResult"]
     Handle --> Runtime
 ```
@@ -118,21 +122,25 @@ The fields are:
 - a stable `SandboxError` with `code`, `message`, `hint`, and `retryable`;
 - `truncated`, virtual `artifacts`, and operation or execution `stats`.
 
-Call `to_dict()` at an agent boundary. It returns JSON-compatible data. Binary
-values become this explicit record:
+Call `to_dict()` at an agent boundary. It uses the same JSON converter as kernel
+output. Binary values become this explicit record:
 
 ```json
 {"encoding": "base64", "content": "..."}
 ```
 
-The Python API keeps the original bytes in `result.value`. It does not force
-application code to decode Base64.
+`run_python()` values are already normalized by the kernel: bytes use Base64
+records, complex values use `{"type": "complex", "real": 1.0, "imag": 2.0}`,
+dates use ISO text, and Monty instances use copied attributes without methods.
+File methods such as `read(path, encoding=None)` keep raw bytes in `result.value`;
+only `to_dict()` encodes those bytes. See
+[result handling](usage-and-capabilities.md#result-handling) for the full contract.
 
 ## Explicit execution methods
 
 | Method | Purpose |
 | --- | --- |
-| `run_python(code)` | Run one Monty feed and reuse bound Python state. |
+| `run_python(code, inputs=None)` | Bind plain host values and run one Monty feed with bound Python state. |
 | `run_shell(command)` | Run the allowlisted virtual shell in the current directory. |
 | `run_cell(code)` | Dispatch Python, `!command`, `%%shell`, or a supported `%` command. |
 | `run_file(path, code=None)` | Run one virtual Python file and optional follow-up code. |
@@ -143,8 +151,12 @@ It cannot start processes, call arbitrary binaries, run Git, install packages,
 or run full Bash scripts. It can run the documented straight-line virtual shell
 files with `source`. See [Virtual shell reference](virtual-shell.md).
 
-`run_cell()` supports `%run FILE`, `%reset`, `%limits`, `%sessions`, and `%mcp`.
+`run_cell()` supports `%run FILE`, `%reset`, `%limits`, `%sessions`, `%mcp`,
+`%who`, and `%whos`.
 Managed `%run` resolves relative paths from the current directory.
+Inspection commands return saved names or name/type mappings without a state
+save. `inputs=` is available on `run_python()`, not `run_cell()` or the agent tool
+schema. With type checking, declare input names in the configured stubs.
 
 ## Relative files and revisions
 
@@ -164,6 +176,30 @@ sandbox.edit(
     expected_revision=current.stats["revision"],
 )
 ```
+
+There is one native directory, not a separate handle-level path base.
+`sandbox.chdir()`, Python `os.chdir()`, and shell `cd` change that directory.
+`sandbox.cwd` is a read-only property that reads the last saved directory without
+model output trimming. `run_shell()` does not insert a hidden `cd` command.
+
+New file-enabled managed sessions start at `sandbox.root`, before bootstrap.
+`filesystem="none"` starts at `/`. State policies also apply to the directory:
+`never` and a failed `success` operation do not save its changes. Forks and
+checkpoints copy the saved directory; reset returns new calls to the initial
+root. Stateless calls always start at that root, so a separate `chdir()` call
+does not carry into the next call. Use absolute paths or change directory and do
+the work in one Python/shell call in that mode.
+
+Managed file paths remain confined below `sandbox.root`. Direct Python and shell
+operations can reach any other configured virtual paths. If Python moves
+outside the managed root, relative managed file methods reject that path. Use an
+absolute managed path or `sandbox.chdir(sandbox.root)` to return. No change
+affects the host process directory.
+
+Earlier same-version managed snapshots can still contain `/` because the old
+handle-level path base was not saved in Monty. Call
+`sandbox.chdir(sandbox.root)` once if needed. Checkpoint `cwd` metadata is an
+informational copy; the restored Monty snapshot is now the authority.
 
 The complete high-level file surface is:
 
@@ -214,6 +250,10 @@ Important limits:
 - Capturing a tree is intentionally bounded by `max_scan_entries`,
   `max_workspace_files`, `max_workspace_bytes`, depth, and transfer limits.
 - Large workspaces make pre- and post-execution quota checks more expensive.
+
+Setup and quota scans use short isolated file checkouts. They do not run session
+bootstrap, save session state, or use trimmed model output. Lowering an output
+limit cannot hide files from a quota check.
 
 Use a dedicated workspace directory for each independent trust domain.
 

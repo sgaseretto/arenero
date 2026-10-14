@@ -248,8 +248,8 @@ These patterns do not work:
 - PyPI packages, wheels, standard sdists, `pip`, or virtual environments;
 - `pyproject.toml`, `setup.py`, or build backend execution;
 - `pytest`, host test runners, Git hooks, compilers, or native extensions;
-- dynamic imports, wildcard imports, imports inside a function, circular imports,
-  namespace packages, import hooks, reload, or `sys.path` changes;
+- dynamic imports, wildcard imports, virtual-file imports inside a function,
+  circular imports, namespace packages, import hooks, reload, or `sys.path` changes;
 - CPython-only syntax, built-ins, standard-library APIs, or object behavior;
 - binary package resources;
 - filesystem paths outside the configured package root;

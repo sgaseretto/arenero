@@ -72,7 +72,9 @@ flowchart TD
 | Virtual shell | Fixed file and text commands, persistent variables, bounded globs, here documents, straight-line source files, conditional lists, Monty Python, and bounded `curl` | No operating-system process or full Bash grammar. |
 | Persistence | Memory, SQLite, or stateless snapshots selected by `session_id` | Files have a separate lifecycle. Snapshots are Monty-version-specific. |
 | Agent tools | Full sync tools, or a small native async Python, file, module, and reset set | LangChain is optional and the runtime thread selects the session. |
-| Static virtual modules | Top-level absolute and relative imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested, cyclic, or third-party imports. Generated feeds skip type checking. |
+| Static virtual modules | Top-level virtual imports, nested bundled standard imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested virtual-file, cyclic, or third-party imports. Generated feeds skip type checking. |
+| Session names | `variables()`, `%who`, and `%whos` | Public names and type names from saved state only; no values or live debugger. |
+| Host inputs | `execute(..., inputs={...})` and managed `run_python(..., inputs={...})` | Monty-supported values; typed input names need stable stubs. |
 | Deep Agents middleware | Async interpreter, dynamic catalog, PTC, subagent task bridge, three state modes, and private checkpoint snapshots | Nested calls bypass the parent ToolNode and its per-tool approvals. |
 | Recursive model calls | External context, plain calls, child RLM sessions, ordered batches, shared depth, call, token, cost, and time limits | Child sessions need free workers and use hosted file tools instead of direct kernel mounts. |
 | Speculative programmatic calls | Stream planning, safe static argument resolution, forked Monty shadows, result claims, fallback, cleanup, events, and statistics | Off by default. Only explicit non-sequential tools can run early. External effects are not transactional. |
@@ -170,6 +172,26 @@ with PersistentMontyKernel() as kernel:
 
 This works across separate human turns while the kernel or its in-memory store
 remains active. Use SQLite when the process can restart.
+
+### Supply data and inspect saved names
+
+```python
+with PersistentMontyKernel() as kernel:
+    session = kernel.session("conversation-42")
+    assert session.execute("sum(values)", inputs={"values": [20, 22]})["result"] == 42
+    assert session.variables() == {"values": "list"}
+    assert session.execute_cell("%who")["result"] == ["values"]
+    assert session.execute("sum(values)")["result"] == 42
+```
+
+Inputs are native host value bindings, not interpolated Python source. They bind
+after bootstrap and follow `state_policy`. With type checking enabled, declare
+input names in `type_check_stubs`; Monty does not infer those declarations.
+`variables()` and `%whos` return public name/type mappings. They read the latest
+saved snapshot without bootstrap or a state save. Missing or stateless sessions
+have no saved names. Inspection hides private and configured helper/tool names,
+but it is not a secret filter or a live debugger. See
+[quality-of-life APIs](quality-of-life.md).
 
 ### Transform plain data
 
@@ -691,6 +713,39 @@ use output. They must check truncation before they treat output as complete.
 An error marked `retryable` can be corrected by the caller. A terminal resource
 failure resets the saved session. A normal code error can preserve changes made
 before the error.
+
+### JSON value formats
+
+Kernel results, overflow JSON, and managed `to_dict()` use one converter.
+Conversion happens before result trimming and original-length measurement.
+
+| Monty or host value | Public representation |
+| --- | --- |
+| `None`, boolean, number, string | The same value. |
+| `bytes` | `{"encoding": "base64", "content": "T0s="}` for `b"OK"`. |
+| `1 + 2j` | `{"type": "complex", "real": 1.0, "imag": 2.0}`. |
+| Date, datetime, time | ISO 8601 text. |
+| Monty class instance | `{"type": "monty_instance", "class": "Record", "attributes": {...}, "is_dataclass": false}`. |
+| Mapping | Object with string keys and recursively converted values. |
+| Tuple, list, set, frozen set | List of recursively converted values. |
+| Host dataclass instance | Recursively converted field mapping. |
+| Path | Path text. |
+| Other unsupported value | Text representation. |
+
+```python
+with PersistentMontyKernel() as kernel:
+    result = kernel.execute("agent", "{'blob': b'OK', 'number': 1+2j}")
+    assert result["result"]["blob"] == {"encoding": "base64", "content": "T0s="}
+    assert result["result"]["number"]["imag"] == 2.0
+```
+
+Monty instance attributes are copies, not live objects. Methods, identity, and
+cyclic references do not round-trip. Monty can replace cyclic or deep values
+with text placeholders before the host receives them. Stringifying mapping keys
+can merge different keys with the same text; set order is not guaranteed. There
+is no automatic input decoder for these records. Native values inside the REPL
+are unchanged. Raw `kernel.download_file()` and managed `read(encoding=None)`
+still return bytes to the host; managed `to_dict()` then encodes those bytes.
 
 Use `kernel.capabilities()` to get exact active commands, limits, persistence,
 network, MCP, bootstrap, and sync or async rules. Use `kernel.instructions()` to

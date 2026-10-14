@@ -245,6 +245,30 @@ callback, so output trimming cannot damage internal directory data. This removes
 the duplicate directory global and one shell setup execution. New mounted
 workspace sessions enter their virtual root before bootstrap.
 
+Managed handles use the same directory from the snapshot. `cwd` is read-only;
+managed `chdir` performs native `os.chdir`. Shell calls need no hidden prefix.
+Setup and quota scans use isolated raw file checkouts, not model-output-trimmed
+session calls. This avoids extra bootstrap work and prevents small output limits
+from corrupting internal metadata.
+
+We install the large generated filesystem prelude once, then save a hash of its
+source in a private session marker. Restore checks the marker with native
+`locals()` and refreshes only when source or helper limits changed. No new cache,
+store field, or live interpreter owner is needed. Regular feeds still allocate
+compilation data, so helper reuse does not make session size constant.
+
+The sync kernel forwards `inputs=` just as the async kernel already did. Bound
+handles and managed `run_python` forward the same mapping. We do not generate
+assignments, infer types, or disable checking for inputs. Stable input names need
+stubs when type checking is enabled. The outer agent tool schema stays unchanged.
+
+One small result converter replaces separate kernel and managed conversion
+rules. Bytes use Base64 records, complex values use real/imaginary records,
+dates use ISO text, and Monty instances use copied attributes and a class name.
+This is a result format, not live host-object support or a round-trip serializer.
+Conversion happens before result trimming, length statistics, and offload. Raw
+file transfers remain bytes.
+
 Native `eval`, `exec`, Base64, copying, random, time, formatting, and complex
 numbers need no extra wrapper. The static resolver passes the new built-in
 modules through. We keep `execute_file` and the resolver because native exec does
@@ -264,6 +288,12 @@ doctor checks, runtime ownership, event delivery, and artifact materialization
 are host control features. They are not new Monty language features. The cell
 dispatcher handles percent commands before a feed. Artifact materialization runs
 after a checkout ends, so it does not re-enter the active persistent session.
+
+Name/type and managed-directory inspection load a disposable saved snapshot.
+They run small trusted metadata feeds without bootstrap, file access, or host
+tools, then discard the copy. They do not save or change a revision. This keeps
+inspection read-only without adding a Monty protocol extension. It reads the
+last commit, not an in-progress namespace, and needs a free worker.
 
 The event sink receives metadata only and cannot change an operation result. A
 failed observer call is ignored. This keeps logging and audit integration small
@@ -353,10 +383,14 @@ their file-local closure values instead of sharing one flat global namespace.
 
 This design adds useful helper modules without placing CPython execution in the
 sandbox or writing an import runtime in Monty. The tradeoff is an explicit small
-feature set: no wildcard or nested imports, reload, namespace packages, third-
-party packages, or type checking of the generated feed. File reads remain under
+feature set: no wildcard or nested virtual-file imports, reload, namespace
+packages, third-party packages, or type checking of the generated feed. File reads remain under
 the existing filesystem transfer limit, plus module count, depth, source-byte,
 root, and cycle checks.
+
+Nested imports of bundled standard modules are passed through because Monty
+already implements them in supported scopes. No lazy virtual loader or new
+import cache is needed. Unsupported standard APIs still fail at runtime.
 
 ## Monty packages use one source-only format
 

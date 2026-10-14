@@ -23,7 +23,7 @@ flowchart LR
     Cell -->|Shell cell| Shell["Virtual shell"]
     Shell --> Kernel
     Kernel --> Worker["Monty worker pool"]
-    Kernel <--> Store["Memory, SQLite, or stateless session store"]
+    Kernel <--> Store["Snapshot: Python state, directory, and installed helpers"]
     Kernel <--> Files["Virtual files or persistent workspace"]
     Kernel --> MCP["Optional initial or hot-loaded MCP tools"]
     Kernel --> Hosted["Selected application and framework tools"]
@@ -31,7 +31,9 @@ flowchart LR
     Interface --> Packages["Monty source package workflow"]
     Packages --> Modules
     Packages --> Files
-    Kernel --> QoL["Capabilities, events, statistics, and bound sessions"]
+    Kernel --> QoL["Capabilities, saved-name inspection, statistics, and bound sessions"]
+    Kernel --> Result["Shared JSON result conversion"]
+    Result --> Interface
     Interface --> RLM["Recursive model runner"]
     RLM --> Kernel
     RLM --> Model["Configured async model adapter"]
@@ -69,7 +71,7 @@ arbitrary executables, or a real shell.
 
 - [Monty updates and migration notes](docs/monty-updates.md) records the reviewed
   release versions, new features, remaining limits, and reproducible runtime
-  evidence. Arenero's dependency has not yet been upgraded.
+  evidence for the pinned Monty `1.1.0` release.
 - [Architecture and components](docs/architecture.md) explains each layer,
   execution flow, state ownership, locks, security boundaries, and extension
   points.
@@ -146,10 +148,26 @@ config = SandboxConfig.conversation(
 )
 
 with open_sandbox("agent-1", config=config) as sandbox:
-    sandbox.run_python("values = [2, 4, 8]")
+    sandbox.run_python("sum(values)", inputs={"values": [2, 4, 8]})
     assert sandbox.run_python("sum(values)").value == 14
+    assert sandbox.run_cell("%whos").value == {"values": "list"}
     sandbox.write("result.txt", "14")
 ```
+
+`inputs=` binds ordinary host values without building Python source strings.
+Values follow the selected state-save policy. With `type_check=True`, declare
+input names in `KernelConfig.type_check_stubs`. The host API supports inputs;
+the model-facing tool schema stays unchanged.
+
+Python `os.chdir()`, shell `cd`, `sandbox.chdir()`, and managed relative file
+tools use one saved virtual directory. `sandbox.cwd` reads it; do not assign to
+it. New file-enabled managed sessions start at `sandbox.root`. Stateless calls
+start there each time.
+
+Python results use JSON records for bytes and complex values, ISO text for dates,
+and copied class attributes for Monty instances. They do not return live instance
+methods. Raw file downloads still return bytes. See
+[result handling](docs/usage-and-capabilities.md#result-handling) for the formats.
 
 Use `SandboxConfig.ephemeral()` for stateless Python, `durable(directory)` for
 SQLite state and mounted files across restarts, or `batch(workers=N)` with
@@ -336,6 +354,7 @@ limits, and promotion rules.
 | Source packages | Build, check, test, and export dependency-free Monty source ZIP files. | No wheels, sdists, installers, or third-party dependencies. |
 | Concurrent agents | Use separate IDs with the batch preset and one worker pool. | Shared filesystem work is serialized in one kernel. |
 | Bounded results | Limit output, save larger bounded output to a file, and inspect statistics. | Hard stream, result, state, and transfer caps still apply. |
+| Session inspection | Use `%who`, `%whos`, or `session.variables()` to read saved names and types. | No values or live interpreter handles; no state save or bootstrap. |
 
 ### Common workarounds
 
@@ -359,6 +378,8 @@ limits, and promotion rules.
   `exec()` use Monty's subset and limits; their source bypasses type checking.
 - A virtual `.py` file cannot be imported in the normal CPython way. Use
   `run_file()` for one file or `run_module()` for a bounded static file graph.
+  Nested bundled standard-module imports are allowed where Monty accepts them;
+  nested virtual-file imports, wildcards, and cycles are rejected.
 - The virtual shell has a fixed command and flag set. It supports persistent
   virtual variables, bounded wildcard expansion, and straight-line `source`
   files. It does not support Git, arbitrary programs, full Bash control flow,
@@ -372,6 +393,8 @@ limits, and promotion rules.
   live MCP connections must be attached again after a process restart.
 - One session accepts one execution at a time. Use different stable session IDs
   and enough workers for concurrent agents.
+  Name and directory inspection read the last saved snapshot, not an active
+  feed. Do not call these APIs from a host function in that active interpreter.
 - Sessions in one managed runtime can share configured files and MCP servers.
   Use separate runtimes for isolation.
 - Interpreter duration is limited per code feed, with an optional per-turn
@@ -941,7 +964,7 @@ directory; it does not store file content inside SQLite.
 
 ### Filesystem helpers and agent tools
 
-Arenero loads these bounded helper functions into every REPL session:
+Arenero installs these bounded helper functions once in each new REPL session:
 
 - `fs_read(path, offset=0, limit=None)`
 - `fs_write(path, content, append=False, create_parents=False)`
@@ -966,6 +989,10 @@ with PersistentMontyKernel(mounts=mount) as kernel:
         "fs_grep('gamma', root='/workspace', case_sensitive=False)",
     )
 ```
+
+Saved sessions reuse the helper definitions. A private source marker triggers one
+refresh when generated helper source or helper limits change. Reserve `fs_*` and
+`_arenero_*` names; do not overwrite the helpers or marker.
 
 The LangChain and LangGraph file tools call these same helpers through the kernel.
 The runtime thread ID selects the Python session, but files remain shared when the

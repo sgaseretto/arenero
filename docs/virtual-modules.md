@@ -56,9 +56,10 @@ Agents middleware exposes it as `python_interpreter_module`.
 flowchart TD
     Entry["Absolute entry .py path"] --> Read["Read bounded UTF-8 source"]
     Read --> Parse["Parse with host Python AST"]
-    Parse --> Imports{"Top-level import"}
+    Parse --> Imports{"Import kind"}
     Imports -->|Monty standard library| Keep["Keep normal import"]
-    Imports -->|Virtual module| Resolve["Resolve .py or __init__.py"]
+    Imports -->|Top-level virtual module| Resolve["Resolve .py or __init__.py"]
+    Imports -->|Nested virtual module or wildcard| Reject["Reject before execution"]
     Resolve --> Limits["Check root, count, depth, bytes, and cycles"]
     Limits --> Dependency["Build dependency-first module loader"]
     Dependency --> Namespace["Create isolated simple module object"]
@@ -90,6 +91,21 @@ from .helper import calculate
 from package.values import VALUE
 from pathlib import Path
 ```
+
+Bundled standard-module imports also work inside functions or supported blocks:
+
+```python
+def distance(x, y):
+    import math
+    from functools import reduce
+
+    return math.sqrt(reduce(lambda a, b: a + b, [x * x, y * y]))
+```
+
+These imports stay unchanged for Monty to run. They do not load virtual files.
+Monty's syntax and partial module APIs still apply: passing a bundled root name
+does not make an unsupported submodule such as `os.path` available in 1.1.0.
+Imports in a class body remain unsupported by Monty.
 
 Packages resolve through `package/__init__.py`. Absolute virtual names search
 configured roots. Relative imports start at the importing file. A configured
@@ -132,7 +148,7 @@ The filesystem transfer limit is also enforced on each file.
 The resolver rejects:
 
 - `from module import *`;
-- imports inside functions, classes, `if`, loops, or other blocks;
+- virtual-file imports inside functions, classes, `if`, loops, or other blocks;
 - circular module graphs;
 - `from . import helper`;
 - a dotted `import package.helper` without an `as` name;
@@ -144,6 +160,17 @@ The resolver rejects:
 
 Only Monty's documented partial standard-library modules remain normal imports.
 A module name that is not in that set is treated as a virtual module.
+For example, this still fails, even if `/helper.py` exists:
+
+```python
+def run():
+    from helper import calculate  # Nested virtual import: rejected.
+
+    return calculate()
+```
+
+Move that virtual import to the file's top level. Keep standard imports nested
+only where Monty accepts the scope.
 
 Generated support code uses dynamic attributes on a simple Monty class. Arenero
 therefore disables Monty type checking for the complete generated module feed.

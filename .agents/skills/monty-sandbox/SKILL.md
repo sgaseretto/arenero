@@ -80,6 +80,10 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   `NetworkConfig` to narrow URL prefixes and methods or to disable curl. Keep
   non-global address blocking, redirect checks, and hard byte limits.
 - Put ordinary input values in `inputs`. Put tools and lazy values in `external_lookup`.
+  Both kernels and bound handles support direct-feed inputs; managed callers use
+  `run_python(inputs=...)`. In typed sessions declare stable input names in
+  `type_check_stubs`; native binding does not infer declarations or validate
+  values against stubs.
 - A callable in `external_lookup` runs in the host process with full host authority. Validate every argument as untrusted input.
 - Use `HostedToolSet` when tools need generated signatures, selection, per-operation
   call limits, sequencing, value conversion, and a bounded `host_calls` ledger.
@@ -189,7 +193,9 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
 - In Arenero, use `execute_module()` only for a small static virtual graph. It is
   host-side AST rewriting, not a new Monty import system. It supports top-level
   `.py` and `__init__.py` imports, relative imports, roots, and aliases. It rejects
-  dynamic, wildcard, nested, circular, and third-party imports. The generated
+  dynamic, wildcard, nested virtual-file, circular, and third-party imports.
+  Nested bundled-standard-module imports pass through where Monty accepts the
+  scope. This does not add unsupported submodules or APIs. The generated
   module feed skips Monty type checking.
 - For an Arenero source package, keep `arenero-package.json` dependencies empty.
   Use `NAME/__init__.py` as `entry` and `verify.py` as `verify`. Write plain
@@ -200,8 +206,21 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
 - Generator functions, `match`, `del`, `async with`, `async for`, exception groups,
   and wildcard imports do not run. Complex literals and values do work.
 - Python `os.getcwd()` and `os.chdir()` share the persistent virtual directory
-  with the shell. New mounted workspace sessions start in that workspace before
-  bootstrap. No host process directory is changed.
+  with the shell and managed relative files. `ManagedSandbox.cwd` reads saved
+  native state; change it through `chdir()`, not assignment. New file-enabled
+  managed sessions start at their root before bootstrap. Stateless calls start
+  there each time. No host process directory is changed.
+- Filesystem helpers are installed once and reused from the saved dump. A source
+  marker refreshes them after helper-source or `FilesystemConfig` changes.
+  Reserve `fs_*` and `_arenero_*` names. Ordinary feeds still grow snapshot size.
+- Use `variables()` or sync `%who`/`%whos` for public names and type names only.
+  Inspection uses a disposable saved snapshot without bootstrap, callbacks, or
+  state saves. It needs a free worker and must not re-enter its active parent.
+  Keep inspection builtins such as `locals` and `type` unchanged.
+- Arenero normalizes public results to Base64 bytes records, complex records,
+  ISO date text, and copied Monty instance attributes. It does not preserve
+  methods or object identity, or decode those records on input. Native REPL
+  values and raw file downloads are unchanged.
 - Some familiar operations are eager. In particular, `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions materialize lists and can consume large memory.
 - Files have no live OS descriptor. Do not use file iteration. Use `read()`, `readline()`, or `readlines()`.
 - The file-iteration rule applies to `0.0.21` and `1.1.0`. Development `main`

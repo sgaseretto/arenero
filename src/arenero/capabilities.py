@@ -71,6 +71,15 @@ def capability_report(
             "mode": "native-async" if is_async else "sync",
             "normal_cpython": False,
             "native_dynamic_execution": ["eval", "exec", "locals"],
+            "direct_feed_inputs": True,
+            "input_type_checking": "declare stable input names in type_check_stubs",
+            "result_encodings": {
+                "bytes": "Base64 record",
+                "complex": "type, real, imag record",
+                "date_and_time": "ISO 8601 text",
+                "monty_instance": "class and copied attributes; no methods or identity",
+            },
+            "session_inspection": "host variables() reads saved public names and types only",
             "stdlib_modules": sorted(MONTY_STDLIB_MODULES),
             "virtual_cwd_shared_with_shell": not is_async,
             "os_policy": _os_policy_report(kernel),
@@ -110,6 +119,7 @@ def capability_report(
                 "grep",
             ],
             "limits": asdict(kernel.filesystem_config),
+            "helpers_installation": "once per session; refresh on source or helper-limit change",
         },
         "virtual_modules": {
             "enabled": filesystem_enabled,
@@ -118,6 +128,7 @@ def capability_report(
             "default_limits": asdict(VirtualModuleConfig()),
             "supports": [
                 "top-level imports",
+                "nested imports of bundled standard modules",
                 ".py files",
                 "__init__.py packages",
                 "relative imports",
@@ -127,7 +138,7 @@ def capability_report(
             "does_not_support": [
                 "dynamic imports",
                 "wildcard imports",
-                "nested imports",
+                "nested virtual-file imports",
                 "circular imports",
                 "site-packages",
                 "native extensions",
@@ -213,7 +224,7 @@ def capability_report(
             "runs_for_new_sessions_only": True,
         },
         "repl_commands": (
-            ["%run FILE", "%reset", "%limits", "%sessions", "%mcp"]
+            ["%run FILE", "%reset", "%limits", "%sessions", "%mcp", "%who", "%whos"]
             if not is_async
             else []
         ),

@@ -13,7 +13,9 @@ flowchart LR
     Runtime --> Kernel["Persistent kernel"]
     Runtime --> Hub["Optional MCP hub"]
     Kernel --> Handle["Bound SessionHandle"]
-    Handle --> Execute["Execute, execute file, reset, info, fork"]
+    Handle --> Execute["Execute with inputs, execute file, reset, info, fork"]
+    Handle --> Inspect["Saved names and types; no state save"]
+    Inspect --> Store
     Kernel --> Report["Capabilities and model instructions"]
     Kernel --> Events["Optional event sink"]
     Kernel --> Hosted["Hosted tool catalog and call ledger"]
@@ -36,7 +38,8 @@ flowchart LR
 | Recovery action | `error.recovery` | Tell an agent to revise code, retry, restart, wait, or stop. |
 | Hosted call records | `result["host_calls"]` | Show bounded nested-call identity, status, timing, and possible side effects. |
 | Execution statistics | `result["stats"]` | Show operation identity, timing, state sizes, and original output sizes. |
-| REPL commands | `%run`, `%reset`, `%limits`, `%sessions`, `%mcp` | Perform common control actions before Monty parses the cell. |
+| Read-only names | `kernel.variables()` or `session.variables()` | Read saved public names and types without bootstrap or state changes. |
+| REPL commands | `%run`, `%reset`, `%limits`, `%sessions`, `%mcp`, `%who`, `%whos` | Perform common control actions before Monty parses the cell. |
 | State save policy | `state_policy=` | Select when Python state is saved. |
 | Session forking | `kernel.fork_session()` or `handle.fork()` | Copy Python state for an isolated experiment. |
 | Session bootstrap | `bootstrap_code=` and `bootstrap_files=` | Install trusted helpers in each new session. |
@@ -69,18 +72,57 @@ configuration.
 
 ```python
 session = kernel.session("agent-1")
-session.execute("values = [10, 20, 30]")
+session.execute("sum(values)", inputs={"values": [10, 20, 30]})
 result = session.execute("sum(values)")
 info = session.info()
+assert session.variables() == {"values": "list"}
 
 experiment = session.fork("agent-1-experiment")
 experiment.execute("values.append(40)")
 ```
 
 `SessionHandle` provides `execute()`, `execute_file()`, `execute_module()`,
-`execute_cell()`, `reset()`, `info()`, and `fork()`. `AsyncSessionHandle`
-provides awaitable execution, file execution, module execution, reset, info, and
-fork methods.
+`execute_cell()`, `variables()`, `reset()`, `info()`, and `fork()`.
+`AsyncSessionHandle` provides awaitable execution, file execution, module
+execution, variables, reset, info, and fork methods.
+
+Both kernels and bound handles accept `execute(code, inputs={...})`. Inputs bind
+before the user feed, after helper installation and bootstrap. A supplied name
+replaces an existing value. Values persist only when the state policy saves the
+operation. This is native Monty binding, not source interpolation. Inputs must
+be values Monty can accept, not unregistered tools or arbitrary host objects.
+`inputs=` is not added to the file/module/cell or model-facing tool schemas.
+
+Monty's static checker does not infer input declarations. Use stable stubs when
+type checking is enabled:
+
+```python
+config = KernelConfig(type_check=True, type_check_stubs="values: list[int]\n")
+with PersistentMontyKernel(config=config) as kernel:
+    assert (
+        kernel.execute("agent", "sum(values)", inputs={"values": [20, 22]})["result"]
+        == 42
+    )
+```
+
+Stubs declare names; they do not validate host input values. This change does not
+disable type checking automatically. Reset an existing typed session when its
+stub configuration changes.
+
+### Read saved names and types
+
+`variables()` loads a disposable copy of the latest committed snapshot. It
+returns public names and Monty type names, not values. Private names, filesystem
+helpers, and configured tool names are hidden. User functions and imported
+modules can appear. Missing, expired, and stateless sessions return `{}`.
+Normal store expiry still applies: loading can remove an expired snapshot.
+
+Inspection does not run bootstrap, refresh helpers, save state, change the
+revision, or attach file/host callbacks. It can see the previous saved state
+while an execution is active. It uses a short worker checkout and can fail when
+the pool is busy or state is incompatible. Do not expose it as a host function
+that re-enters the active interpreter. This is a convenience API, not a secret
+filter or live debugger.
 
 A fork copies only the opaque Monty snapshot, including native directory, RNG,
 and resource settings. The next feed starts a new duration clock. It does not
@@ -163,10 +205,18 @@ kernel = PersistentMontyKernel(
 )
 ```
 
-Arenero installs filesystem helpers first. For a session with no saved snapshot,
-it then executes each bootstrap file in order, executes bootstrap code, and runs
-the requested cell. Names become normal session globals. Bootstrap does not use
-Python module imports.
+Arenero installs filesystem helpers once in each new session, then sets its
+native virtual directory, executes each bootstrap file in order, executes
+bootstrap code, and runs the requested cell. Names become normal session globals.
+Bootstrap does not use Python module imports.
+
+Saved snapshots contain helper definitions and a private source-version marker.
+Restore checks that marker with a small feed. A changed helper source or
+`FilesystemConfig` installs the helpers again once; a missing marker does the
+same. Keep `fs_*`, `_arenero_*`, and inspection builtins such as `locals` and
+`type` reserved. Changing the marker is not a supported reload API or a security
+boundary. Reusing helpers avoids repeated large compilation allocations, but
+ordinary feeds still consume some snapshot space. Reset sessions when needed.
 
 Bootstrap sources are trusted host configuration. A missing or invalid bootstrap
 source returns `session_bootstrap_error`, and Arenero does not save the partial
@@ -184,11 +234,18 @@ The cell dispatcher handles these commands before Monty execution:
 | `%limits` | Return the full active capability report. |
 | `%sessions` | Return metadata for the current bound session only. |
 | `%mcp` | Return configured MCP server status, or a structured unavailable error. |
+| `%who` | Return a sorted list of saved public names. |
+| `%whos` | Return saved public names mapped to type names. |
 
 Commands must use one line. `%run` accepts one shell-quoted path. Use
 `execute_file(file_path, follow_up_code)` when the same call must also execute
 follow-up code. `%sessions` does not list other session IDs. Use the trusted host
 method `kernel.list_sessions()` for administration.
+
+`%who` and `%whos` use the read-only inspection path. Their model output follows
+the requested output limit and hard cap. They do not create a missing session.
+Native async callers use `await session.variables()`; the native async kernel
+does not have a percent-command dispatcher.
 
 ## Runtime owner
 
