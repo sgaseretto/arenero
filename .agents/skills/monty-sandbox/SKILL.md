@@ -43,6 +43,10 @@ Arenero has one narrow exception to general package building. Use
 Monty source package. Keep the fixed manifest and layout, run `package_check`,
 run `package_test` in its fresh session, and export only its source ZIP. This is
 not a wheel, Python sdist, package install, or build backend.
+Binary non-Python package files under `assets/` require host
+`allow_binary_assets=True` in `PackageConfig` or `SandboxConfig`. Python remains
+UTF-8; existing quotas and revisions include the assets. Package metadata must
+use raw scans and verifier flags, not model-trimmed output.
 
 Do not describe a Monty-backed `execute` operation as shell execution. Name it `execute_python`, `python_repl`, or clearly state that it accepts only Monty's Python subset.
 
@@ -80,8 +84,10 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   `NetworkConfig` to narrow URL prefixes and methods or to disable curl. Keep
   non-global address blocking, redirect checks, and hard byte limits.
 - Put ordinary input values in `inputs`. Put tools and lazy values in `external_lookup`.
-  Both kernels and bound handles support direct-feed inputs; managed callers use
-  `run_python(inputs=...)`. In typed sessions declare stable input names in
+  Both kernels, bound handles, and facades support inputs on direct/file/module
+  APIs; managed callers use `run_python`, `run_file`, `run_module`, or Python/%run
+  cells. Bind once after bootstrap, before first source, not again for follow-up.
+  Shell and other control cells reject nonempty inputs. In typed sessions declare stable input names in
   `type_check_stubs`; native binding does not infer declarations or validate
   values against stubs.
 - A callable in `external_lookup` runs in the host process with full host authority. Validate every argument as untrusted input.
@@ -197,6 +203,9 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   Nested bundled-standard-module imports pass through where Monty accepts the
   scope. This does not add unsupported submodules or APIs. The generated
   module feed skips Monty type checking.
+  Explicit `from . import helper` siblings work within the same limits. Each
+  static loader binds its virtual `__file__` for asset reads; it is not an export
+  or a promise of general module metadata.
 - For an Arenero source package, keep `arenero-package.json` dependencies empty.
   Use `NAME/__init__.py` as `entry` and `verify.py` as `verify`. Write plain
   assertions in `verify.py`, then set public `passed = True`. Always test in the
@@ -213,10 +222,16 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
 - Filesystem helpers are installed once and reused from the saved dump. A source
   marker refreshes them after helper-source or `FilesystemConfig` changes.
   Reserve `fs_*` and `_arenero_*` names. Ordinary feeds still grow snapshot size.
-- Use `variables()` or sync `%who`/`%whos` for public names and type names only.
+- Use `variables()` or `%who`/`%whos` for public names and type names only.
   Inspection uses a disposable saved snapshot without bootstrap, callbacks, or
   state saves. It needs a free worker and must not re-enter its active parent.
   Keep inspection builtins such as `locals` and `type` unchanged.
+- Native async supports raw host upload/download, session listing, percent cells,
+  and output-file offloading. Use `session.execute_cell()` or the native async
+  LangChain REPL tool for percent commands; direct `execute()` remains Python.
+  Keep native async shell and automatic MCP artifact materialization unsupported.
+  Write overflow only after the active checkout and async file lock end. The
+  session lock stays held; failed writes do not undo Python state.
 - Arenero normalizes public results to Base64 bytes records, complex records,
   ISO date text, and copied Monty instance attributes. It does not preserve
   methods or object identity, or decode those records on input. Native REPL

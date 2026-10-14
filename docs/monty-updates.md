@@ -398,6 +398,15 @@ Input names still need stubs in typed sessions. Inspection returns names and
 types only. Nested virtual-file imports remain rejected. See
 [quality-of-life APIs](quality-of-life.md) and [static modules](virtual-modules.md).
 
+The next API-completion changes are Arenero features, not new Monty syntax:
+inputs now reach file/module/Python-cell APIs; module and native async calls can
+offload full bounded JSON; native async gains upload, listing, and percent cells;
+the static resolver supports explicit sibling imports and virtual `__file__`;
+packages use raw inventory and verifier data and can opt into `assets/` bytes.
+The trusted file-reading feed skips checking, but file source still follows its
+configured type policy. No runtime upgrade, full import engine, or second shell
+is added.
+
 The static resolver, filesystem helpers, source-package workflow, RLM, speculation,
 stores, and fixed agent tool schemas remain in place. We do not add a remote
 worker service, a live host-object registry, CPython, or development-only APIs.

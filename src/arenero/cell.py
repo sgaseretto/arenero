@@ -1,13 +1,21 @@
+"""Shared Python and percent-cell utilities, with a sync-only virtual shell."""
+
+from __future__ import annotations
+
 import json
 import shlex
+from collections.abc import Mapping
 from dataclasses import asdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic_monty import MontyError
 
 from .hosted_tools import HostedToolSet
 from .kernel import PersistentMontyKernel, StatePolicy, _safe_result, _trim
 from .shell import ShellResult, VirtualShell
+
+if TYPE_CHECKING:
+    from .async_kernel import AsyncPersistentMontyKernel
 
 
 def execute_repl_cell(
@@ -20,6 +28,7 @@ def execute_repl_cell(
     state_policy: StatePolicy = "always",
     restart: bool = False,
     hosted_tools: HostedToolSet | None = None,
+    inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one Python or notebook-style shell cell.
 
@@ -32,6 +41,7 @@ def execute_repl_cell(
         state_policy: State save policy for Python and ``%run`` execution.
         restart: Reset Python state before an executable cell when true.
         hosted_tools: Optional tools for this operation only.
+        inputs: Values bound once for Python or ``%run``; not shell/control inputs.
 
     Returns:
         Python execution fields with ``mode=python``, or shell execution fields
@@ -46,6 +56,7 @@ def execute_repl_cell(
         state_policy,
         restart,
         hosted_tools,
+        inputs,
     )
     if magic is not None:
         return magic
@@ -54,6 +65,8 @@ def execute_repl_cell(
     if error is not None:
         return _shell_result(kernel, ShellResult(error, 2), output_limit_chars)
     if command is not None:
+        if inputs:
+            return _invalid_inputs()
         if restart:
             kernel.reset(session_id)
         result = VirtualShell(kernel, session_id).execute(
@@ -74,52 +87,31 @@ def execute_repl_cell(
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
     )
-    execution["mode"] = "python"
-    execution["exit_code"] = 0 if execution["ok"] else 1
-    execution["output"] = _python_output(execution)
-    execution["truncation"] = {
-        **execution["truncated"],
-        "output": any(execution["truncated"].values()),
-    }
-    return execution
+    return _execution_cell_result(execution, "python")
 
 
-def _magic_command(
-    kernel: PersistentMontyKernel,
-    session_id: str,
-    code: str,
-    output_limit_chars: int | None,
-    output_file: str | None,
-    state_policy: StatePolicy,
-    restart: bool,
-    hosted_tools: HostedToolSet | None,
-) -> dict[str, Any] | None:
-    """Dispatch one supported single-line percent command.
+def _parse_magic(code: str) -> tuple[str, list[str]] | dict[str, Any] | None:
+    """Parse and validate a percent command for both kernel modes.
 
     Args:
-        kernel: Kernel that owns the session.
-        session_id: Current bound session ID.
-        code: Raw REPL cell source.
-        output_limit_chars: Optional caller output limit.
-        output_file: Optional virtual path for trimmed execution output.
-        state_policy: State save policy for ``%run``.
-        restart: Reset state before ``%run`` when true.
-        hosted_tools: Optional tools for ``%run``.
+        code: Raw cell source, with one line required for a percent command.
 
     Returns:
-        Command result, or ``None`` when this is not a percent command.
+        Command and arguments, a structured error, or None for ordinary source.
     """
     if not code.startswith("%") or code.startswith("%%"):
         return None
+    hint = "Use %run FILE, %reset, %limits, %sessions, %mcp, %who, or %whos."
     if "\n" in code:
         return _command_result(
             False,
             None,
             "Percent commands must use one line.",
             "invalid_repl_command",
-            "Use %run, %reset, %limits, %sessions, %mcp, %who, or %whos.",
+            hint,
         )
     try:
         arguments = shlex.split(code[1:])
@@ -133,13 +125,202 @@ def _magic_command(
         )
     if not arguments:
         return _command_result(
-            False,
-            None,
-            "Missing percent command.",
-            "invalid_repl_command",
-            "Use %run, %reset, %limits, %sessions, %mcp, %who, or %whos.",
+            False, None, "Missing percent command.", "invalid_repl_command", hint
         )
     name, values = arguments[0], arguments[1:]
+    counts = {
+        "run": 1,
+        "reset": 0,
+        "limits": 0,
+        "sessions": 0,
+        "mcp": 0,
+        "who": 0,
+        "whos": 0,
+    }
+    if name not in counts or len(values) != counts[name]:
+        return _command_result(
+            False,
+            None,
+            f"Unsupported percent command or arguments: %{name}",
+            "invalid_repl_command",
+            hint,
+        )
+    return name, values
+
+
+def _invalid_inputs() -> dict[str, Any]:
+    """Return guidance when a non-Python cell receives host input values.
+
+    Returns:
+        Structured error with no execution, reset, or state save.
+    """
+    return _command_result(
+        False,
+        None,
+        "inputs are supported only for Python and %run.",
+        "invalid_cell_inputs",
+        "Use a Python cell or %run for inputs.",
+    )
+
+
+async def execute_async_repl_cell(
+    kernel: AsyncPersistentMontyKernel,
+    session_id: str,
+    code: str,
+    output_limit_chars: int | None = None,
+    *,
+    output_file: str | None = None,
+    state_policy: StatePolicy = "always",
+    restart: bool = False,
+    hosted_tools: HostedToolSet | None = None,
+    inputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Dispatch native async Python and percent cells, without a second shell.
+
+    Args:
+        kernel: Native asynchronous kernel.
+        session_id: Bound session key.
+        code: Python source or one supported percent command.
+        output_limit_chars: Optional public output limit.
+        output_file: Optional virtual path for untrimmed execution output.
+        state_policy: Python save policy: always, success, or never.
+        restart: Reset Python state before executable source when true.
+        hosted_tools: Optional tools for this operation only.
+        inputs: Values bound once for Python or %run; other controls reject them.
+
+    Returns:
+        Common cell result. Shell cells are rejected without execution.
+    """
+    parsed = _parse_magic(code)
+    if isinstance(parsed, dict):
+        return parsed
+    if parsed is None:
+        if code.lstrip().startswith(("!", "%%")):
+            return _command_result(
+                False,
+                None,
+                "Native async shell cells are not supported.",
+                "unsupported_shell_cell",
+                "Use the sync or managed shell API.",
+            )
+        execution = await kernel.execute(
+            session_id,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
+            inputs=inputs,
+        )
+        return _execution_cell_result(execution, "python")
+    name, values = parsed
+    if inputs and name != "run":
+        return _invalid_inputs()
+    if name == "run":
+        execution = await kernel.execute_file(
+            session_id,
+            values[0],
+            output_limit_chars=output_limit_chars,
+            output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
+            inputs=inputs,
+        )
+        return _execution_cell_result(execution, "command")
+    if name == "reset":
+        return _command_result(True, {"reset": await kernel.reset(session_id)})
+    if name == "limits":
+        return _command_result(True, kernel.capabilities())
+    if name == "sessions":
+        info = await kernel.get_session_info(session_id)
+        return _command_result(
+            True, {"current_session": asdict(info) if info else None}
+        )
+    if name == "mcp":
+        if kernel.mcp_hub is None:
+            return _command_result(
+                False,
+                None,
+                "No MCP hub is configured.",
+                "mcp_unavailable",
+                "Configure an McpHub before %mcp.",
+            )
+        return _command_result(True, await kernel.mcp_hub.async_servers())
+    try:
+        variables = await kernel.variables(session_id)
+    except (MontyError, OSError, RuntimeError, ValueError) as exc:
+        return _command_result(
+            False,
+            None,
+            str(exc),
+            "session_inspection_failed",
+            "Check the session version and reset incompatible state.",
+        )
+    limit, capped = kernel._output_limit(output_limit_chars)
+    return _command_result(
+        True,
+        sorted(variables) if name == "who" else variables,
+        output_limit_chars=limit,
+        limit_was_capped=capped,
+    )
+
+
+def _execution_cell_result(execution: Mapping[str, Any], mode: str) -> dict[str, Any]:
+    """Add shared cell fields without changing the execution result contract.
+
+    Args:
+        execution: Python or file execution fields from either kernel.
+        mode: Python or command cell mode.
+
+    Returns:
+        Copied fields with cell output, exit status, and truncation flags.
+    """
+    result = dict(execution)
+    result["mode"] = mode
+    result["exit_code"] = 0 if result["ok"] else 1
+    result["output"] = _python_output(result)
+    result["truncation"] = {
+        **result["truncated"],
+        "output": any(result["truncated"].values()),
+    }
+    return result
+
+
+def _magic_command(
+    kernel: PersistentMontyKernel,
+    session_id: str,
+    code: str,
+    output_limit_chars: int | None,
+    output_file: str | None,
+    state_policy: StatePolicy,
+    restart: bool,
+    hosted_tools: HostedToolSet | None,
+    inputs: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Dispatch one supported single-line percent command.
+
+    Args:
+        kernel: Kernel that owns the session.
+        session_id: Current bound session ID.
+        code: Raw REPL cell source.
+        output_limit_chars: Optional caller output limit.
+        output_file: Optional virtual path for trimmed execution output.
+        state_policy: State save policy for ``%run``.
+        restart: Reset state before ``%run`` when true.
+        hosted_tools: Optional tools for ``%run``.
+        inputs: Values bound once for ``%run``; other controls reject nonempty inputs.
+
+    Returns:
+        Command result, or ``None`` when this is not a percent command.
+    """
+    parsed = _parse_magic(code)
+    if parsed is None or isinstance(parsed, dict):
+        return parsed
+    name, values = parsed
+    if inputs and name != "run":
+        return _invalid_inputs()
     if name == "run" and len(values) == 1:
         execution: dict[str, Any] = dict(
             kernel.execute_file(
@@ -150,16 +331,10 @@ def _magic_command(
                 state_policy=state_policy,
                 restart=restart,
                 hosted_tools=hosted_tools,
+                inputs=inputs,
             )
         )
-        execution["mode"] = "command"
-        execution["exit_code"] = 0 if execution["ok"] else 1
-        execution["output"] = _python_output(execution)
-        execution["truncation"] = {
-            **execution["truncated"],
-            "output": any(execution["truncated"].values()),
-        }
-        return execution
+        return _execution_cell_result(execution, "command")
     if name == "reset" and not values:
         existed = kernel.reset(session_id)
         return _command_result(True, {"reset": existed})

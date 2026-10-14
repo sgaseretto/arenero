@@ -41,6 +41,9 @@ attributes.
 Arenero passes nested bundled-standard-module imports through in supported
 Monty scopes. Nested virtual-file imports and wildcard imports remain rejected.
 This does not enable unsupported submodules or class-body imports.
+Explicit `from . import helper` binds sibling module objects through the same
+bounded static resolver. Each loader has a virtual `__file__` for nearby asset
+reads; it is not exported as general module metadata.
 
 Arenero can wrap this static graph in its own dependency-free source package
 format. The host checks the fixed JSON manifest and bounded UTF-8 files, then runs
@@ -48,6 +51,9 @@ format. The host checks the fixed JSON manifest and bounded UTF-8 files, then ru
 its assertions. Export creates a deterministic source ZIP. It does not add an
 installer, build backend, wheel, standard sdist, third-party dependency, or new
 import behavior.
+Optional non-Python bytes below project-level `assets/` use the same quotas,
+digest, and ZIP. They require host `allow_binary_assets=True`; `.py` files stay
+UTF-8. Inventory and verifier decisions must not depend on public output trimming.
 
 Generator expressions and `enumerate`, `zip`, `map`, `filter`, and `reversed` are eager lists. Avoid them on large or unbounded inputs.
 
@@ -117,6 +123,9 @@ Type checking can resolve some stub-support modules that the runtime cannot impo
 - Monty's static checker needs input names in stubs; binding alone does not
   declare them. Arenero forwards native inputs after bootstrap without type
   inference or automatic checking bypass.
+  Direct, file, module, and Python/%run cell APIs bind inputs once before first
+  user source. Trusted file reads skip checking, while user file feeds follow
+  the configured type policy. Follow-up feeds do not rebind input values.
 - Sync `Monty` cannot drive coroutine host functions. Use `AsyncMonty` or manual suspension handling.
 - Payloads and dumps have a 256 MiB wire-frame limit. Export depth is bounded by
   the remaining recursion limit; deep values can become placeholder strings.
@@ -247,6 +256,10 @@ hash after restore. A changed helper source or helper limits refreshes them once
 Read-only name/type and managed-directory inspection load a disposable dump,
 attach no host/file callbacks, and save nothing. They read the last commit, need
 a worker, and must not re-enter an active parent interpreter.
+Native async percent cells reuse the shared parser/result format. Raw uploads and
+overflow output use isolated checkouts without bootstrap or saved state. Overflow
+starts after the execution checkout and async filesystem lock end; a failed write
+does not roll back Python state. No native async shell is added.
 
 Released `1.1.0` uses CBOR and an upstream dump-format version. Arenero still
 requires an exact package-version match. Do not infer that old `0.0.21` snapshots

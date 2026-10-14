@@ -35,6 +35,7 @@ from .filesystem import (
     FilesystemValue,
     build_filesystem_call,
     build_filesystem_prelude,
+    build_upload_source,
 )
 from .hosted_tools import HostedToolScope, HostedToolSet
 from .mcp_artifacts import materialize_mcp_artifacts
@@ -685,6 +686,7 @@ class PersistentMontyKernel:
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute a virtual Python file and optional follow-up code.
 
@@ -698,6 +700,7 @@ class PersistentMontyKernel:
             state_policy: Save state ``always``, only on ``success``, or ``never``.
             restart: Reset state before this execution when true.
             hosted_tools: Optional tools available for this operation only.
+            inputs: Values bound once before file source, after bootstrap.
 
         Returns:
             A structured result for the file or the follow-up code when supplied.
@@ -711,6 +714,7 @@ class PersistentMontyKernel:
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
 
     def download_file(
@@ -761,10 +765,12 @@ class PersistentMontyKernel:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         module_config: VirtualModuleConfig | None = None,
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Resolve and execute a static virtual module graph.
 
@@ -773,10 +779,12 @@ class PersistentMontyKernel:
             entry_path: Absolute virtual entry ``.py`` file.
             code: Optional follow-up code in the same feed.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for bounded untrimmed output.
             module_config: Optional module roots, aliases, and limits.
             state_policy: State save policy for this operation.
             restart: Reset saved Python state before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the module bundle, after bootstrap.
 
         Returns:
             Structured result for the bundle or follow-up code.
@@ -811,11 +819,12 @@ class PersistentMontyKernel:
             bundle.code,
             output_limit_chars,
             file_path=None,
-            output_file=None,
+            output_file=output_file,
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
             skip_type_check=True,
+            inputs=inputs,
         )
 
     def upload_file(
@@ -843,19 +852,8 @@ class PersistentMontyKernel:
             raise ValueError("path must be an absolute virtual POSIX path")
         if len(content) > self.filesystem_config.max_transfer_bytes:
             raise ValueError("content exceeds the filesystem transfer limit")
-        parent_step = (
-            "_arenero_transfer_path.parent.mkdir(parents=True, exist_ok=True)\n"
-            if create_parents
-            else ""
-        )
-        source = (
-            "from pathlib import Path\n"
-            f"_arenero_transfer_path = Path({json.dumps(path)})\n"
-            f"{parent_step}"
-            "_arenero_transfer_path.write_bytes(_arenero_transfer_content)"
-        )
         result = self._run_isolated(
-            source,
+            build_upload_source(path, create_parents),
             inputs={"_arenero_transfer_content": bytes(content)},
         )
         if not isinstance(result, int):
@@ -926,7 +924,7 @@ class PersistentMontyKernel:
             restart: Whether to reset state before this operation.
             hosted_tools: Optional operation-only hosted tools.
             skip_type_check: Disable checking for generated support code.
-            inputs: Optional values bound for the direct user feed.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             A structured execution result with stable statistics.
@@ -1008,7 +1006,7 @@ class PersistentMontyKernel:
             hosted_tools: Optional operation-only hosted tools.
             skip_type_check: Disable checking for generated support code.
             metrics: Mutable execution statistics.
-            inputs: Optional values bound for the direct user feed.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             A structured execution result.
@@ -1356,7 +1354,7 @@ class PersistentMontyKernel:
             code: Direct or follow-up code to execute.
             file_path: Optional virtual file to read and execute first.
             external_lookup: Host functions for this complete operation.
-            inputs: Optional values for a direct code feed.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             The value of the last feed that ran.
@@ -1371,8 +1369,9 @@ class PersistentMontyKernel:
             streams,
             f"open({json.dumps(file_path)}).read()",
             external_lookup,
+            skip_type_check=True,
         )
-        result = self._feed(session, streams, source, external_lookup)
+        result = self._feed(session, streams, source, external_lookup, inputs=inputs)
         if code is not None:
             result = self._feed(session, streams, code, external_lookup)
         return result
@@ -1531,6 +1530,26 @@ class PersistentMontyKernel:
             return
         with self._filesystem_lock:
             yield
+
+    def _call_filesystem_raw(
+        self,
+        operation: FilesystemOperation,
+        arguments: Mapping[str, FilesystemValue],
+    ) -> Any:
+        """Run trusted file bookkeeping without bootstrap, saves, or output trimming.
+
+        Args:
+            operation: Supported filesystem helper operation.
+            arguments: Plain keyword arguments for that helper.
+
+        Returns:
+            Raw bounded helper result, independent of model output limits.
+        """
+        return self._run_isolated(
+            self._filesystem_prelude
+            + "\n"
+            + build_filesystem_call(operation, arguments)
+        )
 
     def _lock_for(self, session_id: str) -> threading.Lock:
         """Get the process-local lock for one session.

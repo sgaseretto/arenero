@@ -52,12 +52,13 @@ virtual files. Await application async host functions. When MCP is configured,
 also await mcp_servers(), mcp_search(), mcp_describe(), mcp_promote(),
 mcp_refresh(), and mcp_call(). Check ok, error, error.recovery, truncated, and
 host_calls before using a result. This small
-native async adapter does not support output-file offloading.
+native async adapter supports bounded output-file offloading.
 Native eval(), exec(), and locals() run Monty source, not CPython, and runtime
 strings bypass static checking. Normal file imports, compile(), globals(), and
 __import__() are unavailable. Use os.getcwd()/os.chdir() for virtual relative
 paths. Interpreter duration is per feed; host waits need separate deadlines.
-Percent commands are not supported by this native async tool. Bytes, complex
+Use %run FILE, %reset, %limits, %sessions, %mcp, %who, and %whos for session controls.
+Bytes, complex
 values, dates, and Monty instances use the shared JSON result formats.
 """
 
@@ -283,6 +284,12 @@ def create_python_repl_tools(
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
         ] = None,
+        output_file: Annotated[
+            str | None,
+            Field(
+                description="Optional absolute virtual path for bounded untrimmed output."
+            ),
+        ] = None,
         state_policy: Annotated[
             Literal["always", "success", "never"],
             Field(description="State save policy for this module execution."),
@@ -299,6 +306,7 @@ def create_python_repl_tools(
             runtime: LangChain runtime that identifies the current thread.
             code: Optional follow-up code.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
             restart: Reset Python state before the module when true.
 
@@ -316,6 +324,7 @@ def create_python_repl_tools(
                 code,
                 output_limit_chars,
                 state_policy=state_policy,
+                output_file=output_file,
                 restart=restart,
                 hosted_tools=hosted_tools_from_langchain(
                     hosted_tools,
@@ -446,12 +455,20 @@ def create_async_python_repl_tools(
     async def python_repl(
         code: Annotated[
             str,
-            Field(description="One Monty Python cell. Use await for async tools."),
+            Field(
+                description="One Monty Python cell or percent command. Use await for async tools."
+            ),
         ],
         runtime: ToolRuntime,
         output_limit_chars: Annotated[
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
+        ] = None,
+        output_file: Annotated[
+            str | None,
+            Field(
+                description="Optional absolute virtual path for bounded untrimmed output."
+            ),
         ] = None,
         state_policy: Annotated[
             Literal["always", "success", "never"],
@@ -468,6 +485,7 @@ def create_async_python_repl_tools(
             code: Monty-compatible Python source.
             runtime: LangChain runtime that identifies the current thread.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
             restart: Reset Python state before this cell when true.
 
@@ -478,11 +496,12 @@ def create_async_python_repl_tools(
         if session_id is None:
             return _missing_thread_id()
         return dict(
-            await kernel.execute(
+            await kernel.execute_cell(
                 session_id,
                 code,
                 output_limit_chars,
                 state_policy=state_policy,
+                output_file=output_file,
                 restart=restart,
                 hosted_tools=hosted_tools_from_langchain(
                     hosted_tools,
@@ -508,6 +527,12 @@ def create_async_python_repl_tools(
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
         ] = None,
+        output_file: Annotated[
+            str | None,
+            Field(
+                description="Optional absolute virtual path for bounded untrimmed output."
+            ),
+        ] = None,
         state_policy: Annotated[
             Literal["always", "success", "never"],
             Field(description="State save policy for this file execution."),
@@ -524,6 +549,7 @@ def create_async_python_repl_tools(
             runtime: LangChain runtime that identifies the current thread.
             code: Optional follow-up code.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
             restart: Reset Python state before this file when true.
 
@@ -540,6 +566,7 @@ def create_async_python_repl_tools(
                 code,
                 output_limit_chars,
                 state_policy=state_policy,
+                output_file=output_file,
                 restart=restart,
                 hosted_tools=hosted_tools_from_langchain(
                     hosted_tools,
@@ -565,6 +592,12 @@ def create_async_python_repl_tools(
             int | None,
             Field(ge=0, description="Optional maximum characters per output field."),
         ] = None,
+        output_file: Annotated[
+            str | None,
+            Field(
+                description="Optional absolute virtual path for bounded untrimmed output."
+            ),
+        ] = None,
         state_policy: Annotated[
             Literal["always", "success", "never"],
             Field(description="State save policy for this module execution."),
@@ -581,6 +614,7 @@ def create_async_python_repl_tools(
             runtime: LangChain runtime that identifies the current thread.
             code: Optional follow-up code.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
             restart: Reset Python state before the module when true.
 
@@ -598,6 +632,7 @@ def create_async_python_repl_tools(
                 code,
                 output_limit_chars,
                 state_policy=state_policy,
+                output_file=output_file,
                 restart=restart,
                 hosted_tools=hosted_tools_from_langchain(
                     hosted_tools,

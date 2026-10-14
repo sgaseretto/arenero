@@ -19,8 +19,8 @@ snapshot resets, new features, and features that remain unavailable.
 flowchart LR
     User["Human or agent"] --> Interface["Managed sandbox, REPL, facade, or agent tools"]
     Interface --> Cell["Cell dispatcher"]
-    Cell -->|Python| Kernel["Sync or native async persistent kernel"]
-    Cell -->|Shell cell| Shell["Virtual shell"]
+    Cell -->|Python or percent controls| Kernel["Sync or native async persistent kernel"]
+    Cell -->|Sync shell cell| Shell["Virtual shell"]
     Shell --> Kernel
     Kernel --> Worker["Monty worker pool"]
     Kernel <--> Store["Snapshot: Python state, directory, and installed helpers"]
@@ -33,6 +33,8 @@ flowchart LR
     Packages --> Files
     Kernel --> QoL["Capabilities, saved-name inspection, statistics, and bound sessions"]
     Kernel --> Result["Shared JSON result conversion"]
+    Result --> Overflow["Optional bounded full JSON file"]
+    Overflow --> Files
     Result --> Interface
     Interface --> RLM["Recursive model runner"]
     RLM --> Kernel
@@ -155,7 +157,11 @@ with open_sandbox("agent-1", config=config) as sandbox:
 ```
 
 `inputs=` binds ordinary host values without building Python source strings.
-Values follow the selected state-save policy. With `type_check=True`, declare
+It works on Python, file, module, and Python/`%run` cell APIs. Values bind once,
+after bootstrap and before the first user-code feed. A file's changes remain
+visible to follow-up code. Nonempty inputs on shell or other percent commands
+are rejected before execution. Values follow the selected state-save policy.
+With `type_check=True`, declare
 input names in `KernelConfig.type_check_stubs`. The host API supports inputs;
 the model-facing tool schema stays unchanged.
 
@@ -351,7 +357,7 @@ limits, and promotion rules.
 | Hosted tools | Compose selected application, LangChain, or Pydantic AI tools in Python. | Each exposed function runs with host authority. |
 | MCP | Discover, describe, compose, and hot-load stdio or HTTP MCP servers. | MCP connections and promotions are not saved in snapshots. |
 | Source files | Run one helper file or a small static virtual module graph. | This is source execution, not Python import machinery. |
-| Source packages | Build, check, test, and export dependency-free Monty source ZIP files. | No wheels, sdists, installers, or third-party dependencies. |
+| Source packages | Build, check, test, and export dependency-free Monty source ZIP files, with opt-in binary files under `assets/`. | No wheels, sdists, installers, or third-party dependencies. |
 | Concurrent agents | Use separate IDs with the batch preset and one worker pool. | Shared filesystem work is serialized in one kernel. |
 | Bounded results | Limit output, save larger bounded output to a file, and inspect statistics. | Hard stream, result, state, and transfer caps still apply. |
 | Session inspection | Use `%who`, `%whos`, or `session.variables()` to read saved names and types. | No values or live interpreter handles; no state save or bootstrap. |
@@ -409,6 +415,12 @@ limits, and promotion rules.
 For verified accepted and rejected examples, read
 [Usage and capabilities](docs/usage-and-capabilities.md). For every shell flag and
 command limit, read [Virtual shell reference](docs/virtual-shell.md).
+
+To include binary package assets, use
+`SandboxConfig.conversation(allow_binary_assets=True)` or
+`PackageConfig(allow_binary_assets=True)`. All `.py` files remain UTF-8 source.
+Assets count toward existing file, byte, revision, and ZIP limits. See the
+[source-package guide](docs/monty-source-packages.md#binary-assets).
 
 ## Terminal REPL
 
@@ -610,11 +622,43 @@ tools = create_async_python_repl_tools(kernel)
 
 This small adapter does not claim virtual shell support. Use
 `AsyncAreneroSandbox` when an async application needs the full synchronous
-sandbox API through worker threads. The native async kernel has bounded host-side
-download support for static module resolution. It still omits upload, session
-listing, and output-file offloading methods. Agents can use virtual `fs_*`
-functions inside Python, run one helper with `execute_file()`, or run a bounded
-static graph with `execute_module()`.
+sandbox API through worker threads. The native async kernel supports bounded
+host upload/download, `list_sessions()`, percent commands through
+`session.execute_cell()`, and output-file offloading for Python, files, and
+modules. The same four agent tool names remain in use. Agents can use virtual
+`fs_*` functions inside Python, run one helper with `execute_file()`, or run a
+bounded static graph with `execute_module()`.
+
+```python
+import asyncio
+import json
+from pydantic_monty import OSAccess
+from arenero import AsyncPersistentMontyKernel
+
+
+async def main():
+    """Run a helper, save full output, and inspect the saved native async session."""
+    async with AsyncPersistentMontyKernel(os_handler=OSAccess()) as kernel:
+        await kernel.upload_file("/helper.py", b"values.append(22)\nsum(values)")
+        session = kernel.session("agent-1")
+        result = await session.execute_file(
+            "/helper.py",
+            "sum(values)",
+            0,
+            inputs={"values": [20]},
+            output_file="/result.json",
+        )
+        assert result["ok"]
+        assert json.loads(await kernel.download_file("/result.json"))["result"] == 42
+        assert (await session.execute_cell("%whos"))["result"] == {"values": "list"}
+
+
+asyncio.run(main())
+```
+
+`inputs=` is a host API option; it is not a new model tool argument. Native async
+REPL tools accept the seven percent commands, but not shell cells. `output_file`
+is available on the sync module tool and all three native async execution tools.
 
 The kernel uses `InMemorySessionStore` when no store is given. Select another mode
 with an explicit store:

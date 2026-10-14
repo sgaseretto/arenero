@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -263,6 +264,7 @@ class AreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> SandboxExecuteResult:
@@ -275,6 +277,7 @@ class AreneroSandbox:
             state_policy: State save policy for this operation.
             restart: Reset state before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -286,6 +289,7 @@ class AreneroSandbox:
                 output_limit_chars,
                 output_file=output_file,
                 state_policy=state_policy,
+                inputs=inputs,
                 restart=restart,
                 hosted_tools=hosted_tools,
             )
@@ -298,6 +302,7 @@ class AreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> dict[str, Any]:
@@ -310,6 +315,7 @@ class AreneroSandbox:
             state_policy: State save policy for Python and ``%run`` execution.
             restart: Reset state before an executable cell when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             A result with ``mode=python`` or ``mode=shell``.
@@ -321,6 +327,7 @@ class AreneroSandbox:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
             restart=restart,
             hosted_tools=hosted_tools,
         )
@@ -332,6 +339,7 @@ class AreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxExecuteResult:
         """Execute one virtual Python file in the persistent session.
 
@@ -340,6 +348,7 @@ class AreneroSandbox:
             output_limit_chars: Optional output limit below the hard maximum.
             output_file: Optional absolute virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -351,6 +360,7 @@ class AreneroSandbox:
                 output_limit_chars=output_limit_chars,
                 output_file=output_file,
                 state_policy=state_policy,
+                inputs=inputs,
             )
         )
 
@@ -360,8 +370,10 @@ class AreneroSandbox:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         module_config: VirtualModuleConfig | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxExecuteResult:
         """Resolve and execute a static virtual module graph.
 
@@ -371,6 +383,8 @@ class AreneroSandbox:
             output_limit_chars: Optional output limit below the hard maximum.
             module_config: Optional module roots, aliases, and limits.
             state_policy: State save policy for this operation.
+            inputs: Values bound once before the first user-code feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -384,6 +398,8 @@ class AreneroSandbox:
                 output_limit_chars,
                 module_config=module_config,
                 state_policy=state_policy,
+                output_file=output_file,
+                inputs=inputs,
             )
         )
 
@@ -724,6 +740,7 @@ class AsyncAreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxExecuteResult:
         """Execute Monty Python without blocking the event loop.
 
@@ -732,6 +749,7 @@ class AsyncAreneroSandbox:
             output_limit_chars: Optional output limit.
             output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -742,6 +760,7 @@ class AsyncAreneroSandbox:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
         )
 
     async def execute_cell(
@@ -751,6 +770,7 @@ class AsyncAreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute one Python or shell cell without blocking the event loop.
 
@@ -759,6 +779,7 @@ class AsyncAreneroSandbox:
             output_limit_chars: Optional result limit.
             output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for Python and ``%run`` execution.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Stable Python or shell cell result.
@@ -769,6 +790,7 @@ class AsyncAreneroSandbox:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
         )
 
     async def execute_file(
@@ -778,6 +800,7 @@ class AsyncAreneroSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxExecuteResult:
         """Execute one virtual Python file without blocking the event loop.
 
@@ -786,6 +809,7 @@ class AsyncAreneroSandbox:
             output_limit_chars: Optional output limit.
             output_file: Optional virtual path used when output is trimmed.
             state_policy: State save policy for this operation.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -796,6 +820,7 @@ class AsyncAreneroSandbox:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
         )
 
     async def execute_module(
@@ -804,8 +829,10 @@ class AsyncAreneroSandbox:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         module_config: VirtualModuleConfig | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxExecuteResult:
         """Resolve and execute static virtual modules without blocking.
 
@@ -815,6 +842,8 @@ class AsyncAreneroSandbox:
             output_limit_chars: Optional output limit.
             module_config: Optional module roots, aliases, and limits.
             state_policy: State save policy for this operation.
+            inputs: Values bound once before the first user-code feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Combined output, exit code, and truncation state.
@@ -827,6 +856,8 @@ class AsyncAreneroSandbox:
             output_limit_chars,
             module_config=module_config,
             state_policy=state_policy,
+            output_file=output_file,
+            inputs=inputs,
         )
 
     async def read(

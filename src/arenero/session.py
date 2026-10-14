@@ -73,6 +73,7 @@ class SessionHandle:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
@@ -86,6 +87,7 @@ class SessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Structured execution result.
@@ -97,6 +99,7 @@ class SessionHandle:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
             restart=restart,
             hosted_tools=hosted_tools,
         )
@@ -108,6 +111,7 @@ class SessionHandle:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
         """Execute a Python, shell, or small REPL command cell.
 
@@ -116,6 +120,7 @@ class SessionHandle:
             output_limit_chars: Optional caller output limit.
             output_file: Optional virtual path for trimmed output.
             state_policy: State save policy for Python execution.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Structured cell result.
@@ -129,6 +134,7 @@ class SessionHandle:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
         )
 
     def execute_module(
@@ -137,8 +143,10 @@ class SessionHandle:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         module_config: VirtualModuleConfig | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
@@ -152,6 +160,8 @@ class SessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Structured module execution result.
@@ -164,6 +174,8 @@ class SessionHandle:
             output_limit_chars,
             module_config=module_config,
             state_policy=state_policy,
+            output_file=output_file,
+            inputs=inputs,
             restart=restart,
             hosted_tools=hosted_tools,
         )
@@ -224,6 +236,7 @@ class AsyncSessionHandle:
         code: str,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
@@ -238,6 +251,7 @@ class AsyncSessionHandle:
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
             inputs: Optional host values bound before this user feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Structured execution result.
@@ -247,6 +261,7 @@ class AsyncSessionHandle:
             code,
             output_limit_chars,
             state_policy=state_policy,
+            output_file=output_file,
             restart=restart,
             hosted_tools=hosted_tools,
             inputs=inputs,
@@ -258,7 +273,9 @@ class AsyncSessionHandle:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
@@ -271,6 +288,8 @@ class AsyncSessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Structured execution result.
@@ -281,8 +300,40 @@ class AsyncSessionHandle:
             code,
             output_limit_chars,
             state_policy=state_policy,
+            output_file=output_file,
+            inputs=inputs,
             restart=restart,
             hosted_tools=hosted_tools,
+        )
+
+    async def execute_cell(
+        self,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run Python or a percent command in this native async session.
+
+        Args:
+            code: Monty source or a supported single-line percent command.
+            output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for untrimmed execution output.
+            state_policy: Python state save policy.
+            inputs: Values bound once for Python or %run, after bootstrap.
+
+        Returns:
+            Cell fields. Native async shell cells are not supported.
+        """
+        return await self.kernel.execute_cell(
+            self.session_id,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+            state_policy=state_policy,
+            inputs=inputs,
         )
 
     async def variables(self) -> dict[str, str]:
@@ -308,7 +359,9 @@ class AsyncSessionHandle:
         output_limit_chars: int | None = None,
         *,
         module_config: VirtualModuleConfig | None = None,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
     ) -> ExecutionResult:
@@ -322,6 +375,8 @@ class AsyncSessionHandle:
             state_policy: State save policy for this operation.
             restart: Reset this session before execution when true.
             hosted_tools: Optional tools for this operation only.
+            inputs: Values bound once before the first user-code feed.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
             Structured module execution result.
@@ -334,6 +389,8 @@ class AsyncSessionHandle:
             output_limit_chars,
             module_config=module_config,
             state_policy=state_policy,
+            output_file=output_file,
+            inputs=inputs,
             restart=restart,
             hosted_tools=hosted_tools,
         )

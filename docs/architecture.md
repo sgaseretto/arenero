@@ -116,7 +116,7 @@ again.
 | LangChain RLM adapter | `langchain_rlm.py` | Call or stream chat models through `ainvoke()` and `astream()`, then normalize text and reported usage. |
 | Doctor | `doctor.py` | Check Monty, worker startup, optional packages, workspace access, and MCP status. |
 | Persistent sync kernel | `kernel.py` | Restore, execute, limit, save, reset, and inspect Monty sessions. |
-| Persistent async kernel | `async_kernel.py` | Run persistent Python, virtual `fs_*` helpers, file transfer for resolution, `execute_file`, and `execute_module` on native `AsyncMonty` workers. |
+| Persistent async kernel | `async_kernel.py` | Run Python, percent cells, binary transfer, overflow output, files, and static modules on native `AsyncMonty` workers; keep the shell on the sync surface. |
 | Session stores | `store.py` | Keep opaque snapshots in memory, SQLite, or nowhere. Apply revision checks and expiry. |
 | Filesystem helpers | `filesystem.py` | Implement bounded `read`, `write`, `edit`, `mkdir`, `delete`, `ls`, `glob`, and `grep`. |
 | Result conversion | `values.py` | Use one JSON representation for kernel output and managed results: Base64 bytes, complex records, ISO dates, and copied Monty instance attributes. |
@@ -174,13 +174,22 @@ sequenceDiagram
     else State policy blocks save
         K->>K: Keep the previous snapshot
     end
+    K->>M: Release execution checkout
     K->>K: Convert result to JSON data and trim public output
+    opt Public output is trimmed and output_file is set
+        K->>F: Write bounded full JSON after the execution checkout closes
+        F-->>K: Path or output_file_error
+    end
     K-->>C: Structured result, error guidance, and statistics
 ```
 
-`execute_file()` reads one virtual Python file, feeds its complete source, then
+`execute_file()` reads one virtual Python file in a trusted unchecked read feed,
+feeds its complete source under the configured type policy, then
 feeds optional follow-up code. It saves the session once after the last successful
 feed. It does not perform a Python import.
+Inputs bind once after bootstrap, before the file source, not again for follow-up
+code. Direct code, static modules, and Python/`%run` cells use the same rule.
+Both kernels support full bounded output files for direct/file/module execution.
 
 `execute_module()` reads and parses a bounded static file graph on the host. It
 rewrites supported top-level imports into simple isolated module objects and runs
@@ -189,6 +198,8 @@ checked because its module objects need dynamic attributes. User source never
 executes in the host parser. See [Static virtual modules](virtual-modules.md).
 Nested imports of bundled standard modules stay in the generated source. Nested
 imports of virtual files still fail before execution.
+Explicit `from . import sibling` forms use the same bounded resolver. Each module
+loader binds its own virtual `__file__` for asset reads, without an import runtime.
 
 Filesystem helpers and their private source-version marker live in the snapshot.
 The next call reuses them unless the source or helper limits change. Bootstrap

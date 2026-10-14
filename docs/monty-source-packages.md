@@ -17,6 +17,8 @@ The package manager applies one small contract:
 - The package name is a Python identifier.
 - The manifest uses format `1` and has no dependencies.
 - All source files are bounded UTF-8 `.py`, `.json`, `.md`, or `.txt` files.
+- When the host opts in, additional non-Python files under `assets/` can contain
+  bytes. They use the same file, byte, revision, and ZIP limits.
 - Each Python file has valid syntax and a supported static import graph.
 - `verify.py` runs in a new temporary Monty session.
 - `verify.py` exports the boolean variable `passed` with value `True`.
@@ -33,10 +35,12 @@ flowchart LR
     Human["Human API"] --> Manager["MontyPackageManager"]
     Agent["LangChain or LangGraph agent"] --> Tools["Opt-in package tools"]
     Tools --> Manager
-    Manager --> Files["Shared virtual filesystem"]
+    Manager --> Inventory["Raw bounded inventory; no output trimming or bootstrap"]
+    Inventory --> Files["Shared virtual filesystem"]
+    Assets["Optional assets/ bytes"] --> Files
     Manager --> Resolver["Static virtual-module resolver"]
     Resolver --> Fresh["Fresh temporary Monty session"]
-    Fresh --> Result["passed must be True"]
+    Fresh --> Result["Capture passed before public output trimming"]
     Result --> Zip["Deterministic source ZIP"]
 ```
 
@@ -75,6 +79,44 @@ The layout is intentionally fixed. `entry` must be
 `NAME/__init__.py`, and `verify` must be `verify.py`. Extra source modules and
 text documentation are allowed within the configured limits.
 
+## Binary assets
+
+Binary assets are off by default. Enable them in trusted host configuration:
+
+```python
+from arenero import SandboxConfig, open_sandbox
+
+config = SandboxConfig.conversation(allow_binary_assets=True)
+with open_sandbox("agent-1", config=config) as sandbox:
+    assert sandbox.package_init("smalllib").ok
+    sandbox.write("smalllib/assets/data.bin", b"\x00\xff")
+    sandbox.write(
+        "smalllib/verify.py",
+        "from pathlib import Path\n"
+        "assert Path(__file__).parent.joinpath('assets/data.bin').read_bytes() == b'\\x00\\xff'\n"
+        "passed = True\n",
+    )
+    assert sandbox.package_test("smalllib").ok
+    assert sandbox.package_export("smalllib").ok
+```
+
+For the low-level API, pass `PackageConfig(allow_binary_assets=True)` to
+`MontyPackageManager` or `create_package_tools`. The agent cannot enable this by
+changing the manifest. The managed instructions and `info()` report the flag.
+
+Non-Python files directly under the project-level `assets/` directory can have
+any extension and arbitrary bytes. All `.py` files, including those below
+`assets/`, remain UTF-8 source and must pass static graph checks. Outside
+`assets/`, only the existing UTF-8 source suffixes are accepted. Hidden paths and
+non-regular files remain rejected.
+
+Assets are included byte-for-byte in the deterministic ZIP and source revision.
+They count toward all existing package and managed workspace quotas. Source
+modules get their virtual `__file__` path for relative asset reads; use bounded
+`Path.read_bytes()` or binary `open()` where supported. This does not add
+`importlib.resources`, extraction, installation, image interpretation, or a
+dependency loader. To show an image to a model, use the existing media bridge.
+
 ## The required process
 
 ```mermaid
@@ -104,6 +146,13 @@ Follow these steps in order:
 The revision is a SHA-256 digest of every included relative path and file byte.
 It detects an edit between check, test, and export. The `dist` directory is not
 part of the digest and is never put inside a new archive.
+
+Inventory uses a raw isolated filesystem scan with no bootstrap or session save.
+It does not use trimmed agent output. Verification captures the actual `passed`
+value before public result trimming, through one private hosted callback. This
+uses one hosted-call budget slot. Its public execution value and streams can
+still be trimmed. A zero-character output limit does not change check/test
+decisions; `passed` must still be exactly boolean `True`.
 
 ## Human API example
 
@@ -251,7 +300,7 @@ These patterns do not work:
 - dynamic imports, wildcard imports, virtual-file imports inside a function,
   circular imports, namespace packages, import hooks, reload, or `sys.path` changes;
 - CPython-only syntax, built-ins, standard-library APIs, or object behavior;
-- binary package resources;
+- binary files outside `assets/`, or any binary assets without the host opt-in;
 - filesystem paths outside the configured package root;
 - package code that depends on state from an existing REPL session.
 
@@ -279,10 +328,11 @@ packages = MontyPackageManager(
 | Setting | Default | Meaning |
 |---|---:|---|
 | `allowed_root` | `/workspace` | Parent virtual directory for package projects. A project cannot equal this path. |
-| `max_files` | `100` | Maximum included source files. |
-| `max_file_bytes` | `256000` | Maximum bytes read from one source file. |
-| `max_total_bytes` | `2000000` | Maximum bytes in all included source files. |
+| `max_files` | `100` | Maximum included files, including assets. |
+| `max_file_bytes` | `256000` | Maximum bytes read from one included file. |
+| `max_total_bytes` | `2000000` | Maximum bytes in all included files. |
 | `max_archive_bytes` | `2500000` | Maximum final ZIP size. |
+| `allow_binary_assets` | `False` | Allow arbitrary non-Python bytes under project-level `assets/` only. |
 
 For agent tools, pass the same `PackageConfig` to `create_package_tools()`.
 These are host limits. Package code and the model cannot increase them.

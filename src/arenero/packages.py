@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic_monty import MontyError
 
+from .hosted_tools import HostedToolSet
 from .kernel import PersistentMontyKernel
 from .modules import VirtualModuleConfig, VirtualModuleError, VirtualModuleResolver
 
@@ -33,6 +34,9 @@ file must set the public variable passed to True after its assertions. Use
 package_export only after checks and tests pass. It creates a source ZIP, not a
 wheel or Python sdist. Arenero does not run pip, pytest, setuptools, build
 backends, or third-party packages.
+Binary non-Python assets are allowed only under assets/ when the host enables
+allow_binary_assets. Assets use the existing file, byte, and ZIP limits; they
+do not add importlib.resources or a package installer.
 """
 
 
@@ -42,10 +46,11 @@ class PackageConfig:
 
     Attributes:
         allowed_root: Absolute virtual directory that contains package projects.
-        max_files: Maximum files in one package source tree.
-        max_file_bytes: Maximum bytes in one source file.
-        max_total_bytes: Maximum total bytes in checked source files.
+        max_files: Maximum included files, including assets.
+        max_file_bytes: Maximum bytes in one included file.
+        max_total_bytes: Maximum total bytes in included files.
         max_archive_bytes: Maximum exported ZIP size.
+        allow_binary_assets: Allow non-Python binary files under ``assets/`` when true.
     """
 
     allowed_root: str = "/workspace"
@@ -53,6 +58,7 @@ class PackageConfig:
     max_file_bytes: int = 256_000
     max_total_bytes: int = 2_000_000
     max_archive_bytes: int = 2_500_000
+    allow_binary_assets: bool = False
 
     def __post_init__(self) -> None:
         """Validate package paths and limits."""
@@ -304,14 +310,29 @@ class MontyPackageManager:
                 check=checked,
             )
         session_id = f"_arenero_package_test_{uuid.uuid4().hex}"
+        verified: dict[str, Any] = {}
+
+        def _arenero_package_capture(passed: Any) -> Any:
+            """Read the verifier flag before model output trimming.
+
+            Args:
+                passed: Public value exported by verify.py.
+
+            Returns:
+                The same value, to keep the public execution result unchanged.
+            """
+            verified["passed"] = passed
+            return passed
+
         try:
             execution = self.kernel.execute_module(
                 session_id,
                 checked["verify_path"],
-                code="passed",
+                code="_arenero_package_capture(passed=passed)",
                 module_config=VirtualModuleConfig(roots=(checked["root"],)),
                 state_policy="never",
                 restart=True,
+                hosted_tools=HostedToolSet.from_callables([_arenero_package_capture]),
             )
         finally:
             self.kernel.reset(session_id)
@@ -325,7 +346,7 @@ class MontyPackageManager:
                 revision=checked["revision"],
                 execution=dict(execution),
             )
-        if execution["result"] is not True:
+        if verified.get("passed") is not True:
             return _error(
                 operation,
                 "invalid_verification_result",
@@ -522,10 +543,8 @@ class MontyPackageManager:
             PackageValidationError: If file or tree limits are exceeded.
         """
 
-        session_id = f"_arenero_package_list_{uuid.uuid4().hex}"
         try:
-            listed = self.kernel.call_filesystem(
-                session_id,
+            result = self.kernel._call_filesystem_raw(
                 "ls",
                 {
                     "path": root,
@@ -533,15 +552,12 @@ class MontyPackageManager:
                     "limit": self.config.max_files * 4 + 1,
                 },
             )
-        finally:
-            self.kernel.reset(session_id)
-        if not listed["ok"]:
+        except (MontyError, TypeError, ValueError) as exc:
             raise PackageValidationError(
                 "package_not_found",
                 f"cannot list package root: {root}",
                 "Run package_init or choose an existing package root.",
-            )
-        result = listed["result"]
+            ) from exc
         if not isinstance(result, dict):
             raise PackageValidationError(
                 "invalid_inventory", "filesystem listing returned invalid data"
@@ -580,7 +596,12 @@ class MontyPackageManager:
                     f"hidden package paths are not supported: {path}",
                 )
             suffix = PurePosixPath(path).suffix
-            if suffix not in _SOURCE_SUFFIXES:
+            binary_asset = (
+                self.config.allow_binary_assets
+                and relative.startswith("assets/")
+                and suffix != ".py"
+            )
+            if suffix not in _SOURCE_SUFFIXES and not binary_asset:
                 raise PackageValidationError(
                     "unsupported_package_file",
                     f"unsupported source file type: {path}",
@@ -601,13 +622,14 @@ class MontyPackageManager:
                     f"cannot read bounded source file {path}: {exc}",
                     "Reduce the file below max_file_bytes.",
                 ) from exc
-            try:
-                content.decode()
-            except UnicodeDecodeError as exc:
-                raise PackageValidationError(
-                    "non_utf8_package_file",
-                    f"source file is not UTF-8: {path}",
-                ) from exc
+            if not binary_asset:
+                try:
+                    content.decode()
+                except UnicodeDecodeError as exc:
+                    raise PackageValidationError(
+                        "non_utf8_package_file",
+                        f"source file is not UTF-8: {path}",
+                    ) from exc
             total_bytes += len(content)
             if total_bytes > self.config.max_total_bytes:
                 raise PackageValidationError(

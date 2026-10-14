@@ -197,9 +197,10 @@ The native async LangChain adapter stays small. It exposes Python execution,
 flat Python-file execution, static module execution, and reset. It does not
 duplicate the virtual shell or all host-side filesystem tools. Monty code can use
 the existing `fs_*` helpers. This keeps one shell implementation and makes the
-smaller tool scope explicit. The native kernel includes bounded download for
-module resolution. It still omits host upload, full session listing, output-file
-offloading, the virtual shell, and automatic MCP artifact materialization. It
+smaller tool scope explicit. The native kernel reuses binary transfer source,
+store metadata, shared percent parsing/results, and JSON overflow preparation.
+It supports host upload/download, session listing, percent cells, and output-file
+offloading. It still omits the virtual shell and automatic MCP artifact materialization. It
 supports bound sessions, current-session info, forking, bootstrap, state policies,
 capability reports, statistics, and events. The full sync facade remains the one
 complete sandbox API.
@@ -213,6 +214,7 @@ flowchart TB
     Choice -->|No, batch Python| Native["AsyncPersistentMontyKernel"]
     Native --> Pool["Shared AsyncMonty worker pool"]
     Pool --> Sessions["Concurrent isolated session IDs"]
+    Native --> Utilities["Shared transfers, percent controls, and overflow JSON"]
 ```
 
 ## Shared-file locking is process-local
@@ -257,10 +259,20 @@ source in a private session marker. Restore checks the marker with native
 store field, or live interpreter owner is needed. Regular feeds still allocate
 compilation data, so helper reuse does not make session size constant.
 
-The sync kernel forwards `inputs=` just as the async kernel already did. Bound
-handles and managed `run_python` forward the same mapping. We do not generate
+Both kernels forward `inputs=` for direct, file, and module execution. Bound
+handles, facades, and managed Python/file/module/cell calls forward the same
+mapping. It binds after bootstrap, once before the first user-code feed; follow-up
+code sees file mutations instead of rebinding the original values. Shell and
+non-run percent cells reject nonempty inputs. We do not generate
 assignments, infer types, or disable checking for inputs. Stable input names need
 stubs when type checking is enabled. The outer agent tool schema stays unchanged.
+Native async and sync module tools gain only the optional overflow path.
+
+Native async result preparation returns the public fields and raw overflow bytes
+together. The outer operation writes bytes after the worker and file lock are
+released, while the session lock remains held. This reuses the existing formatter
+and transfer source without a second output format or a reentrant async lock.
+Write errors stay separate from execution and state-save outcomes.
 
 One small result converter replaces separate kernel and managed conversion
 rules. Bytes use Base64 records, complex values use real/imaginary records,
@@ -391,6 +403,10 @@ root, and cycle checks.
 Nested imports of bundled standard modules are passed through because Monty
 already implements them in supported scopes. No lazy virtual loader or new
 import cache is needed. Unsupported standard APIs still fail at runtime.
+Explicit `from . import sibling` forms use the same dependency resolver, root
+checks, and generated module bindings. Each loader binds its virtual `__file__`
+so code can find nearby assets. We do not add implicit parent-package execution,
+module metadata exports, or runtime import resolution.
 
 ## Monty packages use one source-only format
 
@@ -403,6 +419,15 @@ Package verification runs in a fresh temporary session and reads the current
 virtual files. This prevents a persistent REPL from hiding a source edit with old
 definitions. The verification module exports `passed = True` because a module's
 last expression is not the result of Arenero's generated module bundle.
+Package inventory uses raw isolated file scans, not model-trimmed session calls.
+The verifier flag crosses one private hosted callback before trimming. This
+keeps even zero-output checks correct without saving a temporary Python snapshot.
+The callback occupies one existing hosted-call budget slot.
+
+Binary assets use an opt-in boolean in existing package and managed configs.
+Only non-Python files under project-level `assets/` bypass UTF-8/suffix checks.
+The same inventory, byte caps, revision digest, verifier, and deterministic ZIP
+handle them. No resource loader, installer, or second quota system is added.
 
 Export runs verification again and writes a deterministic source ZIP. It excludes
 `dist` from the source revision and archive. The archive is useful for transfer,
@@ -412,9 +437,11 @@ review, and storage. It is not installable by Python. A source digest supports a
 ```mermaid
 flowchart LR
     Source["Fixed source tree"] --> Digest["Source revision"]
+    Assets["Optional assets/ bytes; existing quotas"] --> Digest
     Digest --> Static["Static module checks"]
     Static --> Fresh["Fresh Monty test"]
-    Fresh --> Zip["Deterministic source ZIP"]
+    Fresh --> Flag["Read passed before output trimming"]
+    Flag --> Zip["Deterministic source ZIP"]
 ```
 
 ## The virtual shell is a bounded Bash-like language

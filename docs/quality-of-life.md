@@ -84,14 +84,23 @@ experiment.execute("values.append(40)")
 `SessionHandle` provides `execute()`, `execute_file()`, `execute_module()`,
 `execute_cell()`, `variables()`, `reset()`, `info()`, and `fork()`.
 `AsyncSessionHandle` provides awaitable execution, file execution, module
-execution, variables, reset, info, and fork methods.
+execution, cell execution, variables, reset, info, and fork methods.
 
 Both kernels and bound handles accept `execute(code, inputs={...})`. Inputs bind
 before the user feed, after helper installation and bootstrap. A supplied name
 replaces an existing value. Values persist only when the state policy saves the
 operation. This is native Monty binding, not source interpolation. Inputs must
 be values Monty can accept, not unregistered tools or arbitrary host objects.
-`inputs=` is not added to the file/module/cell or model-facing tool schemas.
+Both kernels also accept inputs on `execute_file()` and `execute_module()`.
+Bound handles and facades forward them, and managed callers can use `run_file`,
+`run_module`, and `run_cell`. The first user-code feed receives them once;
+follow-up code sees any mutations made by the file. The trusted file-reading
+feed does not bind inputs or perform a user-source type check. The file's source
+and follow-up still follow the configured type-check policy.
+
+Cell inputs apply to Python and `%run` only. Nonempty input mappings on shell or
+other percent commands return `invalid_cell_inputs` without execution or reset.
+`inputs=` is a host option, not a new model-facing tool argument.
 
 Monty's static checker does not infer input declarations. Use stable stubs when
 type checking is enabled:
@@ -245,7 +254,30 @@ method `kernel.list_sessions()` for administration.
 `%who` and `%whos` use the read-only inspection path. Their model output follows
 the requested output limit and hard cap. They do not create a missing session.
 Native async callers use `await session.variables()`; the native async kernel
-does not have a percent-command dispatcher.
+also supports `await session.execute_cell("%whos")` and the same seven commands.
+`create_async_python_repl_tools()` dispatches those commands through its existing
+`python_repl` tool. Direct `execute()` is still Python-only. The native async cell
+API rejects shell cells with `unsupported_shell_cell`; use the sync or managed
+shell surface when needed.
+
+## Native async transfers and overflow output
+
+Use `await kernel.upload_file(path, bytes)` and `download_file(path)` for raw,
+bounded virtual transfers. They do not run bootstrap, load/save a persistent
+session, or use model output limits. Upload creates parents by default;
+`create_parents=False` requires them to exist. Paths must be absolute.
+`await kernel.list_sessions()` returns safe store metadata, not snapshot bytes.
+It is a trusted host administration API; `%sessions` still reports only its own ID.
+
+Both kernels and their wrappers support `output_file=` on Python, file, and
+module execution. The output file contains the shared JSON result format and
+full collected streams/error text, and is written only when public output is
+trimmed. File transfer and stream caps still apply. An output write failure sets
+`output_file_error`; it does not undo Python state or turn successful code into
+an execution failure. Native async writes use a fresh checkout after the user
+checkout closes and the non-reentrant file lock is released. The session lock
+stays held until the write finishes. A native `filesystem=False` operation cannot
+offload output to the configured filesystem.
 
 ## Runtime owner
 
@@ -336,10 +368,10 @@ important: a hosted MCP function must not re-enter the active persistent session
 Only binary blocks present in the final returned Python value are materialized.
 Intermediate MCP results are not scanned. Data removed by `McpHubConfig` result
 limits cannot be materialized. Each file must also fit
-`FilesystemConfig.max_transfer_bytes`. The native async kernel has bounded
-download for module resolution, but it does not have host upload or automatic
-artifact materialization. Automatic materialization is a synchronous kernel
-feature.
+`FilesystemConfig.max_transfer_bytes`. The native async kernel has raw upload
+and download, but still has no automatic MCP artifact materialization. That
+feature remains synchronous. Binary transfers and execution overflow are not
+automatic MCP artifact extraction.
 
 ## What these APIs do not add
 

@@ -96,6 +96,7 @@ SQLite stores opaque Monty snapshots only. It does not store files.
 | `max_workspace_files` | Positive integer | Sets the managed total regular-file quota. |
 | `max_workspace_bytes` | Positive integer | Sets the managed total file-byte quota. |
 | `max_active_sandboxes` | Positive integer | Bounds handles opened by one manager. |
+| `allow_binary_assets` | Boolean; default `False` | Allows non-Python package files under `assets/`; existing quotas still apply. |
 
 The batch preset uses `filesystem="none"` so separate Python sessions can use
 the worker pool at the same time. Set `filesystem="memory"` if agents must share
@@ -155,8 +156,16 @@ files with `source`. See [Virtual shell reference](virtual-shell.md).
 `%who`, and `%whos`.
 Managed `%run` resolves relative paths from the current directory.
 Inspection commands return saved names or name/type mappings without a state
-save. `inputs=` is available on `run_python()`, not `run_cell()` or the agent tool
-schema. With type checking, declare input names in the configured stubs.
+save. `inputs=` is available on `run_python()`, `run_file()`, `run_module()`, and
+Python/`%run` cells. It binds once after bootstrap, before the first source feed;
+a file's mutations remain for follow-up code. Nonempty inputs on shell or other
+controls are rejected. The agent tool schema does not add an input mapping.
+With type checking, declare input names in the configured stubs.
+
+`run_file()` and `run_module()` also accept `output_limit_chars` and
+`output_file`. Managed output paths are relative to the saved directory or
+absolute below the root, and count toward workspace quotas. `%run` forwards
+these options and `restart` rather than discarding them.
 
 ## Relative files and revisions
 
@@ -375,6 +384,9 @@ overlap, or separate managers and workspaces for concurrent file workloads.
 This is full managed feature parity, not Monty's native async interpreter path.
 Use `AsyncPersistentMontyKernel` when native async hosted functions are more
 important than the complete managed file, shell, package, and checkpoint API.
+That native kernel now has host upload/download, session listing, percent cells,
+and execution overflow files. It still has no native virtual shell or managed
+package/checkpoint surface.
 
 ## Agent tool bundle
 

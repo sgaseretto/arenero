@@ -59,12 +59,13 @@ flowchart TD
     Parse --> Imports{"Import kind"}
     Imports -->|Monty standard library| Keep["Keep normal import"]
     Imports -->|Top-level virtual module| Resolve["Resolve .py or __init__.py"]
+    Imports -->|Explicit relative sibling| Resolve
     Imports -->|Nested virtual module or wildcard| Reject["Reject before execution"]
     Resolve --> Limits["Check root, count, depth, bytes, and cycles"]
     Limits --> Dependency["Build dependency-first module loader"]
     Dependency --> Namespace["Create isolated simple module object"]
     Keep --> Namespace
-    Namespace --> Exports["Copy public entry exports to REPL globals"]
+    Namespace --> Exports["Copy public exports; __file__ stays local"]
     Exports --> Followup["Run optional follow-up in the same Monty feed"]
     Followup --> Snapshot["Save normal persistent session snapshot"]
 ```
@@ -88,6 +89,9 @@ import helper as h
 from helper import calculate
 from helper import calculate as run
 from .helper import calculate
+from . import helper
+from . import helper as h, other
+from .. import shared
 from package.values import VALUE
 from pathlib import Path
 ```
@@ -132,6 +136,22 @@ result = kernel.execute_module(
 With this configuration, `from shared.math import add` reads
 `/libraries/shared/math.py` or `/libraries/shared/math/__init__.py`.
 
+`from . import helper` binds a module object, not one exported value. It resolves
+an explicit sibling `.py` file or `__init__.py` directory. Aliases and several
+explicit names work; each counts toward the same graph limits. Parent levels
+still must remain inside allowed roots. There is no implicit parent-package
+execution, runtime module lookup, or import cache.
+
+Inside each static module, `__file__` is its absolute virtual source path. A
+function can keep that value in its closure and use `Path(__file__).parent` to
+read nearby assets. It is not copied to the REPL or exported on module objects.
+This rule is for `execute_module()`, not the flat `execute_file()` operation.
+
+Both kernels accept `inputs=` and `output_file=` for module execution. Inputs
+bind once after bootstrap, before the generated bundle. Full bounded overflow
+uses the same JSON format as direct Python. The generated bundle still skips
+type checking.
+
 The default limits are:
 
 | Limit | Default | Meaning |
@@ -150,7 +170,6 @@ The resolver rejects:
 - `from module import *`;
 - virtual-file imports inside functions, classes, `if`, loops, or other blocks;
 - circular module graphs;
-- `from . import helper`;
 - a dotted `import package.helper` without an `as` name;
 - paths outside configured roots or any path with `..`;
 - non-UTF-8 source and files without a `.py` entry path;

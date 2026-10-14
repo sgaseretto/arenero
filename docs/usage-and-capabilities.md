@@ -74,7 +74,7 @@ flowchart TD
 | Agent tools | Full sync tools, or a small native async Python, file, module, and reset set | LangChain is optional and the runtime thread selects the session. |
 | Static virtual modules | Top-level virtual imports, nested bundled standard imports, `.py`, `__init__.py`, roots, aliases, and follow-up code | No dynamic, wildcard, nested virtual-file, cyclic, or third-party imports. Generated feeds skip type checking. |
 | Session names | `variables()`, `%who`, and `%whos` | Public names and type names from saved state only; no values or live debugger. |
-| Host inputs | `execute(..., inputs={...})` and managed `run_python(..., inputs={...})` | Monty-supported values; typed input names need stable stubs. |
+| Host inputs | Direct, file, module, and Python/`%run` cell APIs | Values bind once after bootstrap; typed input names need stable stubs. Shell/control inputs are rejected. |
 | Deep Agents middleware | Async interpreter, dynamic catalog, PTC, subagent task bridge, three state modes, and private checkpoint snapshots | Nested calls bypass the parent ToolNode and its per-tool approvals. |
 | Recursive model calls | External context, plain calls, child RLM sessions, ordered batches, shared depth, call, token, cost, and time limits | Child sessions need free workers and use hosted file tools instead of direct kernel mounts. |
 | Speculative programmatic calls | Stream planning, safe static argument resolution, forked Monty shadows, result claims, fallback, cleanup, events, and statistics | Off by default. Only explicit non-sequential tools can run early. External effects are not transactional. |
@@ -144,11 +144,13 @@ full.
 Use `create_async_python_repl_tools(kernel)` for LangChain or LangGraph. It
 returns `python_repl`, `python_repl_execute_file`,
 `python_repl_execute_module`, and `reset_python_repl`.
-Shell cells are not accepted by this adapter. Async host functions and native
-async MCP functions must use `await` in Monty code. The native kernel has no
-host upload, session listing, or output-file offloading methods. It has bounded
-download support for module resolution. Use virtual `fs_*` helpers from Python,
-or select the full sync facade when broader host operations are required.
+Shell cells are not accepted by this adapter. The existing `python_repl` accepts
+the seven percent commands, including `%run` and read-only `%who`/`%whos`.
+Async host functions and native async MCP functions must use `await` in Monty
+code. Native host APIs now include upload/download, session listing, and bounded
+output-file offloading for direct/file/module execution. Use virtual `fs_*`
+helpers from Python, or select the full sync facade for shell and managed
+package/checkpoint operations.
 
 ## Working examples
 
@@ -192,6 +194,13 @@ saved snapshot without bootstrap or a state save. Missing or stateless sessions
 have no saved names. Inspection hides private and configured helper/tool names,
 but it is not a secret filter or a live debugger. See
 [quality-of-life APIs](quality-of-life.md).
+
+Use the same mapping with `session.execute_file(path, code, inputs=...)` or
+`execute_module(..., inputs=...)`. File inputs bind before its source, not again
+for follow-up code. Managed callers can use `run_file`, `run_module`, and
+Python/`%run` cells. Both kernels and these wrappers accept an `output_file` for
+bounded full JSON when public output is trimmed. Inputs stay a host-only option;
+agent tool names stay the same.
 
 ### Transform plain data
 

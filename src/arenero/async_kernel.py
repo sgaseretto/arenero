@@ -23,7 +23,7 @@ from pydantic_monty import (
 )
 
 from .events import EventSink, emit_event
-from .filesystem import FilesystemConfig, build_filesystem_prelude
+from .filesystem import FilesystemConfig, build_filesystem_prelude, build_upload_source
 from .hosted_tools import HostedToolSet
 from .kernel import (
     ExecutionResult,
@@ -237,6 +237,55 @@ class AsyncPersistentMontyKernel:
 
         return AsyncSessionHandle(self, session_id)
 
+    async def list_sessions(self) -> list[SessionInfo]:
+        """List saved session metadata without exposing snapshot bytes.
+
+        Returns:
+            Session records from the configured store; stateless stores return [].
+        """
+        return await asyncio.to_thread(self.store.list_sessions)
+
+    async def execute_cell(
+        self,
+        session_id: str,
+        code: str,
+        output_limit_chars: int | None = None,
+        *,
+        output_file: str | None = None,
+        state_policy: StatePolicy = "always",
+        restart: bool = False,
+        hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run Python or a percent command without adding native async shell support.
+
+        Args:
+            session_id: Session key for this cell.
+            code: Monty source or one supported single-line percent command.
+            output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for bounded untrimmed execution output.
+            state_policy: Python state save policy.
+            restart: Reset Python state before an executable cell when true.
+            hosted_tools: Optional operation-only tools.
+            inputs: Values bound once for Python or ``%run``, after bootstrap.
+
+        Returns:
+            Common cell result. Shell cells return a structured unsupported error.
+        """
+        from .cell import execute_async_repl_cell
+
+        return await execute_async_repl_cell(
+            self,
+            session_id,
+            code,
+            output_limit_chars,
+            output_file=output_file,
+            state_policy=state_policy,
+            restart=restart,
+            hosted_tools=hosted_tools,
+            inputs=inputs,
+        )
+
     def capabilities(self) -> dict[str, Any]:
         """Return active limits and integration capabilities.
 
@@ -361,6 +410,7 @@ class AsyncPersistentMontyKernel:
         code: str,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
@@ -373,6 +423,7 @@ class AsyncPersistentMontyKernel:
             session_id: Session key with 1 to 255 characters.
             code: Monty-compatible Python code.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for bounded untrimmed output.
             state_policy: Save state ``always``, only on ``success``, or ``never``.
             restart: Reset state before this execution when true.
             hosted_tools: Optional tools available for this operation only.
@@ -386,6 +437,7 @@ class AsyncPersistentMontyKernel:
             session_id,
             code,
             output_limit_chars,
+            output_file=output_file,
             file_path=None,
             state_policy=state_policy,
             restart=restart,
@@ -401,9 +453,11 @@ class AsyncPersistentMontyKernel:
         code: str | None = None,
         output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute a virtual Python file and optional follow-up code.
 
@@ -412,8 +466,10 @@ class AsyncPersistentMontyKernel:
             file_path: Path to a readable virtual Python file.
             code: Optional code to run after the file.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for bounded untrimmed output.
             state_policy: Save state ``always``, only on ``success``, or ``never``.
             restart: Reset state before this execution when true.
+            inputs: Values bound once before the first user-code feed.
             hosted_tools: Optional tools available for this operation only.
 
         Returns:
@@ -423,11 +479,76 @@ class AsyncPersistentMontyKernel:
             session_id,
             code,
             output_limit_chars,
+            output_file=output_file,
             file_path=file_path,
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
         )
+
+    async def upload_file(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        create_parents: bool = True,
+    ) -> int:
+        """Write bounded bytes without bootstrap or persistent state changes.
+
+        Args:
+            path: Absolute virtual destination.
+            content: Bytes to write, bounded by the filesystem transfer limit.
+            create_parents: Create missing parent directories when true.
+
+        Returns:
+            Number of bytes written. Denied or oversized transfers raise an error.
+        """
+        if not path.startswith("/"):
+            raise ValueError("path must be an absolute virtual POSIX path")
+        if len(content) > self.filesystem_config.max_transfer_bytes:
+            raise ValueError("content exceeds the filesystem transfer limit")
+        result = await self._run_isolated(
+            build_upload_source(path, create_parents),
+            inputs={"_arenero_transfer_content": bytes(content)},
+        )
+        if not isinstance(result, int):
+            raise TypeError("the virtual file write did not return a byte count")
+        emit_event(
+            self.event_sink, "filesystem", "uploaded", path=path, size_bytes=result
+        )
+        return result
+
+    async def _run_isolated(
+        self,
+        code: str,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Run a file transfer without bootstrap, snapshots, or model output trimming.
+
+        Args:
+            code: Trusted Monty transfer source.
+            inputs: Plain values bound before the transfer feed.
+
+        Returns:
+            Raw bounded Monty result. No Python session state is loaded or saved.
+        """
+        await self.open()
+        async with (
+            self.filesystem_guard(),
+            self._require_pool().checkout(
+                script_name="<arenero:transfer>",
+                limits=self.config.resource_limits(),
+                os_policy=self.config.os_policy,
+            ) as session,
+        ):
+            return await session.feed_run(
+                code,
+                inputs=dict(inputs) if inputs is not None else None,
+                mount=self.mounts,
+                os=self.os_handler,
+            )
 
     async def download_file(
         self,
@@ -459,21 +580,7 @@ class AsyncPersistentMontyKernel:
             "    raise ValueError('file exceeds the transfer limit')\n"
             "_arenero_transfer_path.read_bytes()"
         )
-        await self.open()
-        async with (
-            self.filesystem_guard(),
-            self._require_pool().checkout(
-                script_name="<arenero:download>",
-                limits=self.config.resource_limits(),
-                os_policy=self.config.os_policy,
-                type_check=False,
-            ) as session,
-        ):
-            result = await session.feed_run(
-                source,
-                mount=self.mounts,
-                os=self.os_handler,
-            )
+        result = await self._run_isolated(source)
         if not isinstance(result, bytes):
             raise TypeError("the virtual file did not return binary content")
         emit_event(
@@ -493,9 +600,11 @@ class AsyncPersistentMontyKernel:
         output_limit_chars: int | None = None,
         *,
         module_config: VirtualModuleConfig | None = None,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
         restart: bool = False,
         hosted_tools: HostedToolSet | None = None,
+        inputs: Mapping[str, Any] | None = None,
     ) -> ExecutionResult:
         """Resolve and execute a static virtual module graph.
 
@@ -504,9 +613,11 @@ class AsyncPersistentMontyKernel:
             entry_path: Absolute virtual entry ``.py`` file.
             code: Optional follow-up code in the same feed.
             output_limit_chars: Optional caller output limit.
+            output_file: Optional virtual path for bounded untrimmed output.
             module_config: Optional module roots, aliases, and limits.
             state_policy: State save policy for this operation.
             restart: Reset saved Python state before execution when true.
+            inputs: Values bound once before the first user-code feed.
             hosted_tools: Optional tools for this operation only.
 
         Returns:
@@ -554,10 +665,12 @@ class AsyncPersistentMontyKernel:
             session_id,
             source,
             output_limit_chars,
+            output_file=output_file,
             file_path=None,
             state_policy=state_policy,
             restart=restart,
             hosted_tools=hosted_tools,
+            inputs=inputs,
             skip_type_check=True,
         )
 
@@ -568,6 +681,7 @@ class AsyncPersistentMontyKernel:
         output_limit_chars: int | None,
         *,
         file_path: str | None,
+        output_file: str | None = None,
         state_policy: StatePolicy,
         restart: bool,
         hosted_tools: HostedToolSet | None,
@@ -582,10 +696,11 @@ class AsyncPersistentMontyKernel:
             code: Direct or follow-up code.
             output_limit_chars: Optional caller output limit.
             file_path: Optional virtual Python file to execute first.
+            output_file: Optional virtual path for bounded untrimmed output.
             state_policy: State save policy for this operation.
             restart: Whether to reset state before this operation.
             hosted_tools: Optional operation-only hosted tools.
-            inputs: Optional plain values bound before the direct code feed.
+            inputs: Values bound once before the first user-code feed.
             filesystem: Allow configured mounts and virtual file callbacks.
             skip_type_check: Disable checking for generated support code.
 
@@ -621,21 +736,34 @@ class AsyncPersistentMontyKernel:
             return self._finish_result(result, session_id, metrics)
         limit, limit_was_capped = self._output_limit(output_limit_chars)
         file_guard = self.filesystem_guard() if filesystem else _no_filesystem_guard()
-        async with self._lock_for(session_id), file_guard:
-            result = await self._execute_locked(
-                session_id,
-                code,
-                file_path,
-                limit,
-                limit_was_capped,
-                state_policy,
-                restart,
-                hosted_tools,
-                inputs,
-                filesystem,
-                skip_type_check,
-                metrics,
-            )
+        async with self._lock_for(session_id):
+            async with file_guard:
+                result, payload = await self._execute_locked(
+                    session_id,
+                    code,
+                    file_path,
+                    limit,
+                    limit_was_capped,
+                    state_policy,
+                    restart,
+                    hosted_tools,
+                    inputs,
+                    filesystem,
+                    skip_type_check,
+                    metrics,
+                    output_file,
+                )
+            if payload is not None and output_file is not None:
+                try:
+                    if not filesystem:
+                        raise ValueError(
+                            "filesystem access is disabled for this operation"
+                        )
+                    await self.upload_file(output_file, payload)
+                except (MontyError, ValueError, TypeError, RuntimeError) as exc:
+                    result["output_file_error"] = str(exc)
+                else:
+                    result["output_file"] = output_file
         result["session_restarted"] = metrics.session_restarted
         result["host_calls"] = (
             metrics.hosted_scope.summary()
@@ -658,7 +786,8 @@ class AsyncPersistentMontyKernel:
         filesystem: bool,
         skip_type_check: bool,
         metrics: _ExecutionMetrics,
-    ) -> ExecutionResult:
+        output_file: str | None,
+    ) -> tuple[ExecutionResult, bytes | None]:
         """Execute while the session and optional file locks are held.
 
         Args:
@@ -670,13 +799,14 @@ class AsyncPersistentMontyKernel:
             state_policy: State save policy for this operation.
             restart: Whether to delete saved state before loading.
             hosted_tools: Optional operation-only hosted tools.
-            inputs: Optional plain values bound before the direct code feed.
+            inputs: Values bound once before the first user-code feed.
             filesystem: Allow configured mounts and virtual file callbacks.
             skip_type_check: Disable checking for generated support code.
             metrics: Mutable execution statistics.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
-            A structured execution result.
+            Public execution result and optional raw overflow payload.
         """
         if restart:
             existed = await asyncio.to_thread(self.store.delete, session_id)
@@ -708,6 +838,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=True,
                 revision=stored.revision,
                 state_policy=state_policy,
+                output_file=output_file,
             )
 
         streams = CollectStreams(max_bytes=self.config.max_stream_bytes)
@@ -730,6 +861,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         try:
             checkout_started = time.monotonic()
@@ -797,6 +929,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         except TimeoutError as exc:
             metrics.checkout_wait_seconds = time.monotonic() - checkout_started
@@ -810,6 +943,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         except MontyError as exc:
             return self._result(
@@ -821,6 +955,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
 
         if terminal_resource_error:
@@ -834,6 +969,7 @@ class AsyncPersistentMontyKernel:
                 limit_was_capped=limit_was_capped,
                 state_restored=restored,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         if state is None:
             return self._result(
@@ -847,6 +983,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         if len(state) > self.config.max_state_bytes:
             return self._result(
@@ -861,6 +998,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         try:
             revision = await asyncio.to_thread(
@@ -881,6 +1019,7 @@ class AsyncPersistentMontyKernel:
                 state_restored=restored,
                 revision=stored.revision if stored else None,
                 state_policy=state_policy,
+                output_file=output_file,
             )
         return self._result(
             result=result,
@@ -893,6 +1032,7 @@ class AsyncPersistentMontyKernel:
             state_restored=restored,
             revision=revision,
             state_policy=state_policy,
+            output_file=output_file,
         )
 
     async def _prepare_session(
@@ -986,7 +1126,7 @@ class AsyncPersistentMontyKernel:
             code: Direct or follow-up code.
             file_path: Optional virtual file to read and run first.
             external_lookup: Host functions for this operation.
-            inputs: Optional values for a direct code feed.
+            inputs: Values bound once before the first user-code feed.
             filesystem: Allow configured mounts and virtual file callbacks.
 
         Returns:
@@ -1007,12 +1147,14 @@ class AsyncPersistentMontyKernel:
             f"open({json.dumps(file_path)}).read()",
             external_lookup,
             filesystem=filesystem,
+            skip_type_check=True,
         )
         result = await self._feed(
             session,
             streams,
             source,
             external_lookup,
+            inputs=inputs,
             filesystem=filesystem,
         )
         if code is not None:
@@ -1193,13 +1335,14 @@ class AsyncPersistentMontyKernel:
             A structured failed execution result.
         """
         limit, limit_was_capped = self._output_limit(requested_limit)
-        return self._result(
+        result, _ = self._result(
             error_type=error_type,
             error_message=message,
             limit=limit,
             limit_was_capped=limit_was_capped,
             state_policy=state_policy,
         )
+        return result
 
     def _result(
         self,
@@ -1215,7 +1358,8 @@ class AsyncPersistentMontyKernel:
         state_restored: bool = False,
         revision: int | None = None,
         state_policy: StatePolicy = "always",
-    ) -> ExecutionResult:
+        output_file: str | None = None,
+    ) -> tuple[ExecutionResult, bytes | None]:
         """Build and trim one native async execution result.
 
         Args:
@@ -1230,11 +1374,12 @@ class AsyncPersistentMontyKernel:
             state_restored: Whether state was loaded.
             revision: Saved revision, when available.
             state_policy: State save policy for this operation.
+            output_file: Optional virtual path for bounded untrimmed output.
 
         Returns:
-            Public execution result.
+            Public execution result and optional raw overflow payload.
         """
-        public_result, _ = _prepare_execution_result(
+        return _prepare_execution_result(
             result=result,
             streams=streams or CollectStreams(max_bytes=self.config.max_stream_bytes),
             error_type=error_type,
@@ -1245,10 +1390,9 @@ class AsyncPersistentMontyKernel:
             state_saved=state_saved,
             state_restored=state_restored,
             revision=revision,
-            output_file=None,
+            output_file=output_file,
             state_policy=state_policy,
         )
-        return public_result
 
     def _finish_result(
         self,

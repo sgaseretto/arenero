@@ -72,6 +72,18 @@ def capability_report(
             "normal_cpython": False,
             "native_dynamic_execution": ["eval", "exec", "locals"],
             "direct_feed_inputs": True,
+            "inputs_execution_methods": [
+                "execute",
+                "execute_file",
+                "execute_module",
+                "execute_cell: Python or %run",
+            ],
+            "output_file_execution_methods": [
+                "execute",
+                "execute_file",
+                "execute_module",
+                "execute_cell: Python or %run",
+            ],
             "input_type_checking": "declare stable input names in type_check_stubs",
             "result_encodings": {
                 "bytes": "Base64 record",
@@ -132,6 +144,7 @@ def capability_report(
                 ".py files",
                 "__init__.py packages",
                 "relative imports",
+                "explicit sibling imports: from . import helper",
                 "configured aliases",
                 "same-call follow-up code",
             ],
@@ -223,11 +236,16 @@ def capability_report(
             "files": list(getattr(kernel, "bootstrap_files", ())),
             "runs_for_new_sessions_only": True,
         },
-        "repl_commands": (
-            ["%run FILE", "%reset", "%limits", "%sessions", "%mcp", "%who", "%whos"]
-            if not is_async
-            else []
-        ),
+        "repl_commands": [
+            "%run FILE",
+            "%reset",
+            "%limits",
+            "%sessions",
+            "%mcp",
+            "%who",
+            "%whos",
+        ],
+        "repl_command_api": "session.execute_cell(); not direct execute()",
         "important_limits": [
             "Monty is a Python subset, not CPython.",
             "Normal third-party imports and operating-system processes are unavailable.",

@@ -212,7 +212,7 @@ class VirtualModuleResolver:
         ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
         function_name = f"_arenero_load_{self._digest(path)}"
         module_symbol = self._symbol(path)
-        source_lines = [f"def {function_name}():"]
+        source_lines = [f"def {function_name}():", f"    __file__ = {path!r}"]
         if body:
             for statement in body:
                 rendered = ast.unparse(statement)
@@ -292,10 +292,23 @@ class VirtualModuleResolver:
             return [statement], [
                 alias.asname or alias.name for alias in statement.names
             ]
-        if module is None:
-            raise VirtualModuleError("'from . import name' is not supported")
         if any(alias.name == "*" for alias in statement.names):
             raise VirtualModuleError("wildcard virtual imports are not supported")
+        if module is None:
+            replacements: list[ast.stmt] = []
+            names: list[str] = []
+            for alias in statement.names:
+                dependency = self._resolve(importer, alias.name, statement.level)
+                self._compile(dependency, depth + 1)
+                local = alias.asname or alias.name
+                replacements.append(
+                    ast.Assign(
+                        targets=[ast.Name(id=local, ctx=ast.Store())],
+                        value=ast.Name(id=self._symbol(dependency), ctx=ast.Load()),
+                    )
+                )
+                names.append(local)
+            return replacements, names
         dependency = self._resolve(importer, module, statement.level)
         self._compile(dependency, depth + 1)
         available = set(self._exports[dependency])

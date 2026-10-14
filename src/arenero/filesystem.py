@@ -122,6 +122,29 @@ def build_filesystem_prelude(config: FilesystemConfig) -> str:
     return limits + _FILESYSTEM_PRELUDE
 
 
+def build_upload_source(path: str, create_parents: bool) -> str:
+    """Build the shared Monty source for an isolated binary upload.
+
+    Args:
+        path: Absolute virtual destination, validated by the caller.
+        create_parents: Create missing parent directories when true.
+
+    Returns:
+        Source that writes the bound ``_arenero_transfer_content`` bytes.
+    """
+    parent_step = (
+        "_arenero_transfer_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        if create_parents
+        else ""
+    )
+    return (
+        "from pathlib import Path\n"
+        f"_arenero_transfer_path = Path({path!r})\n"
+        f"{parent_step}"
+        "_arenero_transfer_path.write_bytes(_arenero_transfer_content)"
+    )
+
+
 def build_filesystem_call(
     operation: FilesystemOperation,
     arguments: Mapping[str, FilesystemValue],

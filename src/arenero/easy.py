@@ -142,6 +142,7 @@ class SandboxConfig:
         max_workspace_files: Maximum files managed below ``workspace_root``.
         max_workspace_bytes: Maximum combined workspace bytes.
         max_active_sandboxes: Maximum handles opened by one manager.
+        allow_binary_assets: Allow non-Python package files under ``assets/`` when true.
     """
 
     persistence: PersistenceMode = "memory"
@@ -157,6 +158,7 @@ class SandboxConfig:
     max_workspace_files: int = 1_000
     max_workspace_bytes: int = 10_000_000
     max_active_sandboxes: int = 100
+    allow_binary_assets: bool = False
 
     def __post_init__(self) -> None:
         """Validate related persistence, path, and quota settings."""
@@ -513,6 +515,7 @@ class ManagedSandbox:
         *,
         output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
         restart: bool = False,
     ) -> SandboxResult:
         """Run a Python, ``!command``, or ``%%shell`` cell.
@@ -523,12 +526,19 @@ class ManagedSandbox:
             output_file: Optional relative or absolute overflow file.
             state_policy: Python state save policy.
             restart: Reset Python state before a Python cell when true.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Common managed sandbox result.
         """
 
         stripped = code.lstrip()
+        if inputs and stripped.startswith(("!", "%%")):
+            return _failure(
+                "invalid_cell_inputs",
+                "Shell cells do not accept inputs.",
+                "Use a Python cell or %run for inputs.",
+            )
         if stripped.startswith("%%shell"):
             _, _, command = stripped.partition("\n")
             return self.run_shell(command, output_limit_chars, output_file=output_file)
@@ -546,7 +556,11 @@ class ManagedSandbox:
             if len(arguments) == 2 and arguments[0] == "run":
                 return self.run_file(
                     arguments[1],
+                    output_limit_chars=output_limit_chars,
+                    output_file=output_file,
                     state_policy=state_policy,
+                    inputs=inputs,
+                    restart=restart,
                 )
         if stripped.startswith("%"):
             try:
@@ -559,6 +573,7 @@ class ManagedSandbox:
                         self.resolve_path(output_file) if output_file else None
                     ),
                     state_policy=state_policy,
+                    inputs=inputs,
                     restart=restart,
                 )
             except _MANAGED_ERRORS as exc:
@@ -571,6 +586,7 @@ class ManagedSandbox:
             output_limit_chars,
             output_file=output_file,
             state_policy=state_policy,
+            inputs=inputs,
             restart=restart,
         )
 
@@ -578,15 +594,23 @@ class ManagedSandbox:
         self,
         path: str,
         code: str | None = None,
+        output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
+        restart: bool = False,
     ) -> SandboxResult:
         """Run one virtual Python file and optional follow-up code.
 
         Args:
             path: Relative or absolute virtual Python file.
             code: Optional follow-up code in the same operation.
+            output_limit_chars: Optional public output limit.
+            output_file: Relative or absolute overflow file within the workspace.
             state_policy: Python state save policy.
+            inputs: Values bound once before the first user-code feed.
+            restart: Reset Python state before this file when true.
 
         Returns:
             Common managed sandbox result.
@@ -600,7 +624,11 @@ class ManagedSandbox:
                     self.session_id,
                     self.resolve_path(path),
                     code=code,
+                    output_limit_chars=output_limit_chars,
+                    output_file=self.resolve_path(output_file) if output_file else None,
                     state_policy=state_policy,
+                    inputs=inputs,
+                    restart=restart,
                 )
             except _MANAGED_ERRORS as exc:
                 return _failure(
@@ -616,17 +644,23 @@ class ManagedSandbox:
         self,
         path: str,
         code: str | None = None,
+        output_limit_chars: int | None = None,
         *,
+        output_file: str | None = None,
         module_config: VirtualModuleConfig | None = None,
         state_policy: StatePolicy = "always",
+        inputs: Mapping[str, Any] | None = None,
     ) -> SandboxResult:
         """Run one bounded static virtual-module graph.
 
         Args:
             path: Relative or absolute entry Python file.
             code: Optional follow-up code.
+            output_limit_chars: Optional public output limit.
+            output_file: Relative or absolute overflow file within the workspace.
             module_config: Optional explicit module rules.
             state_policy: Python state save policy.
+            inputs: Values bound once before the first user-code feed.
 
         Returns:
             Common managed sandbox result.
@@ -640,9 +674,12 @@ class ManagedSandbox:
                     self.session_id,
                     self.resolve_path(path),
                     code,
+                    output_limit_chars,
+                    output_file=self.resolve_path(output_file) if output_file else None,
                     module_config=module_config
                     or VirtualModuleConfig(roots=(self.root,)),
                     state_policy=state_policy,
+                    inputs=inputs,
                 )
             except _MANAGED_ERRORS as exc:
                 return _failure(
@@ -1488,6 +1525,7 @@ class ManagedSandbox:
                 "cwd": self.cwd,
                 "persistence": self.config.persistence,
                 "filesystem": self.config.filesystem,
+                "allow_binary_assets": self.config.allow_binary_assets,
                 "policy_digest": self.policy_digest(),
                 "workspace": {
                     "file_count": len(files),
@@ -1524,6 +1562,7 @@ class ManagedSandbox:
             + f"Workspace root: {self.root}\n"
             + f"Current directory: {self.cwd}\n"
             + workspace
+            + f"Package binary assets under assets/: {self.config.allow_binary_assets}.\n"
             + "Python state and files have separate lifecycles unless the host uses "
             + "checkpoint and restore. Forked sessions share files.\n"
         )
@@ -1551,6 +1590,8 @@ class ManagedSandbox:
             "bootstrap": capabilities["bootstrap"],
             "external_lookup_names": sorted(self.kernel.external_lookup),
         }
+        if self.config.allow_binary_assets:
+            data["allow_binary_assets"] = True
         encoded = json.dumps(_policy_value(data), sort_keys=True).encode()
         return hashlib.sha256(encoded).hexdigest()
 
@@ -1627,10 +1668,13 @@ class ManagedSandbox:
         source_root = root or self.root
         if self.config.filesystem == "none":
             return {}
-        value = self.kernel._run_isolated(
-            self.kernel._filesystem_prelude
-            + f"\nfs_ls({source_root!r}, recursive=True, "
-            + f"limit={self.config.filesystem_limits.max_scan_entries})"
+        value = self.kernel._call_filesystem_raw(
+            "ls",
+            {
+                "path": source_root,
+                "recursive": True,
+                "limit": self.config.filesystem_limits.max_scan_entries,
+            },
         )
         if value["truncated"]:
             raise ValueError("workspace exceeds the filesystem scan limit")
@@ -1773,6 +1817,7 @@ class ManagedSandbox:
                 max_file_bytes=min(256_000, limits.max_transfer_bytes),
                 max_total_bytes=min(2_000_000, self.config.max_workspace_bytes),
                 max_archive_bytes=min(2_500_000, self.config.max_workspace_bytes),
+                allow_binary_assets=self.config.allow_binary_assets,
             ),
         )
 

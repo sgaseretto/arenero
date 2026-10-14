@@ -32,6 +32,15 @@ rejected nested virtual imports, and native async parity. Its complete mocked
 LangChain graph spans two human turns and reuses supplied values, a saved helper,
 and a directory. Inspection must not change snapshot bytes or revisions.
 
+`tests/test_api_completion.py` checks the next six changes: raw package metadata
+at a zero-character output cap; once-only file/module/cell inputs across bound,
+facade, and managed APIs; typed file reads; sync and native async overflow JSON;
+native async uploads, listing, controls, failures, and a one-worker write path;
+relative sibling imports and graph limits; opt-in binary assets, virtual
+`__file__`, revisions, deterministic ZIPs, and existing quotas. A complete mocked
+native async agent runs `%run`, inspects state on the second human turn, and uses
+the existing module tool to write full output. No live model is called.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -83,6 +92,12 @@ Run the six runtime-change checks only:
 
 ```console
 uv run --frozen python -m unittest tests.test_runtime_simplifications -v
+```
+
+Run the API-completion checks only:
+
+```console
+uv run --frozen python -m unittest tests.test_api_completion -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative
