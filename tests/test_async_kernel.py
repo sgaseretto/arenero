@@ -170,7 +170,7 @@ class AsyncKernelTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_timeout_deletes_async_session_state(self) -> None:
         """Start fresh after a terminal interpreter timeout."""
         config = KernelConfig(
-            max_duration_seconds=0.01,
+            max_feed_duration_seconds=0.01,
             request_timeout_seconds=1,
         )
         async with AsyncPersistentMontyKernel(config=config) as kernel:

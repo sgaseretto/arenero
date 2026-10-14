@@ -289,8 +289,8 @@ open handle with no snapshot stays open.
 
 `ManagedSandbox.fork(new_id)` copies the current opaque Python snapshot and
 returns a child handle in `result.value`. The child shares files and the runtime.
-It does not outlive a parent-owned runtime. The Monty duration budget in the
-snapshot is also copied.
+It does not outlive a parent-owned runtime. Native directory, RNG, and resource
+settings are also copied. The next feed starts a new duration clock.
 
 ## Async applications
 
@@ -391,14 +391,16 @@ Does not work:
 
 ```python
 sandbox.run_python("import requests")  # No third-party packages.
-sandbox.run_python("eval('1 + 1')")  # Monty does not provide eval.
-sandbox.run_shell("python helper.py")  # No arbitrary processes.
+sandbox.run_python("compile('1 + 1', '<cell>', 'eval')")  # No code-object compiler.
+sandbox.run_shell("python -m helper")  # No normal module runner.
 sandbox.run_shell("pip install requests")  # No package installer.
 sandbox.read("../../secret")  # Managed paths cannot escape.
 ```
 
 The managed layer improves setup and lifecycle safety. It does not change
 Monty's language, import, runtime, host-boundary, or security constraints. Read
+the [upstream version review](monty-updates.md) before applying newer Monty
+features to this API. Read
 [Usage and capabilities](usage-and-capabilities.md) and
 [Sandbox compatibility](sandbox-compatibility.md) before production use.
 

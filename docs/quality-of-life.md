@@ -82,8 +82,8 @@ experiment.execute("values.append(40)")
 provides awaitable execution, file execution, module execution, reset, info, and
 fork methods.
 
-A fork copies only the opaque Monty snapshot. It keeps the remaining cumulative
-Monty duration budget because that budget is part of the snapshot. It does not
+A fork copies only the opaque Monty snapshot, including native directory, RNG,
+and resource settings. The next feed starts a new duration clock. It does not
 copy virtual files, mounts, host functions, MCP connections, or credentials.
 Files can still be shared when both sessions use the same filesystem. The target
 session must not exist.

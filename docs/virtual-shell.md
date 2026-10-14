@@ -28,6 +28,9 @@ flowchart LR
     Policy -->|Yes| Dispatch["Virtual command dispatcher"]
     Dispatch --> VFS["Virtual filesystem"]
     Dispatch --> Monty["Persistent Monty session"]
+    Monty --> CWD["Native virtual directory"]
+    Dispatch -->|"cd and pwd"| CWD
+    CWD -->|"relative paths"| VFS
     Dispatch --> HTTP["Bounded HTTP client"]
     VFS --> Result["Bounded text result"]
     Monty --> Result
@@ -323,9 +326,15 @@ session. They do not accept pipeline input, script arguments, `-m`, an interacti
 prompt, or normal CPython flags. `FILE.py` is submitted as source; it is not a
 normal Python import.
 
-Monty has no `eval`, `exec`, `compile`, `__import__`, subprocesses, sockets,
+Arenero's pinned Monty `1.1.0` has no `compile`, `globals`, `__import__`,
+subprocesses, sockets,
 threads, site-packages, or native extensions. Use Arenero's `execute_module()` for
 a bounded Monty-compatible virtual source package.
+
+Native `eval` and `exec` run Monty source, not CPython. Their strings bypass static
+checking. Python `os.chdir()` and shell `cd` change the same saved virtual
+directory; relative Python file reads use it. The host process directory is not
+changed. See [the migration and limit guide](monty-updates.md).
 
 ## Examples that work
 

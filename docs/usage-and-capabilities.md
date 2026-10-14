@@ -1,8 +1,10 @@
 # Arenero usage and capabilities
 
 This guide shows what Arenero can do, what it rejects, and how to select the right
-API. The examples were checked with the project-pinned `pydantic-monty 0.0.21`.
-Monty is experimental, so run the project tests before a Monty version update.
+API. The examples are tested with the project-pinned `pydantic-monty 1.1.0`.
+Upstream now has a `1.x` release series. These examples still use Arenero's
+pinned runtime. Read [the Monty update review](monty-updates.md) and run the
+project tests before a runtime migration.
 
 ## Quick selection guide
 
@@ -480,14 +482,19 @@ still cannot load virtual files.
 ### Dynamic execution and namespace inspection
 
 ```python
-kernel.execute("thread-1", "eval('1 + 1')")
-kernel.execute("thread-1", "exec('x = 1')")
+assert kernel.execute("thread-1", "eval('20 + 22')")["result"] == 42
+kernel.execute("thread-1", "exec('x = 42')")
+assert kernel.execute("thread-1", "locals()['x']")["result"] == 42
+# These still fail:
 kernel.execute("thread-1", "__import__('math')")
 kernel.execute("thread-1", "globals()")
 ```
 
-These operations are absent. Submit source as a new host-driven feed instead of
-building source inside Monty.
+`eval`, `exec`, and `locals` are native Monty features, not CPython bridges.
+Runtime source bypasses static checking and retains compiled state. An explicit
+namespace dictionary does not resolve unknown host functions. `compile`,
+`globals`, and `__import__` remain absent. See the
+[migration guide](monty-updates.md) for namespace and limit rules.
 
 ### Real shell and process commands
 
@@ -545,10 +552,11 @@ operations instead of random-access update modes.
 sandbox.execute("python -c '21 * 2'", timeout=1)
 ```
 
-The facade returns exit code `2` because one persistent checkout cannot safely
-change its cumulative Monty budget per call. Set
-`KernelConfig.max_duration_seconds` and `request_timeout_seconds` when the kernel
-is created. Virtual `curl --max-time` can only lower the network timeout.
+The facade returns exit code `2`; per-call timeout overrides are not part of
+this API. Set `KernelConfig.max_feed_duration_seconds`, optional
+`max_turn_duration_seconds`, and `request_timeout_seconds` when the kernel is
+created. Host waits are not interpreter time. Virtual `curl --max-time` can only
+lower the network timeout.
 
 ## Verified Monty Python shape
 
@@ -560,6 +568,7 @@ The following forms work in the pinned runtime:
 - Exceptions from Monty's fixed exception set.
 - Synchronous context managers.
 - F-strings and common calculations.
+- Complex numbers, `format`, percent formatting, native `eval`, `exec`, and `locals`.
 - Generator expressions, but they are eager lists instead of lazy generators.
 
 The following forms do not work:
@@ -569,26 +578,29 @@ The following forms do not work:
 - `match`, `del`, `async with`, `async for`, and exception groups.
 - User-defined exception subclasses.
 - Wildcard imports, relative imports, packages, and dynamic imports.
-- `eval`, `exec`, `compile`, `globals`, `locals`, `vars`, and `dir`.
+- `compile`, `globals`, `vars`, `dir`, and `__import__`.
 
 `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions are
 eager. Do not use them on large or unbounded inputs.
 
 ## Verified module imports
 
-The table reports only whether the module imports in `pydantic-monty 0.0.21`.
+The table reports only whether the module imports in `pydantic-monty 1.1.0`.
 Every successful module provides only part of the CPython API.
 
 | Imports | Does not import |
 | --- | --- |
-| `asyncio`, `collections`, `dataclasses`, `datetime`, `itertools`, `json`, `math`, `os`, `pathlib`, `re`, `sys`, `typing`, `unicodedata` | `base64`, `binascii`, `csv`, `functools`, `hashlib`, `io`, `logging`, `pickle`, `random`, `socket`, `subprocess`, `tempfile`, `threading`, `time`, `traceback`, `urllib`, `uuid`, `zipfile` |
+| `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata` | `csv`, `hashlib`, `io`, `logging`, `os.path`, `pickle`, `posixpath`, `socket`, `subprocess`, `tempfile`, `threading`, `traceback`, `urllib`, `uuid`, `zipfile` |
 
 Do not infer API support from a successful import. For example, Monty's `os` has
-no process API, normal current directory, or complete `os.path` behavior. Use a
-small runtime test for an API that matters.
+no process API or `os.path`, but has a native virtual current directory. Use a
+small runtime test for an API that matters. `asyncio` has `run`, `gather`, and
+`sleep`, not task creation or exposed event loops. `functools` has `reduce` and
+`partial`; dataclasses have `eq` and `frozen`, not factories or post-init hooks.
 
 Arenero's virtual shell implements `base64`, `sha256sum`, and `curl` in the host.
-This does not make the matching Python modules available inside Monty.
+This does not add Python `hashlib` or network modules. Native Base64 is available
+independently. No extra host bridge is needed for Base64 inside Python.
 
 ## Filesystem choices
 

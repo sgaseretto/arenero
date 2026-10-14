@@ -220,9 +220,10 @@ to a different thread. A missing, changed, or oversized signed snapshot is
 rejected and cleared.
 
 This feature stores full snapshots. It does not implement snapshot deltas.
-Monty's remaining cumulative duration budget is part of the snapshot. Restoring
-an old checkpoint restores its remaining budget too. Checkpoint time travel does
-not restore virtual files or undo external tool effects.
+Monty's resource settings, native directory, and RNG state are part of the
+snapshot. A new feed resets the duration clock; it is not a session-lifetime
+budget. Checkpoint time travel does not restore virtual files or undo external
+tool effects. Old Monty-version snapshots require a reset.
 
 ## Dynamic instructions
 

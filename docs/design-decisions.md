@@ -224,12 +224,38 @@ lock for their full read-modify-write operation.
 The lock cannot coordinate two application processes. Applications that mount the
 same host directory in separate processes must supply external coordination.
 
-## Monty compatibility is a tested range
+## Monty compatibility is an exact tested version
 
-The package currently accepts `pydantic-monty>=0.0.21,<0.0.22`. Monty is
-experimental, and session snapshots are version-specific. A new Monty release
+The package pins `pydantic-monty==1.1.0`, including its matched client and worker
+dependencies. The [2026-10-14 migration](monty-updates.md) records breaking limit
+changes and new features. A new Monty release
 must pass the unit tests, static type check, clean build, and clean core install
-before the dependency range changes.
+before the dependency pin changes.
+
+Monty's old cumulative duration setting is removed. We use an explicit
+`max_feed_duration_seconds` field, not an alias with a different meaning. A
+five-second feed limit and ten-second total system-sleep limit remain bounded
+defaults. The optional turn limit is off. We reuse one `KernelConfig.resource_limits()`
+method in both kernels and keep Monty's default one-second duration backstops.
+We do not add a host-side cumulative session budget.
+
+Both kernels pass `KernelConfig.os_policy` to Monty. Python and the virtual shell
+use one native virtual directory. Shell state and directory are read in one host
+callback, so output trimming cannot damage internal directory data. This removes
+the duplicate directory global and one shell setup execution. New mounted
+workspace sessions enter their virtual root before bootstrap.
+
+Native `eval`, `exec`, Base64, copying, random, time, formatting, and complex
+numbers need no extra wrapper. The static resolver passes the new built-in
+modules through. We keep `execute_file` and the resolver because native exec does
+not add file imports, return the last expression from a file, or resolve host
+names under an explicit namespace. We do not add live host-object wrappers or
+unreleased `ExternalModule` APIs; their restore behavior needs a separate design.
+
+Old snapshots require an explicit reset. No conversion is attempted. A released
+1.1.0 dump keeps its resource configuration, except for the current stricter
+suspension cap. Low-level callers must reset after policy changes. Managed
+checkpoint policy checks remain in place.
 
 ## Control APIs stay outside Monty
 

@@ -30,6 +30,12 @@ output, error, truncation, retryable, and output-file fields. Set output_file to
 an absolute virtual path to save larger bounded output when the response is
 trimmed.
 
+Native eval(), exec(), and locals() run within Monty, not CPython. Runtime source
+strings bypass static checking. compile(), globals(), __import__(), normal file
+imports, and third-party packages are unavailable. Python os.chdir() and shell
+cd share one virtual directory. Interpreter time is bounded per code feed, not
+over the session lifetime; host waits need separate deadlines.
+
 """
     + VIRTUAL_SHELL_TOOL_DESCRIPTION
 )
@@ -44,6 +50,10 @@ also await mcp_servers(), mcp_search(), mcp_describe(), mcp_promote(),
 mcp_refresh(), and mcp_call(). Check ok, error, error.recovery, truncated, and
 host_calls before using a result. This small
 native async adapter does not support output-file offloading.
+Native eval(), exec(), and locals() run Monty source, not CPython, and runtime
+strings bypass static checking. Normal file imports, compile(), globals(), and
+__import__() are unavailable. Use os.getcwd()/os.chdir() for virtual relative
+paths. Interpreter duration is per feed; host waits need separate deadlines.
 """
 
 VIRTUAL_MODULE_TOOL_DESCRIPTION = """Resolve and run a limited static Python

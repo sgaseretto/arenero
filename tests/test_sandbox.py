@@ -327,7 +327,7 @@ class SandboxTests(unittest.TestCase):
     def test_terminal_time_limit_resets_saved_session(self) -> None:
         """Discard persistent state after Monty reports a terminal timeout."""
         config = KernelConfig(
-            max_duration_seconds=0.01,
+            max_feed_duration_seconds=0.01,
             request_timeout_seconds=1,
         )
         kernel, _ = self.make_sandbox(kernel_config=config)

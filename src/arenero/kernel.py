@@ -21,6 +21,7 @@ from pydantic_monty import (
     MontyShutdown,
     MountDir,
     OsHandler,
+    OSPolicy,
     ResourceLimits,
     TypeCheckFormat,
 )
@@ -148,7 +149,11 @@ class KernelConfig:
         allowed_shell_commands: Enabled virtual command names, or all commands.
         max_stream_bytes: Maximum collected standard stream bytes.
         max_state_bytes: Maximum saved Monty session size.
-        max_duration_seconds: Cumulative Monty interpreter time per session.
+        max_feed_duration_seconds: Interpreter time limit for each code feed.
+        max_turn_duration_seconds: Interpreter time between host answers, or None.
+        max_suspensions: Maximum host/OS suspensions in one worker checkout.
+        max_total_sleep_seconds: Maximum total system sleep in one checkout.
+        os_policy: Monty clock, sleep, and initial random seed policy, or defaults.
         max_memory_bytes: Maximum tracked Monty allocations.
         max_recursion_depth: Maximum Monty call depth.
         request_timeout_seconds: Worker request wall-time limit.
@@ -175,7 +180,11 @@ class KernelConfig:
     allowed_shell_commands: frozenset[str] | None = None
     max_stream_bytes: int = 1_000_000
     max_state_bytes: int = 5_000_000
-    max_duration_seconds: float = 5.0
+    max_feed_duration_seconds: float = 5.0
+    max_turn_duration_seconds: float | None = None
+    max_suspensions: int = 1_000
+    max_total_sleep_seconds: float = 10.0
+    os_policy: OSPolicy | None = None
     max_memory_bytes: int = 64 * 1024 * 1024
     max_recursion_depth: int = 100
     request_timeout_seconds: float = 10.0
@@ -210,6 +219,15 @@ class KernelConfig:
             raise ValueError("allowed shell command names must not be empty or padded")
         if self.max_stream_bytes <= 0 or self.max_state_bytes <= 0:
             raise ValueError("byte limits must be greater than 0")
+        if self.max_feed_duration_seconds <= 0 or (
+            self.max_turn_duration_seconds is not None
+            and self.max_turn_duration_seconds <= 0
+        ):
+            raise ValueError("interpreter duration limits must be greater than 0")
+        if self.max_suspensions <= 0 or self.max_total_sleep_seconds < 0:
+            raise ValueError(
+                "suspensions must be positive and sleep must be nonnegative"
+            )
         if self.min_worker_processes <= 0:
             raise ValueError("min_worker_processes must be greater than 0")
         if (
@@ -229,6 +247,23 @@ class KernelConfig:
             and self.max_checkouts_per_worker <= 0
         ):
             raise ValueError("max_checkouts_per_worker must be greater than 0")
+
+    def resource_limits(self) -> ResourceLimits:
+        """Build the shared Monty limits for sync and async checkouts.
+
+        Returns:
+            Per-feed and per-turn time, memory, recursion, suspension, and sleep limits.
+        """
+        limits: ResourceLimits = {
+            "max_feed_duration_secs": self.max_feed_duration_seconds,
+            "max_memory": self.max_memory_bytes,
+            "max_recursion_depth": self.max_recursion_depth,
+            "max_suspensions": self.max_suspensions,
+            "max_total_sleep_secs": self.max_total_sleep_seconds,
+        }
+        if self.max_turn_duration_seconds is not None:
+            limits["max_turn_duration_secs"] = self.max_turn_duration_seconds
+        return limits
 
 
 InfrastructureErrors = (
@@ -987,7 +1022,8 @@ class PersistentMontyKernel:
                 checkout_started = time.monotonic()
                 with self._pool.checkout(
                     script_name=f"<arenero:{session_id}>",
-                    limits=self._resource_limits(),
+                    limits=self.config.resource_limits(),
+                    os_policy=self.config.os_policy,
                     type_check=(
                         False
                         if skip_type_check
@@ -1200,6 +1236,14 @@ class PersistentMontyKernel:
         )
         if not new_session:
             return
+        if self.default_working_directory != "/":
+            self._feed(
+                session,
+                streams,
+                f"import os as _arenero_os\n_arenero_os.chdir({self.default_working_directory!r})",
+                external_lookup,
+                skip_type_check=True,
+            )
         for path in self.bootstrap_files:
             source = self._feed(
                 session,
@@ -1372,7 +1416,8 @@ class PersistentMontyKernel:
             self.filesystem_guard(),
             self._pool.checkout(
                 script_name="<arenero:transfer>",
-                limits=self._resource_limits(),
+                limits=self.config.resource_limits(),
+                os_policy=self.config.os_policy,
             ) as session,
         ):
             return session.feed_run(
@@ -1407,18 +1452,6 @@ class PersistentMontyKernel:
         """
         with self._locks_guard:
             return self._locks.setdefault(session_id, threading.Lock())
-
-    def _resource_limits(self) -> ResourceLimits:
-        """Build Monty resource limits from kernel configuration.
-
-        Returns:
-            Limits for time, memory, and recursion depth.
-        """
-        return {
-            "max_duration_secs": self.config.max_duration_seconds,
-            "max_memory": self.config.max_memory_bytes,
-            "max_recursion_depth": self.config.max_recursion_depth,
-        }
 
     def _output_limit(self, requested: int | None) -> tuple[int, bool]:
         """Normalize a requested output limit.
@@ -1771,6 +1804,10 @@ def _error_code(error_type: str, message: str) -> str:
     if error_type == "VirtualModuleError":
         return "virtual_module_error"
     lowered = message.lower()
+    if "suspension limit" in lowered:
+        return "suspension_limit"
+    if "sleep limit" in lowered:
+        return "sleep_limit"
     if "hosted tool call limit" in lowered:
         return "hosted_tool_call_limit"
     if "hosted tool" in lowered and "time limit" in lowered:
@@ -1814,6 +1851,10 @@ def _error_hint(error_type: str, message: str, retryable: bool) -> str:
     if error_type in hints:
         return hints[error_type]
     lowered = message.lower()
+    if "suspension limit" in lowered:
+        return "Use fewer host or OS calls, or split the work across executions."
+    if "sleep limit" in lowered:
+        return "Start fresh with less system sleep or a zero-sleep OS policy."
     if "hosted tool call limit" in lowered:
         return "Use fewer hosted calls or split the work across executions."
     if "hosted tool" in lowered and "time limit" in lowered:
@@ -1821,10 +1862,14 @@ def _error_hint(error_type: str, message: str, retryable: bool) -> str:
     if "unresolved-reference" in lowered:
         return (
             "Define the name. If it is a newly added hosted tool, use restart=True "
-            "or configure it before this type-checked session starts."
+            "or configure it before this type-checked session starts. For exec-defined "
+            "names, use execute_file or keep their use inside exec."
         )
     if "import" in lowered or "no module" in lowered:
-        return "Use execute_file or %run for virtual Python files; packages are unavailable."
+        return (
+            "Third-party packages are unavailable. Use execute_file for one virtual "
+            "file or execute_module for a static graph."
+        )
     if "nameerror" in lowered or "not defined" in lowered:
         return "Define the name or run its helper file before this code."
     if retryable:
@@ -1855,7 +1900,7 @@ def _recovery_action(error_type: str, message: str, retryable: bool) -> Recovery
         "call limit" in lowered or "time limit" in lowered
     ):
         return "revise_code"
-    if "time limit" in lowered or "memory" in lowered:
+    if "time limit" in lowered or "sleep limit" in lowered or "memory" in lowered:
         return "restart_session"
     if error_type in {
         "InvalidSessionId",

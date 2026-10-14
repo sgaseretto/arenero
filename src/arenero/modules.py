@@ -15,6 +15,7 @@ MONTY_STDLIB_MODULES = frozenset(
         "base64",
         "binascii",
         "collections",
+        "copy",
         "dataclasses",
         "datetime",
         "functools",
@@ -23,8 +24,10 @@ MONTY_STDLIB_MODULES = frozenset(
         "math",
         "os",
         "pathlib",
+        "random",
         "re",
         "sys",
+        "time",
         "typing",
         "unicodedata",
     }

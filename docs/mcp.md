@@ -143,21 +143,25 @@ Agent-supplied configuration is a plain dictionary. These are the accepted
 forms:
 
 ```python
-mcp_add_server({
-    "name": "local",
-    "transport": "stdio",
-    "command": "python",
-    "args": ["server.py"],
-    "env": {"MODE": "agent"},
-    "cwd": "/srv/tools",
-})
+mcp_add_server(
+    {
+        "name": "local",
+        "transport": "stdio",
+        "command": "python",
+        "args": ["server.py"],
+        "env": {"MODE": "agent"},
+        "cwd": "/srv/tools",
+    }
+)
 
-mcp_add_server({
-    "name": "remote",
-    "transport": "streamable-http",
-    "url": "https://example.com/mcp",
-    "headers": {"Authorization": "Bearer token"},
-})
+mcp_add_server(
+    {
+        "name": "remote",
+        "transport": "streamable-http",
+        "url": "https://example.com/mcp",
+        "headers": {"Authorization": "Bearer token"},
+    }
+)
 ```
 
 `transport="http"` is a short alias for `"streamable-http"`. Unknown fields,
@@ -177,11 +181,13 @@ results as the REPL functions.
 Replace or remove a server by its stable namespace:
 
 ```python
-changed = mcp_replace_server({
-    "name": "remote",
-    "transport": "http",
-    "url": "https://new.example.com/mcp",
-})
+changed = mcp_replace_server(
+    {
+        "name": "remote",
+        "transport": "http",
+        "url": "https://new.example.com/mcp",
+    }
+)
 removed = mcp_remove_server("remote")
 ```
 
@@ -283,7 +289,11 @@ Arenero reattaches fresh MCP host functions when it restores the Monty snapshot.
 The agent can also write one flat helper to a virtual `.py` file and load it with
 `execute_file()`. For a small static helper graph, it can use `execute_module()`.
 This remains host-side bounded source resolution, not Monty importlib. There is
-no dynamic import, `eval`, or `exec` inside Monty.
+no dynamic import inside the pinned Monty `1.1.0`. Native `eval` and `exec` run
+within Monty and can call attached host functions when they use normal globals.
+An explicit globals dictionary does not resolve unknown host names. Development
+host modules may later provide a namespaced tool bridge. See
+[the migration guide](monty-updates.md).
 
 Live MCP connections are not in the snapshot. Keep the `McpHub` active for later
 turns. After an application restart, create a new hub with the same configured

@@ -259,7 +259,8 @@ direct mount is disabled. Trusted `bootstrap_code` still runs.
 - The parent interpreter tool cannot call itself.
 - Recursive child sessions do not get direct kernel mounts or virtual
   `bootstrap_files`.
-- RLM does not add CPython packages, `exec`, dynamic imports, sockets,
+- This RLM uses Monty `1.1.0`; native `eval` and `exec` run in Monty. They bypass
+  static checking. The RLM does not add CPython packages, dynamic imports, sockets,
   subprocesses, or arbitrary shell commands to Monty.
 - Output that exceeds `max_response_chars` is rejected. Arenero does not execute
   a truncated code block.

@@ -191,7 +191,9 @@ class ManagedSandboxTests(unittest.TestCase):
 
         with open_sandbox("source-policy") as source:
             checkpoint = source.checkpoint().value
-        config = SandboxConfig.conversation(kernel=KernelConfig(max_duration_seconds=5))
+        config = SandboxConfig.conversation(
+            kernel=KernelConfig(max_feed_duration_seconds=5)
+        )
         with open_sandbox("target-policy", config=config) as target:
             result = target.restore(checkpoint)
             self.assertFalse(result.ok)

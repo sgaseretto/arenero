@@ -146,13 +146,15 @@ after the URL check, so the secret does not need to appear in an agent command.
   agent can access sensitive data.
 - Private and non-global addresses must stay blocked unless a trusted local test
   or service needs them.
-- Use both Monty's cumulative duration limit and the pool request timeout.
+- Use Monty's per-feed duration limit and the pool request timeout. Host work
+  needs its own deadline. System sleeps and host suspensions have separate caps.
 - A time limit, memory limit, or worker crash invalidates the affected persistent
   session. Arenero deletes its saved state in these cases.
 - Read-write mounts change real host files. Mount only a dedicated data directory
   that is outside import, configuration, and execution paths.
-- The current Monty release is experimental. Store the Monty version with every
-  snapshot and reset incompatible sessions.
+- This project pins Monty `1.1.0`.
+  Store the Monty version with every snapshot and reset incompatible sessions.
+  Read [the upstream review](monty-updates.md) before changing the runtime.
 
 ## Related references
 

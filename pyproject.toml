@@ -5,7 +5,7 @@ description = "A persistent Monty REPL and agent tool"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "pydantic-monty>=0.0.21,<0.0.22",
+    "pydantic-monty==1.1.0",
     "urllib3>=2.5.0",
 ]
 

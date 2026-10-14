@@ -16,6 +16,7 @@ import time
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
@@ -2499,6 +2500,8 @@ def _json_value(value: Any) -> Any:
         return _json_value(asdict(value))
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
     if value is None or isinstance(value, (bool, float, int, str)):
         return value
     return repr(value)
@@ -2527,6 +2530,10 @@ def _policy_value(value: Any) -> Any:
         return [_policy_value(item) for item in value]
     if callable(value):
         return {"configured_callable": True}
+    if isinstance(value, bytes):
+        return _json_value(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
     if isinstance(value, Path):
         return str(value)
     return value

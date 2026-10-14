@@ -60,7 +60,10 @@ supports only the documented small expression subset. source runs the same small
 grammar and shares the command, output, filesystem, and nesting limits.
 
 Python runs Monty's limited Python subset, not CPython; it has no third-party
-packages or normal file imports. curl allows public HTTP and HTTPS URLs by
+packages or normal file imports. Native eval/exec run Monty source and bypass
+static checking. Python os.chdir() and shell cd share one virtual directory.
+Interpreter duration is per feed, not per session lifetime.
+curl allows public HTTP and HTTPS URLs by
 default. NetworkConfig can restrict exact URL origins, path prefixes, and methods,
 or disable curl. Each redirect is checked again. Private, local, and reserved
 addresses are blocked by default. Use -o FILE for a binary response; normal curl
@@ -240,7 +243,7 @@ class AreneroSandbox:
             return SandboxExecuteResult(
                 output=(
                     "Per-call timeouts are not supported. Configure "
-                    "KernelConfig.max_duration_seconds and "
+                    "KernelConfig.max_feed_duration_seconds and "
                     "request_timeout_seconds."
                 ),
                 exit_code=2,

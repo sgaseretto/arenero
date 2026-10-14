@@ -1,0 +1,637 @@
+{
+  "checked_on": "2026-10-14",
+  "released_version": "1.1.0",
+  "development_commit": "4246aa75724b133e55f8a82e2cf5dfc0120e62e8",
+  "comparison_baseline_dependency": "pydantic-monty>=0.0.21,<0.0.22",
+  "arenero_dependency": "pydantic-monty==1.1.0",
+  "runtime_upgraded": true,
+  "scope": "Historical bounded direct Monty comparison; current Arenero validation is in tests/test_monty_110.py and the full suite.",
+  "runtime_apis": {
+    "0.0.21": {
+      "checkout": "(self, /, *, script_name='main.py', limits=None, type_check=False, type_check_stubs=None, type_check_format=None, type_check_color=False, assert_message_annotations=Ellipsis, dataclass_registry=None)",
+      "external_modules": false,
+      "host_class_construction": false,
+      "host_objects": false,
+      "resource_limit_keys": [
+        "gc_interval",
+        "max_duration_secs",
+        "max_memory",
+        "max_recursion_depth"
+      ],
+      "sandbox_class_proxy": false
+    },
+    "1.1.0": {
+      "checkout": "(self, /, *, script_name='main.py', limits=None, type_check=False, type_check_stubs=None, type_check_format=None, type_check_color=False, assert_message_annotations=Ellipsis, print_flush_interval=None, os_policy=None)",
+      "external_modules": false,
+      "host_class_construction": true,
+      "host_objects": true,
+      "resource_limit_keys": [
+        "gc_interval",
+        "max_feed_duration_secs",
+        "max_memory",
+        "max_recursion_depth",
+        "max_suspensions",
+        "max_total_sleep_secs",
+        "max_turn_duration_secs"
+      ],
+      "sandbox_class_proxy": true
+    }
+  },
+  "legacy_duration_limit": {
+    "0.0.21": {
+      "ok": true,
+      "value": 2
+    },
+    "1.1.0": {
+      "error": "ValueError",
+      "message": "unknown limits key 'max_duration_secs'; accepted keys are 'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'",
+      "ok": false
+    }
+  },
+  "features": {
+    "ascii85": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'base64'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "hello"
+      }
+    },
+    "asyncio_create_task": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'module' object has no attribute 'create_task'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'module' object has no attribute 'create_task'",
+        "ok": false
+      }
+    },
+    "asyncio_sleep": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: module 'asyncio' has no attribute 'sleep'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "base64": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'base64'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "aGVsbG8="
+      }
+    },
+    "binascii": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'binascii'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 50018
+      }
+    },
+    "bytes_percent_format": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: unsupported operand type(s) for %: 'bytes' and 'tuple'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "b'answer 42'"
+      }
+    },
+    "class_iterator": {
+      "0.0.21": {
+        "ok": true,
+        "value": [
+          20,
+          22
+        ]
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": [
+          20,
+          22
+        ]
+      }
+    },
+    "compile": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'compile' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'compile' is not defined",
+        "ok": false
+      }
+    },
+    "complex": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support complex constants",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "(5+0j)"
+      }
+    },
+    "copy": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'copy'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": {
+          "items": [
+            1,
+            2
+          ]
+        }
+      }
+    },
+    "dataclass_field": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ImportError: cannot import name 'field' from 'dataclasses' (unknown location)",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ImportError: cannot import name 'field' from 'dataclasses' (unknown location)",
+        "ok": false
+      }
+    },
+    "dataclass_options": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: dataclass() keyword options (eq, order, frozen, unsafe_hash, ...) are not yet supported",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": true
+      }
+    },
+    "dataclass_post_init": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: dataclass() does not yet support __post_init__ in a class body, which would be silently skipped",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: dataclass() does not yet support __post_init__ in a class body, which would be silently skipped",
+        "ok": false
+      }
+    },
+    "datetime_now": {
+      "0.0.21": {
+        "ok": true,
+        "value": true
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": true
+      }
+    },
+    "delete": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support the 'del' statement",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support the 'del' statement",
+        "ok": false
+      }
+    },
+    "dynamic_import": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name '__import__' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name '__import__' is not defined",
+        "ok": false
+      }
+    },
+    "eager_builtins": {
+      "0.0.21": {
+        "ok": true,
+        "value": [
+          "list",
+          "list"
+        ]
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": [
+          "list",
+          "list"
+        ]
+      }
+    },
+    "eager_generator_expression": {
+      "0.0.21": {
+        "ok": true,
+        "value": "list"
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "list"
+      }
+    },
+    "eval": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'eval' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "exec": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'exec' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "exec_namespace": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'exec' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "file_exclusive_mode": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ValueError: exclusive creation mode is not supported",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ValueError: exclusive creation mode is not supported",
+        "ok": false
+      }
+    },
+    "file_iteration": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: '_io.TextIOWrapper' object is not iterable",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: '_io.TextIOWrapper' object is not iterable",
+        "ok": false
+      }
+    },
+    "file_newline": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: 'newline' argument is not yet supported",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: 'newline' argument is not yet supported",
+        "ok": false
+      }
+    },
+    "file_update_mode": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ValueError: update modes ('+') are not yet supported",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ValueError: update modes ('+') are not yet supported",
+        "ok": false
+      }
+    },
+    "format": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'format' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "0042"
+      }
+    },
+    "functools_partial": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'functools'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 8
+      }
+    },
+    "functools_reduce": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'functools'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "generator_function": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support yield expressions",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support yield expressions",
+        "ok": false
+      }
+    },
+    "globals": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'globals' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'globals' is not defined",
+        "ok": false
+      }
+    },
+    "hashlib": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'hashlib'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'hashlib'",
+        "ok": false
+      }
+    },
+    "inheritance": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support class inheritance and metaclasses",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support class inheritance and metaclasses",
+        "ok": false
+      }
+    },
+    "iter_next": {
+      "0.0.21": {
+        "ok": true,
+        "value": [
+          1,
+          2
+        ]
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": [
+          1,
+          2
+        ]
+      }
+    },
+    "itertools_batched": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ImportError: cannot import name 'batched' from 'itertools' (unknown location)",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      }
+    },
+    "itertools_tee": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ImportError: cannot import name 'tee' from 'itertools' (unknown location)",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": [
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    "locals": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NameError: name 'locals' is not defined",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 42
+      }
+    },
+    "match": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support pattern matching (match statements)",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "NotImplementedError: The monty syntax parser does not yet support pattern matching (match statements)",
+        "ok": false
+      }
+    },
+    "native_cwd": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: module 'os' has no attribute 'getcwd'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "/"
+      }
+    },
+    "os_path": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'os.path'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'os.path'",
+        "ok": false
+      }
+    },
+    "os_scandir": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: module 'os' has no attribute 'scandir'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: module 'os' has no attribute 'scandir'",
+        "ok": false
+      }
+    },
+    "path_glob": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'PosixPath' object has no attribute 'glob'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'PosixPath' object has no attribute 'glob'",
+        "ok": false
+      }
+    },
+    "path_walk": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'PosixPath' object has no attribute 'walk'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "AttributeError: 'PosixPath' object has no attribute 'walk'",
+        "ok": false
+      }
+    },
+    "percent_format": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: unsupported operand type(s) for %: 'str' and 'tuple'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": "answer 42"
+      }
+    },
+    "posixpath": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'posixpath'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'posixpath'",
+        "ok": false
+      }
+    },
+    "print_stderr": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "TypeError: print() 'file' argument is not supported",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": true
+      }
+    },
+    "random": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'random'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 82
+      }
+    },
+    "third_party_import": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'numpy'",
+        "ok": false
+      },
+      "1.1.0": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'numpy'",
+        "ok": false
+      }
+    },
+    "time": {
+      "0.0.21": {
+        "error": "MontyRuntimeError",
+        "message": "ModuleNotFoundError: No module named 'time'",
+        "ok": false
+      },
+      "1.1.0": {
+        "ok": true,
+        "value": 0
+      }
+    }
+  }
+}

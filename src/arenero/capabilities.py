@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import asdict
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from .modules import VirtualModuleConfig
+from .modules import MONTY_STDLIB_MODULES, VirtualModuleConfig
 from .store import InMemorySessionStore, SQLiteSessionStore, StatelessSessionStore
 
 if TYPE_CHECKING:
@@ -17,7 +19,7 @@ if TYPE_CHECKING:
 def capability_report(
     kernel: PersistentMontyKernel | AsyncPersistentMontyKernel,
 ) -> dict[str, Any]:
-    """Return the exact public capabilities of one configured kernel.
+    """Return public capabilities and the configured new-session policy.
 
     Args:
         kernel: Configured synchronous or asynchronous kernel.
@@ -68,6 +70,18 @@ def capability_report(
             "monty_version": kernel.monty_version,
             "mode": "native-async" if is_async else "sync",
             "normal_cpython": False,
+            "native_dynamic_execution": ["eval", "exec", "locals"],
+            "stdlib_modules": sorted(MONTY_STDLIB_MODULES),
+            "virtual_cwd_shared_with_shell": not is_async,
+            "os_policy": _os_policy_report(kernel),
+            "policy_report_scope": "configured new sessions, not saved dump inspection",
+            "limit_scopes": {
+                "duration": "per feed; optional per interpreter turn",
+                "suspensions": "per checkout; reset on snapshot restore",
+                "system_sleep": "per checkout; reset on snapshot restore",
+                "request_timeout": "per worker protocol turn, not whole operation",
+                "restored_limits": "snapshot limits, except current suspension cap",
+            },
         },
         "persistence": {
             "mode": store_mode,
@@ -206,9 +220,14 @@ def capability_report(
         "important_limits": [
             "Monty is a Python subset, not CPython.",
             "Normal third-party imports and operating-system processes are unavailable.",
+            "eval and exec run Monty code, not CPython, and bypass static type checking.",
+            "Type-checked follow-up code cannot see names defined only by exec.",
+            "Explicit exec namespace dictionaries do not resolve unknown host functions.",
+            "Time and memory failures discard Python state; host time needs its own deadline.",
             "Use execute_file or %run for one flat virtual Python file.",
             "Use execute_module for a bounded static virtual module graph.",
             "Session snapshots do not contain virtual files or host functions.",
+            "Reset saved sessions after changes to resource limits or OS policy.",
             "Dynamic MCP server configuration lasts only while its hub is alive.",
             "One execution at a time is allowed for each session.",
         ],
@@ -267,10 +286,44 @@ def _kernel_limits(
     """
     data = asdict(kernel.config)
     data.pop("type_check_stubs", None)
+    data.pop("os_policy", None)
     allowed = data.get("allowed_shell_commands")
     if allowed is not None:
         data["allowed_shell_commands"] = sorted(allowed)
     return data
+
+
+def _os_policy_report(
+    kernel: PersistentMontyKernel | AsyncPersistentMontyKernel,
+) -> dict[str, Any]:
+    """Report OS policy defaults with JSON-safe datetime and seed values.
+
+    Args:
+        kernel: Configured kernel.
+
+    Returns:
+        Policy values; fixed datetimes use ISO text and byte seeds use Base64.
+    """
+    policy: dict[str, Any] = {
+        "datetime": "system",
+        "timezone": "UTC",
+        "sleep": "system",
+        "sleep_system_max": 10.0,
+        "process_time": "zero",
+        "random_start": "system",
+    }
+    policy.update(kernel.config.os_policy or {})
+    if isinstance(policy["datetime"], datetime):
+        policy["datetime"] = policy["datetime"].isoformat()
+    start = policy["random_start"]
+    if isinstance(start, dict) and isinstance(start.get("seed"), bytes):
+        policy["random_start"] = {
+            "seed": {
+                "encoding": "base64",
+                "content": base64.b64encode(start["seed"]).decode("ascii"),
+            }
+        }
+    return policy
 
 
 def _filesystem_mode(

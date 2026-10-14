@@ -4,6 +4,10 @@ Arenero gives an application one small persistent execution service. It adds
 session storage, virtual files, a limited shell, agent adapters, and application
 limits around Monty. Monty remains the only Python runtime.
 
+This architecture uses pinned Monty `1.1.0`. The
+[migration guide](monty-updates.md) describes per-feed limits, native directories,
+OS policy, snapshot constraints, and unreleased import APIs.
+
 ## System map
 
 ```mermaid
@@ -187,7 +191,8 @@ session unsafe, so Arenero removes its saved state.
 The `success` state policy keeps the previous snapshot after a normal code error.
 The `never` policy does not save the operation. Neither policy rolls back file,
 network, or MCP side effects. Session forking copies the opaque Monty snapshot,
-including its remaining duration budget, but does not copy files or host tools.
+including its native directory and RNG state, but does not copy files or host
+tools. The next feed starts a new duration clock.
 
 ## State ownership
 
@@ -195,8 +200,8 @@ Python state and file state are intentionally separate:
 
 | State | Owner | Persistence |
 | --- | --- | --- |
-| Python globals, functions, classes, and remaining duration budget | Monty snapshot in the selected `SessionStore` | Follows memory, SQLite, or stateless mode. |
-| Virtual shell variables, working directory, previous directory, and last status | Reserved values in the Monty session | Follow the Python session. |
+| Python globals, functions, classes, native directory, RNG, and resource configuration | Monty snapshot in the selected `SessionStore` | Follows memory, SQLite, or stateless mode. Feed time resets for each new feed. |
+| Virtual shell variables, previous directory, and last status | Reserved values in the Monty session | Follow the Python session. `PWD` uses Monty's native directory. |
 | `OSAccess` memory files | The caller-owned `OSAccess` object | Lives while that object lives. It is not in SQLite. |
 | `WorkspaceConfig` files | Dedicated host directory through `MountDir` | Survives process restarts. It is not in SQLite. |
 | Caller-supplied mounts | Caller-owned `MountDir` objects | Follows the selected mount mode and host directory. |
@@ -211,7 +216,8 @@ flowchart LR
     SessionID["session_id"] --> Snapshot["Monty snapshot"]
     Snapshot --> PythonState["Python values and functions"]
     Snapshot --> ShellState["Shell variables, PWD, OLDPWD, and status"]
-    Snapshot --> Budget["Remaining cumulative duration"]
+    Snapshot --> Config["Resource settings, native directory, and RNG"]
+    Feed["New code feed"] --> Budget["Fresh interpreter-time budget"]
 
     FileConfig["Filesystem configuration"] --> MemoryFiles["OSAccess memory files"]
     FileConfig --> Workspace["Host-backed workspace"]

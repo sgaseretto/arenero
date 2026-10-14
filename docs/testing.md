@@ -16,6 +16,14 @@ flowchart TD
 The current suite includes the first three layers. Live provider tests are not
 part of the suite.
 
+`tests/test_monty_110.py` tests native dynamic source, standard modules, complex
+values, eager iterators, unsupported features, virtual helper execution, saved
+RNG and functions, directory sharing and restore, workspace bootstrap, fixed OS
+policy, native stderr, feed and turn limits, sleep and suspension limits, old
+snapshot rejection, and sync/async parity. It uses real Monty workers and no LLM.
+The full suite also tests mocked LangGraph agents, MCP reload, source packages,
+RLM recursion, speculative calls, cancellation, and checkpoints on this version.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -24,6 +32,13 @@ part of the suite.
 | Live integration | Check one real provider or remote service. | Not implemented. These tests must be separate and opt-in if added later. |
 
 ## Run the suite
+
+For a version-specific language and API comparison, run
+`uv run --frozen python scripts/monty_feature_probe.py`. Run that same script in
+an isolated environment for a candidate Monty release. It is separate from the
+Arenero suite: a successful native feature probe does not validate our adapters,
+snapshots, or limit mapping. See [the reviewed comparison](monty-updates.md) and
+[saved results](monty-compatibility.json).
 
 Run all tests:
 

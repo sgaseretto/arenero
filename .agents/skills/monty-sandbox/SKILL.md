@@ -5,13 +5,27 @@ description: Build, review, debug, or integrate Pydantic Monty sandboxes and Mon
 
 # Monty Sandbox
 
-Treat Monty as a small Python-like VM for model-written glue code. It is not CPython, a shell, a package runner, or a general code sandbox.
+Treat Monty as a bounded Python sandbox for model-written glue code. Use its
+documented language subset and explicit host capabilities.
 
 ## Before changing Monty code
 
-1. Check the installed `pydantic-monty` version and its Python API. Monty is experimental and its API, language subset, snapshots, and wire format can change.
+1. Check the installed `pydantic-monty` version and its Python API. Monty reached
+   `1.0.0` on 2026-09-25; older releases and newer development source have
+   different language, limit, and snapshot contracts.
 2. Read [references/constraints.md](references/constraints.md) when a task depends on Python syntax, imports, files, host functions, resource limits, security, or persistence.
 3. Prefer a short runtime probe over a CPython assumption. Turn on Monty type checking when the integration can support it.
+
+Arenero pins `pydantic-monty==1.1.0`. The 2026-10-14 review compared previous
+`0.0.21`, released `1.1.0`, and upstream `main` at
+`4246aa75724b133e55f8a82e2cf5dfc0120e62e8`.
+Read [the migration guide](../../../docs/monty-updates.md) before a change to
+runtime behavior. Use tagged docs for releases.
+Public docs can include unreleased host modules, file iteration, directory scans,
+dataclass factories, and hashlib. The project's
+`scripts/monty_feature_probe.py` runs the same bounded checks in separate runtime
+environments; [saved evidence](../../../docs/monty-compatibility.json) records
+the last comparison. Do not remove the dependency pin to run that comparison.
 
 ## Choose Monty only for the right workload
 
@@ -58,7 +72,9 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
 
 ## Design the host boundary
 
-- Monty has no ambient filesystem, environment, network, or process access.
+- Monty has no ambient host filesystem, environment, network, or process access.
+  Released `1.1.0` does expose wall time and random entropy by default through
+  `OSPolicy`; select a fixed clock, seed, and zero sleep for deterministic runs.
 - Arenero's shell `curl` runs on the host and allows bounded public HTTP and HTTPS
   requests by default. It does not add sockets or network APIs to Monty. Use
   `NetworkConfig` to narrow URL prefixes and methods or to disable curl. Keep
@@ -119,20 +135,40 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   by default. SQLite still stores interpreter snapshots, not file content.
 - Do not place secrets in sandbox inputs, files, mounts, or environment mappings. Keep authenticated work in narrow host functions.
 - Return only Monty-supported boundary values. Complex sandbox-only objects sent to a host function can degrade to their `repr` string.
+- On `1.1.0`, use explicit `ClassInstance` or `ClassType` policies for host
+  objects and `MontyClassProxy` for returned sandbox instances. Their live host
+  registrations do not survive dump/restore. Arenero restores between operations,
+  so test later calls before adopting an object API. Do not expose a session
+  handle whose methods re-enter its own locked checkout.
+- Development `ExternalModule` can put approved tools under Python import names,
+  including a live module mapping and module stubs. It is not in `1.1.0` and does
+  not automatically load virtual source files. Prefer it only after a released
+  implementation passes Arenero's persistence and tool integration tests.
 
 ## Execute safely
 
-- Configure both `max_duration_secs` and the pool `request_timeout` for untrusted code. They cover different failure modes.
+- Use `KernelConfig.max_feed_duration_seconds`, optional
+  `max_turn_duration_seconds`, `max_suspensions`, and `max_total_sleep_seconds`.
+  The old `max_duration_seconds` name was removed, not silently redefined.
 - Configure `max_memory`, `max_recursion_depth`, output collection limits, filesystem limits, and persisted snapshot size.
-- Duration is cumulative interpreter time across feeds. Time spent waiting for host functions does not count.
-- Compilation is outside the duration budget. Use the subprocess-backed Python or native JavaScript pool for crash isolation.
+- Duration resets per feed and per host answer. Waiting for host functions does
+  not count. There is no session-lifetime duration budget.
+- A checkout can contain helper, startup, file-read, file-source, and follow-up
+  feeds. Duration resets for each; suspension and system-sleep use are shared
+  within the checkout and reset on restore.
+- Initial feed compilation is outside duration. Runtime `eval`/`exec`
+  compilation counts. Keep compilation behind the worker boundary.
+- A restored dump supplies its resource limits except for the restoring
+  checkout's stricter suspension cap. Reset low-level sessions after changing
+  limits or OS policy; managed checkpoints also check the policy digest.
 - Treat `MemoryError`, `TimeoutError`, and worker crashes as terminal for that session. Delete its saved state and start a fresh session. `RecursionError` is not terminal.
 - Keep one execution at a time per persistent session. Use an optimistic revision check as a second guard when state is shared across processes.
 - Use `state_policy="always"` to keep valid changes before normal errors,
   `"success"` to save only successful code, and `"never"` for temporary Python
   state. None of these policies rolls back files or external side effects.
-- A session fork copies the opaque Monty snapshot and its remaining cumulative
-  duration budget. It does not copy files, mounts, host functions, or connections.
+- A session fork copies the opaque Monty snapshot, native directory, and RNG
+  state. Its next feed gets a fresh feed-duration clock. It does not copy files,
+  mounts, host functions, object registrations, or connections.
 - Run bootstrap files as source feeds for new sessions only. They are not imports.
   Do not save a partly completed bootstrap.
 - Arenero serializes filesystem-capable calls across sessions in one kernel. This
@@ -142,7 +178,14 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
 ## Work within the Python subset
 
 - Expect only Monty's documented modules and partial APIs. There is no `sys.path`, site-packages, package system, or dynamic import.
-- `eval`, `exec`, `compile`, and `__import__` do not exist. To run a virtual `.py` file, read its text on the host or through the virtual filesystem, then submit that text as a new host-driven feed.
+- `eval`, `exec`, and `locals` run within Monty, without CPython. Use
+  `execute_file` for a host-managed helper feed and same-call follow-up result.
+  Runtime source strings bypass
+  static checking and retain started compilation products for the session
+  lifetime. `compile`, `globals`, and `__import__` remain absent.
+- With `type_check=True`, names defined only by `exec` remain unknown to the
+  checker. Use a checked `execute_file` feed, stubs, or definition and use within
+  dynamic source. Reset does not solve this static namespace gap.
 - In Arenero, use `execute_module()` only for a small static virtual graph. It is
   host-side AST rewriting, not a new Monty import system. It supports top-level
   `.py` and `__init__.py` imports, relative imports, roots, and aliases. It rejects
@@ -154,9 +197,16 @@ surface. They are complete wrappers, not the native `AsyncMonty` path. Use
   package manager's new temporary session. Do not use a persistent REPL as proof
   that current source passes.
 - Simple classes work. Inheritance, method decorators, descriptors, `super()`, and user-defined exception classes do not.
-- Generators, `match`, `del`, `async with`, `async for`, exception groups, wildcard imports, complex literals, and several other constructs do not run.
+- Generator functions, `match`, `del`, `async with`, `async for`, exception groups,
+  and wildcard imports do not run. Complex literals and values do work.
+- Python `os.getcwd()` and `os.chdir()` share the persistent virtual directory
+  with the shell. New mounted workspace sessions start in that workspace before
+  bootstrap. No host process directory is changed.
 - Some familiar operations are eager. In particular, `enumerate`, `zip`, `map`, `filter`, `reversed`, and generator expressions materialize lists and can consume large memory.
 - Files have no live OS descriptor. Do not use file iteration. Use `read()`, `readline()`, or `readlines()`.
+- The file-iteration rule applies to `0.0.21` and `1.1.0`. Development `main`
+  supports `for` and `next` on unread files; other consumers need the full-file
+  buffer loaded first. Do not call this released support until verified.
 
 ## Make model use effective
 
@@ -198,13 +248,17 @@ Test the actual Monty runtime for:
 
 ## Authoritative sources
 
-Monty's `limitations/` directory is the source of truth for CPython differences. Use the current version of these sources when behavior is important:
+Use versioned `docs/limitations/` in the upstream repository for CPython
+differences (`limitations/` is now a symlink). Use the current runtime's release
+tag, and check the specific feature page and runtime when summary notes disagree:
 
-- [Monty documentation](https://pydantic.dev/docs/monty/get-started/)
-- [Python subset](https://pydantic.dev/docs/monty/reference/python-subset/)
+- [Python quickstart](https://pydantic.dev/docs/monty/quickstart/python/)
+- [Python subset and limitations](https://pydantic.dev/docs/monty/limitations/)
 - [Security model](https://pydantic.dev/docs/monty/concepts/security/)
 - [Filesystem access](https://pydantic.dev/docs/monty/concepts/filesystem/)
 - [Resource limits](https://pydantic.dev/docs/monty/concepts/resource-limits/)
 - [Host functions](https://pydantic.dev/docs/monty/concepts/host-functions/)
 - [Snapshots](https://pydantic.dev/docs/monty/concepts/snapshots/)
-- [Complete limitations](https://github.com/pydantic/monty/tree/main/limitations)
+- [Released 1.1.0 limitations](https://github.com/pydantic/monty/tree/v1.1.0/docs/limitations)
+- [Current development limitations](https://github.com/pydantic/monty/tree/main/docs/limitations)
+- [Release history](https://github.com/pydantic/monty/releases)

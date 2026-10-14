@@ -15,7 +15,6 @@ from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, PersistentMontyKernel
 from .network import NetworkRequest, NetworkResponse, fetch_url
 
-_CWD_NAME = "__arenero_shell_cwd"
 _STATE_NAME = "__arenero_shell_state"
 _HEREDOC_PREFIX = "__arenero_heredoc_"
 _VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -311,13 +310,10 @@ class VirtualShell:
         except _UsageError as exc:
             return ShellResult(str(exc), 2)
 
-        cwd_result = self._load_cwd()
-        if isinstance(cwd_result, ShellResult):
-            return cwd_result
-        state_result = self._load_shell_state(cwd_result)
+        state_result = self._load_shell_state()
         if isinstance(state_result, ShellResult):
             return state_result
-        self._variables, self._oldpwd, self._last_status = state_result
+        self._variables, self._oldpwd, self._last_status, cwd_result = state_result
         self._current_cwd = cwd_result
         self._command_budget = self.kernel.config.max_shell_commands
 
@@ -849,7 +845,7 @@ class VirtualShell:
         self._oldpwd = cwd
         result = self.kernel.execute(
             self.session_id,
-            f"{_CWD_NAME} = {target!r}",
+            f"import os as _arenero_os\n_arenero_os.chdir({target!r})",
             self.kernel.config.max_output_limit_chars,
         )
         changed = shell_result_from_execution(result)
@@ -1888,39 +1884,36 @@ class VirtualShell:
         )
         return None if result["ok"] else ShellResult(_error_text(result), 1)
 
-    def _load_shell_state(
-        self,
-        cwd: str,
-    ) -> tuple[dict[str, str], str, int] | ShellResult:
-        """Load or initialize persistent variables and the last exit status.
-
-        Args:
-            cwd: Current working directory used as the initial previous directory.
+    def _load_shell_state(self) -> tuple[dict[str, str], str, int, str] | ShellResult:
+        """Read shell state and Monty's native virtual directory in one call.
 
         Returns:
-            Variables, previous directory, and previous exit status, or an error.
+            Variables, previous directory, exit status, and directory, or an error.
         """
 
-        initial = {"variables": {}, "oldpwd": cwd, "status": 0}
         captured: dict[str, Any] = {}
 
-        def arenero_capture_shell_state(value: dict[str, Any]) -> bool:
+        def arenero_capture_shell_state(value: dict[str, Any], cwd: str) -> bool:
             """Copy internal shell state across the Monty host boundary.
 
             Args:
                 value: Persisted virtual shell state.
+                cwd: Monty's current virtual directory.
 
             Returns:
                 Always ``True`` after the value is captured.
             """
 
             captured["value"] = value
+            captured["cwd"] = cwd
             return True
 
         code = (
+            "import os as _arenero_os\n"
             f"try:\n    {_STATE_NAME}\n"
-            f"except NameError:\n    {_STATE_NAME} = {initial!r}\n"
-            f"arenero_capture_shell_state(value={_STATE_NAME})"
+            f"except NameError:\n    {_STATE_NAME} = "
+            "{'variables': {}, 'oldpwd': _arenero_os.getcwd(), 'status': 0}\n"
+            f"arenero_capture_shell_state(value={_STATE_NAME}, cwd=_arenero_os.getcwd())"
         )
         result = self.kernel.execute(
             self.session_id,
@@ -1952,7 +1945,7 @@ class VirtualShell:
             or not isinstance(status, int)
         ):
             return ShellResult("The virtual shell variable state is invalid", 1)
-        return dict(variables), oldpwd, status
+        return dict(variables), oldpwd, status, captured["cwd"]
 
     def _save_shell_state(self) -> ShellResult | None:
         """Save current virtual variables, previous directory, and exit status.
@@ -1974,26 +1967,6 @@ class VirtualShell:
         if result["ok"]:
             return None
         return ShellResult(_error_text(result), 1, _was_truncated(result))
-
-    def _load_cwd(self) -> str | ShellResult:
-        """Load or initialize the persistent virtual working directory."""
-        code = (
-            f"try:\n    {_CWD_NAME}\n"
-            f"except NameError:\n    {_CWD_NAME} = "
-            f"{self.kernel.default_working_directory!r}\n"
-            f"{_CWD_NAME}"
-        )
-        result = self.kernel.execute(
-            self.session_id,
-            code,
-            self.kernel.config.max_output_limit_chars,
-        )
-        if not result["ok"]:
-            return ShellResult(_error_text(result), 1, _was_truncated(result))
-        value = result["result"]
-        if not isinstance(value, str) or not value.startswith("/"):
-            return ShellResult("The virtual working directory state is invalid", 1)
-        return value
 
     def _path_kind(self, path: str) -> str | None:
         """Return whether one exact virtual path is a file or directory.

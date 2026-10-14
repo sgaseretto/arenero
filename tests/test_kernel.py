@@ -156,7 +156,7 @@ class KernelTests(unittest.TestCase):
 
     def test_execution_time_is_limited(self) -> None:
         config = KernelConfig(
-            max_duration_seconds=0.01,
+            max_feed_duration_seconds=0.01,
             request_timeout_seconds=1,
         )
         with self.make_kernel(config) as kernel:

@@ -1,9 +1,18 @@
 # Static virtual modules
 
-Monty has no `sys.path`, site-packages, import loader, or real module namespace.
+Arenero's pinned Monty `1.1.0` has no `sys.path`, site-packages, file import
+loader, or user module namespace.
 Arenero therefore provides a small host-side resolver for user-owned Python
 files in the virtual filesystem. It is useful for a few helper files. It is not
 a CPython compatibility layer.
+
+Released Monty `1.1.0` adds native `exec`, but does not add a source-file loader.
+Development `main` adds explicitly supplied host modules. Neither change replaces
+this resolver in the current project. See [the upstream review](monty-updates.md).
+
+The resolver passes supported built-in modules through, including `base64`,
+`binascii`, `copy`, `functools`, `random`, and `time`. Their APIs remain partial.
+It does not enable development-only `hashlib`, `os.path`, or host module providers.
 
 Use `execute_file()` for one flat helper. Use `execute_module()` only when files
 need explicit static imports.

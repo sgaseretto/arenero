@@ -19,7 +19,6 @@ from pydantic_monty import (
     MontyError,
     MountDir,
     OsHandler,
-    ResourceLimits,
 )
 
 from .events import EventSink, emit_event
@@ -427,7 +426,8 @@ class AsyncPersistentMontyKernel:
             self.filesystem_guard(),
             self._require_pool().checkout(
                 script_name="<arenero:download>",
-                limits=self._resource_limits(),
+                limits=self.config.resource_limits(),
+                os_policy=self.config.os_policy,
                 type_check=False,
             ) as session,
         ):
@@ -697,7 +697,8 @@ class AsyncPersistentMontyKernel:
             checkout_started = time.monotonic()
             async with self._require_pool().checkout(
                 script_name=f"<arenero:{session_id}>",
-                limits=self._resource_limits(),
+                limits=self.config.resource_limits(),
+                os_policy=self.config.os_policy,
                 type_check=(
                     False
                     if skip_type_check
@@ -884,6 +885,14 @@ class AsyncPersistentMontyKernel:
         )
         if not new_session:
             return
+        if filesystem and self.default_working_directory != "/":
+            await self._feed(
+                session,
+                streams,
+                f"import os as _arenero_os\n_arenero_os.chdir({self.default_working_directory!r})",
+                external_lookup,
+                skip_type_check=True,
+            )
         for path in self.bootstrap_files if filesystem else ():
             source = await self._feed(
                 session,
@@ -1099,18 +1108,6 @@ class AsyncPersistentMontyKernel:
             Session lock.
         """
         return self._locks.setdefault(session_id, asyncio.Lock())
-
-    def _resource_limits(self) -> ResourceLimits:
-        """Build Monty resource limits from configuration.
-
-        Returns:
-            Limits for time, memory, and recursion depth.
-        """
-        return {
-            "max_duration_secs": self.config.max_duration_seconds,
-            "max_memory": self.config.max_memory_bytes,
-            "max_recursion_depth": self.config.max_recursion_depth,
-        }
 
     def _output_limit(self, requested: int | None) -> tuple[int, bool]:
         """Normalize a requested output limit.

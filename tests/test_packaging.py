@@ -41,7 +41,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("langchain>=1.3.18", project["dependency-groups"]["dev"])
         self.assertIn("deepagents>=0.7,<0.8", project["dependency-groups"]["dev"])
         self.assertIn("mcp>=2,<3", project["dependency-groups"]["dev"])
-        self.assertIn("pydantic-monty>=0.0.21,<0.0.22", dependencies)
+        self.assertIn("pydantic-monty==1.1.0", dependencies)
 
     def test_package_marks_inline_types_and_has_ci(self) -> None:
         """Ship the typing marker and keep a repository validation workflow."""

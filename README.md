@@ -9,6 +9,12 @@ Each session can use in-memory, SQLite, or stateless storage. In-memory storage 
 the default kernel mode. It keeps variables and functions across agent loops and
 separate human turns while the application process stays active.
 
+This project pins Monty `1.1.0`. It supports native `eval()`, `exec()`, `locals()`,
+Base64, seeded randomness, and a virtual working directory shared by Python and
+the shell. It does not use CPython for agent code. Read the
+[migration and limits guide](docs/monty-updates.md) for configuration changes,
+snapshot resets, new features, and features that remain unavailable.
+
 ```mermaid
 flowchart LR
     User["Human or agent"] --> Interface["Managed sandbox, REPL, facade, or agent tools"]
@@ -61,6 +67,9 @@ arbitrary executables, or a real shell.
 
 ## Documentation map
 
+- [Monty updates and migration notes](docs/monty-updates.md) records the reviewed
+  release versions, new features, remaining limits, and reproducible runtime
+  evidence. Arenero's dependency has not yet been upgraded.
 - [Architecture and components](docs/architecture.md) explains each layer,
   execution flow, state ownership, locks, security boundaries, and extension
   points.
@@ -344,8 +353,10 @@ limits, and promotion rules.
 
 ### Important limitations
 
-- Monty does not provide full CPython. There is no `pip`, site-packages, native
-  extension, `eval()`, `exec()`, `compile()`, or dynamic import.
+- The pinned Monty `1.1.0` does not provide full CPython. There is no `pip`,
+  site-packages, native
+  extension, `compile()`, `globals()`, or dynamic import. Native `eval()` and
+  `exec()` use Monty's subset and limits; their source bypasses type checking.
 - A virtual `.py` file cannot be imported in the normal CPython way. Use
   `run_file()` for one file or `run_module()` for a bounded static file graph.
 - The virtual shell has a fixed command and flag set. It supports persistent
@@ -363,8 +374,12 @@ limits, and promotion rules.
   and enough workers for concurrent agents.
 - Sessions in one managed runtime can share configured files and MCP servers.
   Use separate runtimes for isolation.
-- Duration is cumulative Monty interpreter time for a session. A session that
-  reaches its time or memory limit must be reset.
+- Interpreter duration is limited per code feed, with an optional per-turn
+  limit. There is no session-lifetime time budget. Time and memory failures
+  discard Python state. Host work needs its own deadline.
+- Old Monty snapshots cannot be used after this upgrade. Reset them. Also reset
+  low-level sessions after changing resource limits or OS policy; a restored
+  1.1.0 dump keeps its saved settings, except for a stricter suspension cap.
 - Hosted functions and MCP tools run outside Monty's isolation. Validate their
   inputs and keep secrets in trusted host code.
 
@@ -419,7 +434,11 @@ config = KernelConfig(
     max_shell_commands=8,
     max_stream_bytes=1_000_000,
     max_state_bytes=5_000_000,
-    max_duration_seconds=5,
+    max_feed_duration_seconds=5,
+    max_turn_duration_seconds=None,
+    max_suspensions=1_000,
+    max_total_sleep_seconds=10,
+    os_policy={"sleep": "zero", "random_start": {"seed": 42}},
     max_memory_bytes=64 * 1024 * 1024,
     max_recursion_depth=100,
     request_timeout_seconds=10,
@@ -1021,9 +1040,8 @@ hard caps. Kernel output trimming still applies after a helper returns its resul
 
 ### Execute a virtual Python file
 
-Monty does not import Python files from the virtual filesystem and does not expose
-`eval()` or `exec()`. Arenero can still read a file and submit its source directly
-to the persistent Monty session:
+Monty does not import Python files from the virtual filesystem. Arenero can read
+a file and submit its source directly to the persistent Monty session:
 
 ```python
 filesystem = OSAccess(
@@ -1065,6 +1083,20 @@ Agents receive the same feature as `python_repl_execute_file`:
 The file source stays between Arenero and Monty. It is not returned to the model,
 and the output limit does not shorten it. This is file execution, not normal Python
 module importing. Names defined by the file enter the current REPL namespace.
+
+An agent can also load a flat helper from inside Python with native Monty `exec`:
+
+```python
+exec(open("/helper.py").read())
+double(21)
+```
+
+Use this form with normal globals when the helper calls hosted functions. An
+explicit namespace dictionary does not resolve unknown host names. The source
+still uses Monty's limits, but bypasses static type checking. `exec` returns
+`None`; the final `double(21)` returns the useful value.
+With `type_check=True`, the checker cannot see names defined only by `exec`.
+Use `execute_file` for checked helpers, or keep their use inside dynamic source.
 
 For supported static imports between several virtual files, use
 `execute_module()` or `python_repl_execute_module`. See
@@ -1190,9 +1222,7 @@ state. It does not create a second Monty runtime. Use
 with PersistentMontyKernel(os_handler=OSAccess()) as kernel:
     sandbox = AreneroSandbox(kernel, session_id="agent-1")
     sandbox.execute("NAME=report; mkdir -p ~/work; touch ~/work/a.txt")
-    result = sandbox.execute(
-        "printf '%s\\n' ~/work/*.txt | grep -E 'a\\.txt$'"
-    )
+    result = sandbox.execute("printf '%s\\n' ~/work/*.txt | grep -E 'a\\.txt$'")
     print(result.output)
 ```
 
