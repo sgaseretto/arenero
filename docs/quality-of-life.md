@@ -282,6 +282,10 @@ Every kernel error has these fields:
 Use `code` for program logic. Show `message` and `hint` to the model or operator.
 Use `recovery` for the next control decision. Its values are `retry_same_call`,
 `revise_code`, `restart_session`, `retry_later`, `stop`, and `none`.
+Thread-scoped LangChain Python and filesystem tools also share
+`missing_thread_id`, its hint, and `recovery="stop"`. This failure occurs before
+code or file work starts. Supply `configurable.thread_id`, or use the configured
+session resolver. Managed tools are already bound and do not need that graph ID.
 The code `unsupported_import` tells the agent that direct Monty import cannot
 load that name. Use `execute_file()` or `%run` for one flat helper. Use
 `execute_module()` only for the documented bounded static module graph. General

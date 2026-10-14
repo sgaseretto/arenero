@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING, Any
 from pydantic_monty import MontyError
 
 from .hosted_tools import HostedToolSet
-from .kernel import PersistentMontyKernel, StatePolicy, _safe_result, _trim
+from .kernel import PersistentMontyKernel, StatePolicy, _output_limit, _safe_result
 from .shell import ShellResult, VirtualShell
+from .values import trim_text as _trim
 
 if TYPE_CHECKING:
     from .async_kernel import AsyncPersistentMontyKernel
@@ -258,7 +259,7 @@ async def execute_async_repl_cell(
             "session_inspection_failed",
             "Check the session version and reset incompatible state.",
         )
-    limit, capped = kernel._output_limit(output_limit_chars)
+    limit, capped = _output_limit(kernel.config, output_limit_chars)
     return _command_result(
         True,
         sorted(variables) if name == "who" else variables,
@@ -349,7 +350,7 @@ def _magic_command(
                 "session_inspection_failed",
                 "Check the session version and reset incompatible state.",
             )
-        limit, capped = kernel._output_limit(output_limit_chars)
+        limit, capped = _output_limit(kernel.config, output_limit_chars)
         return _command_result(
             True,
             sorted(variables) if name == "who" else variables,
@@ -498,7 +499,7 @@ def _shell_result(
     Returns:
         Stable shell-mode result fields for callers and agents.
     """
-    limit, capped = _output_limit(kernel, requested_limit)
+    limit, capped = _output_limit(kernel.config, requested_limit)
     ok = result.exit_code == 0
     error = None
     if not ok:
@@ -538,26 +539,6 @@ def _shell_result(
         "stats": None,
         "mcp_artifacts": [],
     }
-
-
-def _output_limit(
-    kernel: PersistentMontyKernel,
-    requested: int | None,
-) -> tuple[int, bool]:
-    """Normalize a shell cell output limit.
-
-    Args:
-        kernel: Kernel that owns output limits.
-        requested: Optional caller limit.
-
-    Returns:
-        Effective limit and whether the hard cap changed it.
-    """
-    if requested is None:
-        return kernel.config.default_output_limit_chars, False
-    normalized = max(0, requested)
-    effective = min(normalized, kernel.config.max_output_limit_chars)
-    return effective, effective != requested
 
 
 def _python_output(execution: dict[str, Any]) -> str:

@@ -631,7 +631,7 @@ class HostedToolScope:
                     if remaining <= 0:
                         raise TimeoutError("hosted tool operation time limit exceeded")
                     result = await asyncio.wait_for(
-                        self._invoke_async(tool, kwargs), timeout=remaining
+                        _invoke_tool(tool, kwargs), timeout=remaining
                     )
             except BaseException as exc:
                 self._finish(record, started_at, error=exc)
@@ -642,22 +642,6 @@ class HostedToolScope:
             return _boundary_value(result)
 
         return call
-
-    async def _invoke_async(self, tool: HostedTool, arguments: dict[str, Any]) -> Any:
-        """Invoke one hosted tool without blocking the caller event loop.
-
-        Args:
-            tool: Tool to invoke.
-            arguments: Keyword arguments from Monty.
-
-        Returns:
-            Raw framework tool result.
-        """
-
-        if tool.ainvoke is not None:
-            return await tool.ainvoke(arguments)
-        assert tool.invoke is not None
-        return await asyncio.to_thread(tool.invoke, arguments)
 
     def _enter_sync(self, sequential: bool) -> None:
         """Enter the synchronous parallel or sequential gate.
@@ -1018,6 +1002,23 @@ def _preview(value: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"... ({len(text)} chars)"
+
+
+async def _invoke_tool(tool: HostedTool, arguments: dict[str, Any]) -> Any:
+    """Invoke one hosted tool without blocking the caller event loop.
+
+    Args:
+        tool: Tool with an async invoker, a sync invoker, or both.
+        arguments: Concrete keyword arguments from Monty or speculation.
+
+    Returns:
+        Raw framework result. The async invoker takes priority; sync-only tools
+        run in a host thread. Exceptions and cancellation reach the caller.
+    """
+    if tool.ainvoke is not None:
+        return await tool.ainvoke(arguments)
+    assert tool.invoke is not None
+    return await asyncio.to_thread(tool.invoke, arguments)
 
 
 def _boundary_value(value: Any) -> Any:

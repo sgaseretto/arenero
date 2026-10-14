@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from .async_kernel import AsyncPersistentMontyKernel
 from .events import EventSink, emit_event
-from .hosted_tools import HostedTool, HostedToolSet
+from .hosted_tools import HostedTool, HostedToolSet, _invoke_tool
 
 SpeculationMode = Literal["off", "lazy", "stream"]
 SpeculationKey = tuple[str, str]
@@ -1330,23 +1330,6 @@ def _is_compound(statement: ast.stmt) -> bool:
             ast.With,
         ),
     )
-
-
-async def _invoke_tool(tool: HostedTool, arguments: dict[str, Any]) -> Any:
-    """Invoke one original hosted tool on its supported path.
-
-    Args:
-        tool: Original hosted tool.
-        arguments: Concrete keyword arguments.
-
-    Returns:
-        Raw tool result.
-    """
-
-    if tool.ainvoke is not None:
-        return await tool.ainvoke(arguments)
-    assert tool.invoke is not None
-    return await asyncio.to_thread(tool.invoke, arguments)
 
 
 def _speculation_key(

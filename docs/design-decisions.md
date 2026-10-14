@@ -74,6 +74,37 @@ reports how to install the `langchain` extra when it is missing.
 
 This keeps the REPL, kernel, shell, and sandbox usable in small applications.
 
+## Share small helpers, not a kernel base class
+
+The sync and native async kernels share plain tool merging, alias collision
+checks, generated declarations, and checking-policy decisions. Each operation
+still creates fresh host wrappers, budgets, and call records. Worker execution,
+locking, cancellation, and file writes stay on their existing separate paths.
+There is no common kernel base class or new dependency.
+
+The output-limit calculation is shared by both kernels, cell dispatch, and the
+shell. Python calls clamp negative limits to zero; the shell still rejects them.
+`values.py` owns the common text-trimming marker and error-text reader. This
+changes neither the result conversion nor the hard caps.
+
+The previous `_type_check_stubs` field was not completely unused: snapshot
+policy hashing read it. The cleanup removes the retained text copy, not the
+policy check. The hash uses the same configured declarations and encoding as
+before. Temporary operation tools and promoted MCP tools remain outside it.
+No snapshot format or store migration is needed.
+
+Normal async hosted calls and speculative calls use one invocation helper. It
+prefers an async callback, or runs a sync-only callback through
+`asyncio.to_thread()`. Errors and cancellation still reach the caller. Their
+existing guards, budgets, and side-effect rules remain separate.
+
+Thread-scoped LangChain Python and filesystem tools use one missing-thread error
+builder in the optional integration loader. File errors now include the same
+`code`, `hint`, and `recovery` fields as Python errors. Names, argument schemas,
+and previous error fields stay unchanged. Missing thread IDs do not run work.
+The native async no-file execution and reset paths use standard
+`contextlib.nullcontext()` instead of a custom no-op context manager.
+
 ## MCP clients are optional and stay on the host
 
 The core package does not import the MCP SDK. Applications import

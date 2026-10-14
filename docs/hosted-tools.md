@@ -173,6 +173,10 @@ An async kernel runs a sync-only tool with `asyncio.to_thread()`. A tool marked
 Other tools share the `max_parallel_calls` limit. Normal Monty code often awaits
 one call at a time, so this rule is most visible in code that starts overlapping
 awaitables.
+If a tool has both invokers, the native async path selects `ainvoke`. Ordinary
+hosted calls and speculative calls reuse this invocation rule, but keep their
+own guards and budgets. Errors and cancellation propagate to the caller; a
+cancelled thread-backed sync call can still finish its host-side work.
 
 ## LangChain and LangGraph
 

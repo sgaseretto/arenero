@@ -8,6 +8,25 @@ from .packages import PackageConfig
 from .rlm import RLMModelCall, RLMModelStreamCall
 
 
+def _missing_thread_id() -> dict[str, Any]:
+    """Build the common missing-thread error for thread-scoped agent tools.
+
+    Returns:
+        A non-retryable error with code, hint, and recovery guidance.
+    """
+    return {
+        "ok": False,
+        "error": {
+            "type": "MissingThreadId",
+            "code": "missing_thread_id",
+            "message": "The graph call must include a thread_id.",
+            "hint": "Set configurable.thread_id on the graph call.",
+            "retryable": False,
+            "recovery": "stop",
+        },
+    }
+
+
 def create_python_repl_tools(
     kernel: PersistentMontyKernel,
     session_id_resolver: Callable[[Any], str | None] | None = None,

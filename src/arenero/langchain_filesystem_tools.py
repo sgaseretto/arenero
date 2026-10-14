@@ -5,6 +5,7 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
+from .integrations import _missing_thread_id
 from .kernel import PersistentMontyKernel
 
 SessionIdResolver = Callable[[ToolRuntime], str | None]
@@ -392,19 +393,3 @@ def create_filesystem_tools(
         glob_files,
         grep_files,
     ]
-
-
-def _missing_thread_id() -> dict[str, Any]:
-    """Build the standard missing-thread error.
-
-    Returns:
-        A structured non-retryable error.
-    """
-    return {
-        "ok": False,
-        "error": {
-            "type": "MissingThreadId",
-            "message": "The graph call must include a thread_id.",
-            "retryable": False,
-        },
-    }

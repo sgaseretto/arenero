@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Self
 
 from pydantic_monty import (
@@ -45,10 +45,14 @@ from .kernel import (
     _inspection_result,
     _is_terminal_resource_error,
     _mount_list,
+    _operation_external_lookup,
+    _operation_hosted_tools,
+    _operation_type_check_enabled,
+    _operation_type_check_stubs,
+    _output_limit,
     _policy_report,
     _prepare_execution_result,
     _session_policy,
-    _type_check_stubs,
     _validate_session_id,
     _values_source,
     _variables_source,
@@ -67,17 +71,6 @@ if TYPE_CHECKING:
     from .mcp import McpHub
     from .sandbox import FileDownloadResult, FileUploadResult
     from .session import AsyncSessionHandle
-
-
-@asynccontextmanager
-async def _no_filesystem_guard() -> AsyncIterator[None]:
-    """Yield without taking the kernel-wide filesystem lock.
-
-    Yields:
-        One no-op async context.
-    """
-
-    yield
 
 
 class AsyncPersistentMontyKernel:
@@ -166,7 +159,6 @@ class AsyncPersistentMontyKernel:
                 value for value in (host_stubs, mcp_hub.async_type_check_stubs) if value
             )
         self._base_type_check_stubs = host_stubs
-        self._type_check_stubs = self._operation_type_check_stubs(self.hosted_tools)
         self.monty_version = importlib.metadata.version("pydantic-monty")
         self._pool_context = AsyncMonty(
             min_processes=self.config.min_worker_processes,
@@ -235,7 +227,7 @@ class AsyncPersistentMontyKernel:
         Returns:
             ``True`` when saved state existed.
         """
-        file_guard = self.filesystem_guard() if filesystem else _no_filesystem_guard()
+        file_guard = self.filesystem_guard() if filesystem else nullcontext()
         async with self._lock_for(session_id), file_guard:
             deleted = await asyncio.to_thread(self.store.delete, session_id)
         emit_event(
@@ -420,7 +412,7 @@ class AsyncPersistentMontyKernel:
             Copied values or a JSON preview, plus truncation and limit fields.
         """
         source = _values_source(self, names)
-        limit, capped = self._output_limit(output_limit_chars)
+        limit, capped = _output_limit(self.config, output_limit_chars)
         return _inspection_result(
             await self._inspect_session(session_id, source) or {}, limit, capped
         )
@@ -435,7 +427,9 @@ class AsyncPersistentMontyKernel:
             Saved/current policy and match, changed, unknown, or absent status.
         """
         return _policy_report(
-            await self._inspect_session(session_id, _SESSION_METADATA_SOURCE), self
+            await self._inspect_session(session_id, _SESSION_METADATA_SOURCE),
+            self,
+            async_mode=True,
         )
 
     async def _inspect_session(self, session_id: str, source: str) -> Any:
@@ -905,8 +899,8 @@ class AsyncPersistentMontyKernel:
                 state_policy=state_policy,
             )
             return self._finish_result(result, session_id, metrics)
-        limit, limit_was_capped = self._output_limit(output_limit_chars)
-        file_guard = self.filesystem_guard() if filesystem else _no_filesystem_guard()
+        limit, limit_was_capped = _output_limit(self.config, output_limit_chars)
+        file_guard = self.filesystem_guard() if filesystem else nullcontext()
         async with self._lock_for(session_id):
             async with file_guard:
                 data = await self._execute_locked(
@@ -1031,8 +1025,10 @@ class AsyncPersistentMontyKernel:
         bootstrap_failed = False
         state: bytes | None = None
         try:
-            operation_tools = self._operation_hosted_tools(hosted_tools)
-            external_lookup = self._operation_external_lookup(metrics, operation_tools)
+            operation_tools = _operation_hosted_tools(self, hosted_tools)
+            external_lookup = _operation_external_lookup(
+                self, metrics, operation_tools, async_mode=True
+            )
         except (TypeError, ValueError) as exc:
             return self._result(
                 streams=streams,
@@ -1054,9 +1050,11 @@ class AsyncPersistentMontyKernel:
                 type_check=(
                     False
                     if skip_type_check
-                    else self._operation_type_check_enabled(operation_tools)
+                    else _operation_type_check_enabled(self, operation_tools)
                 ),
-                type_check_stubs=self._operation_type_check_stubs(operation_tools),
+                type_check_stubs=_operation_type_check_stubs(
+                    self, operation_tools, async_mode=True
+                ),
                 type_check_format=self.config.type_check_format,
             ) as session:
                 metrics.checkout_wait_seconds = time.monotonic() - checkout_started
@@ -1251,7 +1249,7 @@ class AsyncPersistentMontyKernel:
             if new_session
             else await session.feed_run(_SESSION_METADATA_SOURCE, skip_type_check=True)
         )
-        _check_session_policy(metadata.get("policy"), self)
+        _check_session_policy(metadata.get("policy"), self, async_mode=True)
         if (
             new_session
             or metadata.get("filesystem_version") != self._filesystem_version
@@ -1270,7 +1268,7 @@ class AsyncPersistentMontyKernel:
         await self._feed(
             session,
             streams,
-            f"_arenero_session_policy = {_session_policy(self)!r}",
+            f"_arenero_session_policy = {_session_policy(self, async_mode=True)!r}",
             None,
             skip_type_check=True,
             filesystem=filesystem,
@@ -1390,82 +1388,6 @@ class AsyncPersistentMontyKernel:
             skip_type_check=skip_type_check,
         )
 
-    def _operation_hosted_tools(
-        self, operation_tools: HostedToolSet | None
-    ) -> HostedToolSet:
-        """Combine configured, promoted MCP, and operation-only tools.
-
-        Args:
-            operation_tools: Optional tools supplied by one framework call.
-
-        Returns:
-            Complete hosted tool set for one execution.
-        """
-
-        promoted = self.mcp_hub.promoted_toolset() if self.mcp_hub is not None else None
-        return self.hosted_tools.merged(promoted, operation_tools)
-
-    def _operation_external_lookup(
-        self,
-        metrics: _ExecutionMetrics,
-        hosted_tools: HostedToolSet,
-    ) -> dict[str, Any] | None:
-        """Build async host functions with fresh operation budgets.
-
-        Args:
-            metrics: Current execution statistics.
-            hosted_tools: Tools selected for this operation.
-
-        Returns:
-            Host functions for one complete operation, or ``None``.
-        """
-
-        lookup = dict(self.external_lookup)
-        if self.mcp_hub is not None:
-            lookup.update(self.mcp_hub.async_host_functions())
-        if hosted_tools.tools:
-            scope = hosted_tools.async_scope(metrics.execution_id, self.event_sink)
-            hosted_lookup = scope.async_lookup()
-            collisions = lookup.keys() & hosted_lookup.keys()
-            if collisions:
-                names = ", ".join(sorted(collisions))
-                raise ValueError(
-                    f"hosted tool names conflict with host functions: {names}"
-                )
-            lookup.update(hosted_lookup)
-            metrics.hosted_scope = scope
-        return lookup or None
-
-    def _operation_type_check_stubs(self, hosted_tools: HostedToolSet) -> str:
-        """Build type stubs for one operation's exact async host functions.
-
-        Args:
-            hosted_tools: Tools selected for this operation.
-
-        Returns:
-            Filesystem, MCP, application, and hosted-tool declarations.
-        """
-
-        hosted_stubs = hosted_tools.type_check_stubs(async_mode=True)
-        host_stubs = "\n".join(
-            value for value in (self._base_type_check_stubs, hosted_stubs) if value
-        )
-        return _type_check_stubs(host_stubs)
-
-    def _operation_type_check_enabled(self, hosted_tools: HostedToolSet) -> bool:
-        """Disable checking when an operation adds functions to a saved session.
-
-        Args:
-            hosted_tools: Complete hosted tool set for this operation.
-
-        Returns:
-            ``True`` when the session's stable stub set covers all hosted tools.
-        """
-
-        configured = {tool.alias for tool in self.hosted_tools.tools}
-        active = {tool.alias for tool in hosted_tools.tools}
-        return self.config.type_check and active <= configured
-
     @asynccontextmanager
     async def filesystem_guard(self) -> AsyncIterator[None]:
         """Serialize shared filesystem work inside this kernel.
@@ -1490,20 +1412,6 @@ class AsyncPersistentMontyKernel:
         """
         return self._locks.setdefault(session_id, asyncio.Lock())
 
-    def _output_limit(self, requested: int | None) -> tuple[int, bool]:
-        """Normalize a requested output limit.
-
-        Args:
-            requested: Caller limit, or ``None`` for the default.
-
-        Returns:
-            Effective limit and whether the hard cap changed it.
-        """
-        if requested is None:
-            return self.config.default_output_limit_chars, False
-        effective = min(max(0, requested), self.config.max_output_limit_chars)
-        return effective, effective != requested
-
     def _error_result(
         self,
         error_type: str,
@@ -1522,7 +1430,7 @@ class AsyncPersistentMontyKernel:
         Returns:
             A structured failed execution result.
         """
-        limit, limit_was_capped = self._output_limit(requested_limit)
+        limit, limit_was_capped = _output_limit(self.config, requested_limit)
         result, _ = _prepare_execution_result(
             **self._result(
                 error_type=error_type,

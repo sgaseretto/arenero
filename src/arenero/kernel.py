@@ -48,6 +48,7 @@ from .store import (
     SessionStore,
 )
 from .values import json_value as _json_value
+from .values import trim_text as _trim
 from .workspace import WorkspaceConfig
 
 if TYPE_CHECKING:
@@ -377,7 +378,6 @@ class PersistentMontyKernel:
                 value for value in (host_stubs, mcp_hub.type_check_stubs) if value
             )
         self._base_type_check_stubs = host_stubs
-        self._type_check_stubs = self._operation_type_check_stubs(self.hosted_tools)
         self.monty_version = importlib.metadata.version("pydantic-monty")
         try:
             self._pool_context = Monty(
@@ -631,7 +631,7 @@ class PersistentMontyKernel:
             Values, truncation status, and applied limit. Oversized values become JSON text previews.
         """
         source = _values_source(self, names)
-        limit, capped = self._output_limit(output_limit_chars)
+        limit, capped = _output_limit(self.config, output_limit_chars)
         return _inspection_result(
             self._inspect_session(session_id, source) or {}, limit, capped
         )
@@ -1078,7 +1078,7 @@ class PersistentMontyKernel:
                 state_policy=state_policy,
             )
 
-        limit, limit_was_capped = self._output_limit(output_limit_chars)
+        limit, limit_was_capped = _output_limit(self.config, output_limit_chars)
         with (
             self._lock_for(session_id),
             self.filesystem_guard() if filesystem else nullcontext(),
@@ -1121,9 +1121,9 @@ class PersistentMontyKernel:
             bootstrap_failed = False
             state: bytes | None = None
             try:
-                operation_tools = self._operation_hosted_tools(hosted_tools)
-                external_lookup = self._operation_external_lookup(
-                    metrics, operation_tools
+                operation_tools = _operation_hosted_tools(self, hosted_tools)
+                external_lookup = _operation_external_lookup(
+                    self, metrics, operation_tools
                 )
             except (TypeError, ValueError) as exc:
                 return self._result(
@@ -1151,9 +1151,9 @@ class PersistentMontyKernel:
                     type_check=(
                         False
                         if skip_type_check
-                        else self._operation_type_check_enabled(operation_tools)
+                        else _operation_type_check_enabled(self, operation_tools)
                     ),
-                    type_check_stubs=self._operation_type_check_stubs(operation_tools),
+                    type_check_stubs=_operation_type_check_stubs(self, operation_tools),
                     type_check_format=self.config.type_check_format,
                 ) as session:
                     metrics.checkout_wait_seconds = time.monotonic() - checkout_started
@@ -1523,82 +1523,6 @@ class PersistentMontyKernel:
             skip_type_check=skip_type_check,
         )
 
-    def _operation_hosted_tools(
-        self, operation_tools: HostedToolSet | None
-    ) -> HostedToolSet:
-        """Combine configured, promoted MCP, and operation-only tools.
-
-        Args:
-            operation_tools: Optional tools supplied by one framework call.
-
-        Returns:
-            Complete hosted tool set for one execution.
-        """
-
-        promoted = self.mcp_hub.promoted_toolset() if self.mcp_hub is not None else None
-        return self.hosted_tools.merged(promoted, operation_tools)
-
-    def _operation_external_lookup(
-        self,
-        metrics: _ExecutionMetrics,
-        hosted_tools: HostedToolSet,
-    ) -> dict[str, Any] | None:
-        """Build host functions with fresh MCP and hosted-tool budgets.
-
-        Args:
-            metrics: Current execution statistics.
-            hosted_tools: Tools selected for this operation.
-
-        Returns:
-            Host functions for one complete kernel operation, or ``None``.
-        """
-
-        lookup = dict(self.external_lookup)
-        if self.mcp_hub is not None:
-            lookup.update(self.mcp_hub.host_functions())
-        if hosted_tools.tools:
-            scope = hosted_tools.sync_scope(metrics.execution_id, self.event_sink)
-            hosted_lookup = scope.sync_lookup()
-            collisions = lookup.keys() & hosted_lookup.keys()
-            if collisions:
-                names = ", ".join(sorted(collisions))
-                raise ValueError(
-                    f"hosted tool names conflict with host functions: {names}"
-                )
-            lookup.update(hosted_lookup)
-            metrics.hosted_scope = scope
-        return lookup or None
-
-    def _operation_type_check_stubs(self, hosted_tools: HostedToolSet) -> str:
-        """Build type stubs for one operation's exact host functions.
-
-        Args:
-            hosted_tools: Tools selected for this operation.
-
-        Returns:
-            Filesystem, MCP, application, and hosted-tool declarations.
-        """
-
-        hosted_stubs = hosted_tools.type_check_stubs(async_mode=False)
-        host_stubs = "\n".join(
-            value for value in (self._base_type_check_stubs, hosted_stubs) if value
-        )
-        return _type_check_stubs(host_stubs)
-
-    def _operation_type_check_enabled(self, hosted_tools: HostedToolSet) -> bool:
-        """Disable checking when an operation adds functions to a saved session.
-
-        Args:
-            hosted_tools: Complete hosted tool set for this operation.
-
-        Returns:
-            ``True`` when the session's stable stub set covers all hosted tools.
-        """
-
-        configured = {tool.alias for tool in self.hosted_tools.tools}
-        active = {tool.alias for tool in hosted_tools.tools}
-        return self.config.type_check and active <= configured
-
     def _run_isolated(
         self,
         code: str,
@@ -1677,21 +1601,6 @@ class PersistentMontyKernel:
         with self._locks_guard:
             return self._locks.setdefault(session_id, threading.Lock())
 
-    def _output_limit(self, requested: int | None) -> tuple[int, bool]:
-        """Normalize a requested output limit.
-
-        Args:
-            requested: Caller limit, or ``None`` for the configured default.
-
-        Returns:
-            Effective limit and whether the hard maximum changed it.
-        """
-        if requested is None:
-            return self.config.default_output_limit_chars, False
-        normalized = max(0, requested)
-        effective = min(normalized, self.config.max_output_limit_chars)
-        return effective, effective != requested
-
     def _transfer_limit(self, requested: int | None) -> int:
         """Normalize a requested binary transfer limit.
 
@@ -1727,7 +1636,7 @@ class PersistentMontyKernel:
         Returns:
             A structured failed execution result.
         """
-        limit, limit_was_capped = self._output_limit(requested_limit)
+        limit, limit_was_capped = _output_limit(self.config, requested_limit)
         streams = CollectStreams(max_bytes=self.config.max_stream_bytes)
         return self._result(
             result=None,
@@ -1955,7 +1864,7 @@ def _variables_source(
     excluded = {
         name for name, value in kernel.external_lookup.items() if callable(value)
     }
-    excluded.update(tool.alias for tool in kernel._operation_hosted_tools(None).tools)
+    excluded.update(tool.alias for tool in _operation_hosted_tools(kernel, None).tools)
     excluded.update(f"fs_{name}" for name in get_args(FilesystemOperation))
     excluded.add("arenero_capture_shell_state")  # Alias in older snapshots.
     if kernel.mcp_hub is not None:
@@ -2009,11 +1918,125 @@ def _inspection_result(value: Any, limit: int, capped: bool) -> dict[str, Any]:
     }
 
 
-def _session_policy(kernel: Any) -> dict[str, Any]:
+def _operation_hosted_tools(
+    kernel: Any, operation_tools: HostedToolSet | None
+) -> HostedToolSet:
+    """Combine configured, promoted MCP, and operation-only tools.
+
+    Args:
+        kernel: Sync or native async kernel with configured tools and MCP hub.
+        operation_tools: Optional tools supplied by one framework call.
+
+    Returns:
+        Complete hosted tool set with the existing merged limits.
+    """
+    promoted = kernel.mcp_hub.promoted_toolset() if kernel.mcp_hub is not None else None
+    return kernel.hosted_tools.merged(promoted, operation_tools)
+
+
+def _operation_external_lookup(
+    kernel: Any,
+    metrics: _ExecutionMetrics,
+    hosted_tools: HostedToolSet,
+    *,
+    async_mode: bool = False,
+) -> dict[str, Any] | None:
+    """Build fresh host functions, budgets, and call records for one operation.
+
+    Args:
+        kernel: Sync or native async kernel with host functions and an event sink.
+        metrics: Statistics that receive this operation's hosted-tool scope.
+        hosted_tools: Complete selected tool set.
+        async_mode: Build async host wrappers when true; sync wrappers otherwise.
+
+    Returns:
+        Host lookup, or None when no host functions are configured.
+
+    Raises:
+        ValueError: If hosted aliases conflict with other host functions.
+    """
+    lookup = dict(kernel.external_lookup)
+    if kernel.mcp_hub is not None:
+        lookup.update(
+            kernel.mcp_hub.async_host_functions()
+            if async_mode
+            else kernel.mcp_hub.host_functions()
+        )
+    if hosted_tools.tools:
+        scope = (
+            hosted_tools.async_scope(metrics.execution_id, kernel.event_sink)
+            if async_mode
+            else hosted_tools.sync_scope(metrics.execution_id, kernel.event_sink)
+        )
+        hosted_lookup = scope.async_lookup() if async_mode else scope.sync_lookup()
+        collisions = lookup.keys() & hosted_lookup.keys()
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise ValueError(f"hosted tool names conflict with host functions: {names}")
+        lookup.update(hosted_lookup)
+        metrics.hosted_scope = scope
+    return lookup or None
+
+
+def _operation_type_check_stubs(
+    kernel: Any, hosted_tools: HostedToolSet, *, async_mode: bool = False
+) -> str:
+    """Build declarations for an operation or the stable policy hash.
+
+    Args:
+        kernel: Kernel with stable application and MCP declarations.
+        hosted_tools: Selected tools; use configured tools for policy hashing.
+        async_mode: Render async hosted declarations when true.
+
+    Returns:
+        Filesystem, MCP, application, and hosted-tool declarations.
+    """
+    hosted_stubs = hosted_tools.type_check_stubs(async_mode=async_mode)
+    host_stubs = "\n".join(
+        value for value in (kernel._base_type_check_stubs, hosted_stubs) if value
+    )
+    if host_stubs:
+        return f"{FILESYSTEM_TYPE_CHECK_STUBS}\n{host_stubs}"
+    return FILESYSTEM_TYPE_CHECK_STUBS
+
+
+def _operation_type_check_enabled(kernel: Any, hosted_tools: HostedToolSet) -> bool:
+    """Disable checking when an operation adds names to the stable tool set.
+
+    Args:
+        kernel: Kernel with configured tools and the type-check flag.
+        hosted_tools: Complete hosted tool set for this operation.
+
+    Returns:
+        True when checking is configured and every active alias is declared.
+    """
+    configured = {tool.alias for tool in kernel.hosted_tools.tools}
+    active = {tool.alias for tool in hosted_tools.tools}
+    return kernel.config.type_check and active <= configured
+
+
+def _output_limit(config: KernelConfig, requested: int | None) -> tuple[int, bool]:
+    """Normalize a requested output limit for kernels and cell dispatch.
+
+    Args:
+        config: Default and hard output limits.
+        requested: Caller limit, or None for the default. Negative values become 0.
+
+    Returns:
+        Effective character limit and whether normalization changed the request.
+    """
+    if requested is None:
+        return config.default_output_limit_chars, False
+    effective = min(max(0, requested), config.max_output_limit_chars)
+    return effective, effective != requested
+
+
+def _session_policy(kernel: Any, *, async_mode: bool = False) -> dict[str, Any]:
     """Record configured interpreter settings without live resources or stub text.
 
     Args:
         kernel: Kernel with limits, OS policy, and stable checking declarations.
+        async_mode: Use native async hosted declarations when true.
 
     Returns:
         Plain versioned policy data that can travel inside a Monty snapshot.
@@ -2023,40 +2046,48 @@ def _session_policy(kernel: Any) -> dict[str, Any]:
         "limits": kernel.config.resource_limits(),
         "os_policy": _json_value(kernel.config.os_policy),
         "type_check": kernel.config.type_check,
-        "stubs_hash": hashlib.sha256(kernel._type_check_stubs.encode()).hexdigest()
+        "stubs_hash": hashlib.sha256(
+            _operation_type_check_stubs(
+                kernel, kernel.hosted_tools, async_mode=async_mode
+            ).encode()
+        ).hexdigest()
         if kernel.config.type_check
         else None,
     }
 
 
-def _check_session_policy(saved: Any, kernel: Any) -> None:
+def _check_session_policy(saved: Any, kernel: Any, *, async_mode: bool = False) -> None:
     """Refuse known policy drift; leave legacy snapshots unmodified.
 
     Args:
         saved: Saved policy, or None for a legacy snapshot.
         kernel: Kernel with the current configured interpreter settings.
+        async_mode: Use native async hosted declarations when true.
 
     Raises:
         SessionPolicyChanged: If the recorded settings differ.
     """
-    if saved is not None and saved != _session_policy(kernel):
+    if saved is not None and saved != _session_policy(kernel, async_mode=async_mode):
         raise SessionPolicyChanged(
             "Saved interpreter policy differs from current configuration. Use restart=True or reset the session."
         )
 
 
-def _policy_report(metadata: Any, kernel: Any) -> dict[str, Any]:
+def _policy_report(
+    metadata: Any, kernel: Any, *, async_mode: bool = False
+) -> dict[str, Any]:
     """Describe saved-policy provenance, including legacy snapshots.
 
     Args:
         metadata: Raw snapshot metadata, or None when state is absent.
         kernel: Kernel whose current interpreter policy is compared.
+        async_mode: Use native async hosted declarations when true.
 
     Returns:
         Status, saved/current data, and whether an explicit reset is required.
     """
     saved = metadata.get("policy") if metadata is not None else None
-    current = _session_policy(kernel)
+    current = _session_policy(kernel, async_mode=async_mode)
     if metadata is None:
         status = "absent"
     elif saved is None:
@@ -2095,20 +2126,6 @@ def _mount_list(mounts: MountDir | list[MountDir] | None) -> list[MountDir]:
     if mounts is None:
         return []
     return list(mounts) if isinstance(mounts, list) else [mounts]
-
-
-def _type_check_stubs(host_stubs: str | None) -> str:
-    """Combine Arenero helper declarations with application declarations.
-
-    Args:
-        host_stubs: Optional stubs for approved host functions.
-
-    Returns:
-        Complete Monty type-check stub source.
-    """
-    if host_stubs:
-        return f"{FILESYSTEM_TYPE_CHECK_STUBS}\n{host_stubs}"
-    return FILESYSTEM_TYPE_CHECK_STUBS
 
 
 def _safe_result(value: Any, limit: int) -> tuple[Any, bool]:
@@ -2303,24 +2320,3 @@ def _is_terminal_resource_error(error: MontyError) -> bool:
     except (AttributeError, TypeError):
         return False
     return isinstance(exception, (MemoryError, TimeoutError))
-
-
-def _trim(text: str, limit: int) -> tuple[str, bool]:
-    """Shorten text to a character limit.
-
-    Args:
-        text: Text to check.
-        limit: Maximum returned length.
-
-    Returns:
-        Limited text and whether it was shortened.
-    """
-    if len(text) <= limit:
-        return text, False
-    if limit == 0:
-        return "", True
-
-    marker = "... <trimmed>"
-    if len(marker) + 4 >= limit:
-        return text[:limit], True
-    return text[: limit - len(marker)] + marker, True

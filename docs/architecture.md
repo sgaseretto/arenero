@@ -119,7 +119,7 @@ again.
 | Persistent async kernel | `async_kernel.py` | Run Python, percent cells, binary transfer, overflow output, files, and static modules on native `AsyncMonty` workers; keep the shell on the sync surface. |
 | Session stores | `store.py` | Keep opaque snapshots in memory, SQLite, or nowhere. Apply revision checks and expiry. |
 | Filesystem helpers | `filesystem.py` | Implement bounded `read`, `write`, `edit`, `mkdir`, `delete`, `ls`, `glob`, and `grep`. |
-| Result conversion | `values.py` | Use one JSON representation for kernel output and managed results: Base64 bytes, complex records, ISO dates, and copied Monty instance attributes. |
+| Result conversion | `values.py` | Use one JSON representation, text-trimming marker, and error-text reader across kernels, cells, shell, and sandbox results. |
 | Persistent workspace | `workspace.py` | Own one confined read-write host directory mount. |
 | Virtual shell | `shell.py` | Parse and dispatch the documented command allowlist without starting host processes. |
 | Network policy | `network.py` | Check URLs, addresses, methods, redirects, time, headers, and byte limits for virtual `curl`. |
@@ -147,6 +147,7 @@ sequenceDiagram
     C->>K: execute(session_id, code, state_policy, inputs)
     K->>K: Lock the session
     K->>S: Load snapshot and revision
+    K->>K: Shared tool merge, collision checks, fresh lookup, and declarations
     alt Saved compatible state exists
         K->>M: Restore a fresh checkout
         K->>M: Read recorded interpreter policy
@@ -183,7 +184,7 @@ sequenceDiagram
         K->>F: Materialize sync/async artifacts before output trimming
         F-->>K: Paths or per-block artifact_error
     end
-    K->>K: Convert result to JSON data and trim public output
+    K->>K: Shared result conversion, output limits, and text trimming
     opt Public output is trimmed and output_file is set
         K->>F: Write bounded full JSON after the execution checkout closes
         F-->>K: Path or output_file_error
@@ -218,6 +219,9 @@ runs only for a new session. This removes repeated helper compilation without a
 live interpreter cache or another persistence format.
 The recorded interpreter policy lives in the same snapshot. New known policy
 changes require an explicit reset; legacy snapshots report unknown provenance.
+The stable stub hash is calculated from configured declarations when needed.
+It uses the same format as before the cleanup, without a second stored stub-text
+copy. Operation-only and promoted tools do not enter that stable hash.
 Selected value/policy inspection uses the existing disposable checkout path and
 saves nothing. Python-only `filesystem=False` operations retain the session
 lock but skip direct files and the shared file lock. See [utility boundaries](quality-of-life.md).

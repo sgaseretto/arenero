@@ -54,6 +54,13 @@ The native Monty restore-limit test stays separate from Arenero's new guard.
 Speculative wait timing starts at the observed real claim, not task creation;
 MCP budget tests accept exhaustion before or during the next call.
 
+`tests/test_cleanup.py` checks the shared missing-thread error through real
+LangGraph tool nodes, default/zero/capped/negative output limits, the common trim
+marker and error-text fallback, prior stable-stub hashes and saved-state restore,
+sync/async tool merging and collision errors, fresh call budgets, async callback
+priority, sync thread offloading, error/cancellation propagation, and native async
+execution/reset while the file lock is held. These checks use no live model.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -117,6 +124,12 @@ Run the ten small sandbox change checks only:
 
 ```console
 uv run --frozen python -m unittest tests.test_small_sandbox_gaps -v
+```
+
+Run the internal cleanup checks only:
+
+```console
+uv run --frozen python -m unittest tests.test_cleanup -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

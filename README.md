@@ -862,6 +862,9 @@ recover its Python state after the application process restarts.
 The adapter reads `thread_id` from `ToolRuntime`. The model cannot select another
 thread. You can provide a custom `session_id_resolver` when a session key must also
 contain a user or tenant ID.
+If no session ID is available, thread-scoped Python and file tools return the
+same `missing_thread_id` error with a hint and `recovery="stop"`. No code or file
+operation runs. Supply `configurable.thread_id` before retrying.
 
 ## Configurable output limits
 

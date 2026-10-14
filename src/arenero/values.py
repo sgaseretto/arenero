@@ -12,6 +12,39 @@ from typing import Any
 from pydantic_monty import MontyClassProxy
 
 
+def trim_text(text: str, limit: int) -> tuple[str, bool]:
+    """Shorten text with the common Arenero output marker.
+
+    Args:
+        text: Text to check.
+        limit: Nonnegative maximum returned character count.
+
+    Returns:
+        Limited text and whether it was shortened.
+    """
+    if len(text) <= limit:
+        return text, False
+    if limit == 0:
+        return "", True
+    marker = "... <trimmed>"
+    if len(marker) + 4 >= limit:
+        return text[:limit], True
+    return text[: limit - len(marker)] + marker, True
+
+
+def error_text(result: Mapping[str, Any]) -> str:
+    """Read error text from a kernel execution result.
+
+    Args:
+        result: Execution envelope with an error mapping or None.
+
+    Returns:
+        Error message or a generic fallback when no error is present.
+    """
+    error = result["error"]
+    return error["message"] if error is not None else "unknown Arenero error"
+
+
 def decode_value(value: Any) -> Any:
     """Explicitly decode Arenero bytes and complex records in JSON data.
 

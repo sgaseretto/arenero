@@ -8,6 +8,7 @@ from pydantic import Field
 
 from .async_kernel import AsyncPersistentMontyKernel
 from .hosted_tools import HostedToolConfig
+from .integrations import _missing_thread_id
 from .kernel import PersistentMontyKernel
 from .langchain_filesystem_tools import create_filesystem_tools
 from .langchain_hosted_tools import hosted_tools_from_langchain
@@ -686,22 +687,3 @@ def _default_session_id(runtime: ToolRuntime) -> str | None:
     configurable = runtime.config.get("configurable", {})
     thread_id = configurable.get("thread_id")
     return str(thread_id) if thread_id is not None else None
-
-
-def _missing_thread_id() -> dict[str, Any]:
-    """Build the standard missing-thread error.
-
-    Returns:
-        A structured non-retryable error.
-    """
-    return {
-        "ok": False,
-        "error": {
-            "type": "MissingThreadId",
-            "code": "missing_thread_id",
-            "message": "The graph call must include a thread_id.",
-            "hint": "Set configurable.thread_id on the graph call.",
-            "retryable": False,
-            "recovery": "stop",
-        },
-    }

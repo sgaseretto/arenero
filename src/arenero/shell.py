@@ -12,8 +12,10 @@ from pydantic_monty import MontyError
 
 from .events import emit_event
 from .hosted_tools import HostedToolSet
-from .kernel import ExecutionResult, PersistentMontyKernel
+from .kernel import ExecutionResult, PersistentMontyKernel, _output_limit
 from .network import NetworkRequest, NetworkResponse, fetch_url
+from .values import error_text as _error_text
+from .values import trim_text as _trim
 
 _STATE_NAME = "__arenero_shell_state"
 _HEREDOC_PREFIX = "__arenero_heredoc_"
@@ -2005,12 +2007,20 @@ class VirtualShell:
         return "/" if normalized == "/" else "/" + normalized.lstrip("/")
 
     def _output_limit(self, requested: int | None) -> int:
-        """Return the requested final output limit under the hard maximum."""
-        if requested is None:
-            return self.kernel.config.default_output_limit_chars
-        if requested < 0:
+        """Validate a shell limit, then use the shared output-limit calculation.
+
+        Args:
+            requested: Nonnegative caller limit, or None for the kernel default.
+
+        Returns:
+            Effective character limit under the kernel hard maximum.
+
+        Raises:
+            _UsageError: If the caller supplies a negative limit.
+        """
+        if requested is not None and requested < 0:
             raise _UsageError("output_limit_chars must be at least 0")
-        return min(requested, self.kernel.config.max_output_limit_chars)
+        return _output_limit(self.kernel.config, requested)[0]
 
 
 def shell_result_from_execution(result: ExecutionResult) -> ShellResult:
@@ -2741,32 +2751,6 @@ def _curl_header_text(response: NetworkResponse) -> str:
     status = f"HTTP {response.status} {response.reason}".rstrip()
     headers = "".join(f"{name}: {value}\n" for name, value in response.headers)
     return f"{status}\n{headers}\n"
-
-
-def _trim(text: str, limit: int) -> tuple[str, bool]:
-    """Shorten text with the same marker used by the kernel.
-
-    Args:
-        text: Text to check.
-        limit: Maximum returned character count.
-
-    Returns:
-        Limited text and whether it was shortened.
-    """
-    if len(text) <= limit:
-        return text, False
-    if limit == 0:
-        return "", True
-    marker = "... <trimmed>"
-    if len(marker) + 4 >= limit:
-        return text[:limit], True
-    return text[: limit - len(marker)] + marker, True
-
-
-def _error_text(result: ExecutionResult) -> str:
-    """Return error text from one failed kernel operation."""
-    error = result["error"]
-    return error["message"] if error is not None else "unknown Arenero error"
 
 
 def _was_truncated(result: ExecutionResult) -> bool:

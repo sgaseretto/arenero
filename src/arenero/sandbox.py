@@ -11,6 +11,7 @@ from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, PersistentMontyKernel, StatePolicy
 from .modules import VirtualModuleConfig
 from .shell import ShellResult, VirtualShell, shell_result_from_execution
+from .values import error_text as _error_text
 
 VIRTUAL_SHELL_TOOL_DESCRIPTION = """Run a small allowlisted shell over the
 Arenero virtual filesystem. This is not an operating-system shell and it never
@@ -1047,16 +1048,3 @@ def _shell_response(result: ShellResult) -> SandboxExecuteResult:
         output_file=result.output_file,
         output_file_error=result.output_file_error,
     )
-
-
-def _error_text(result: ExecutionResult) -> str:
-    """Read the error text from a failed kernel result.
-
-    Args:
-        result: Structured kernel execution result.
-
-    Returns:
-        Error text or a generic fallback.
-    """
-    error = result["error"]
-    return error["message"] if error is not None else "unknown Arenero error"
