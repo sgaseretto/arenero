@@ -598,8 +598,10 @@ with fresh input state, invocations get separate private sessions.
 flowchart LR
     Graph["Deep Agents or LangChain graph"] --> Eval["eval: Monty Python"]
     Eval --> State["Private snapshots with Monty version and optional HMAC"]
+    Graph --> Selection["Filtered request tools; private names survive resume"]
+    Selection --> Eval
     Eval --> Monty["Owned native async Monty loop"]
-    Monty --> Tools["Selected tools and subagents on caller loop for async graphs"]
+    Monty --> Tools["Selected tools, subagents, and RLM model calls on async caller loop"]
     Eval -. "optional fs_* bridge" .-> Backend["AreneroBackend"]
     Monty -. "module/startup reads and bounded output writes" .-> Backend
     Graph -. "outer file and execute tools" .-> Backend
@@ -637,11 +639,20 @@ with CodeInterpreterMiddleware(
 
 The compatibility profile discards excess console text without discarding Python
 state. Its rich artifact reports original character counts and truncation. Error
-blocks include a stable code and recovery hint. `output_file` can save retained
+blocks include a stable code, recovery hint, and bounded native traceback.
+Output-file paths, write errors, and original output counts also appear in the
+model-facing text. `output_file` can save retained
 bounded output through the shared backend. Discarded console text cannot be
 recovered. New graph snapshots check the exact Monty version before loading.
 Configured hubs and backends remain caller-owned. See the guide for limit
 precedence, callback loops, and legacy snapshot rules.
+
+Put tool-filter middleware before Arenero. Named PTC tools and automatic `task`
+then follow the filtered request, including after interrupt/resume. Explicit
+tool objects and configured MCP/RLM/backend functions remain separate host
+grants. RLM model calls and streams use the async caller's loop without changing
+the supplied runner; child Monty work stays on the kernel loop. Sync graph calls
+use the owned loop instead. See the guide for these limits and working examples.
 
 The existing interface remains available without changes:
 

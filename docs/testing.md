@@ -95,6 +95,18 @@ The latter does not commit its generated lock file. Monty remains pinned to
 environment, checks that Deep Agents is absent, and executes `20 + 22` in Monty.
 The matrix tests compatibility, not every possible dependency combination.
 
+`tests/test_interpreter_fixes.py` covers the next four fixes and RLM loop
+ownership. Mocked complete graphs check named tool removal across human turns,
+saved helpers, sync calls, concurrent slots, interrupt/resume in a new adapter,
+historical names versus a newer host cache, and standalone explicit tool grants.
+Nested commands exercise real messages, serialized messages, empty content, and
+typed update fallbacks without parent-state changes. Other fake graphs check
+native tracebacks, unchanged error messages, shared error caps, full overflow
+JSON, model-visible output-file success/failure and original counts. Fake RLM
+clients test plain, batch, recursive and speculative streaming calls, deadlines,
+errors, cancellation cleanup, two application loops sharing a runner, and sync
+fallback to the owned loop. No live provider or remote service is called.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -171,7 +183,7 @@ Run the Python interpreter adapter checks only:
 ```console
 uv run --frozen python -m unittest \
   tests.test_deepagents tests.test_deepagents_compat \
-  tests.test_deepagents_hardening -v
+  tests.test_deepagents_hardening tests.test_interpreter_fixes -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

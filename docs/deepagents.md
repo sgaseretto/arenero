@@ -254,6 +254,19 @@ call. It includes:
 This report is generated from configuration. Do not copy a stale prompt into an
 agent when the kernel or tool list can change.
 
+Place model-request tool filters before this middleware. Named PTC entries and
+automatic `task` use the filtered request seen by Arenero, not the ToolNode's
+full registry. Private `_arenero_active_tools` names survive interrupt/resume and
+adapter recreation; live tool references are not checkpointed. Explicit tool
+objects and other host-configured functions remain separate grants. Direct
+host invocations without captured model state retain their runtime fallback.
+This does not add per-tool approval to nested calls.
+
+Native runtime errors also expose optional `error.traceback` alongside the
+unchanged message and guidance fields. Message and stack share the error output
+cap. See the [compatibility guide](deepagents-compatibility.md) for model-facing
+text blocks, output-file status, and RLM callback loop ownership.
+
 ## Limits and non-goals
 
 - This middleware is async-only for execution.

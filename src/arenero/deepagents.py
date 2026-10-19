@@ -26,7 +26,7 @@ from langchain.agents.middleware.types import (
     omit_payload,
 )
 from langchain.tools import BaseTool, ToolRuntime
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_config
 from pydantic import BaseModel, Field
@@ -40,6 +40,7 @@ from .hosted_tools import HostedToolConfig, HostedToolSet, python_identifier
 from .kernel import KernelConfig
 from .langchain_hosted_tools import hosted_tools_from_langchain
 from .rlm import RLM
+from .values import trim_text
 from .workspace import WorkspaceConfig
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class AreneroAgentState(AgentState):
     _arenero_snapshot_hmac: NotRequired[Annotated[bytes, PrivateStateAttr]]
     _arenero_slot_id: NotRequired[Annotated[str, PrivateStateAttr]]
     _arenero_monty_version: NotRequired[Annotated[str, PrivateStateAttr]]
+    _arenero_active_tools: NotRequired[Annotated[list[str], PrivateStateAttr]]
 
 
 class AreneroEvalInput(BaseModel):
@@ -175,6 +177,7 @@ class AreneroInterpreterMiddleware(
         self._session_prefix = session_prefix
         self._fallback_thread_id = uuid4().hex
         self._turn_sessions: dict[str, str] = {}
+        self._active_tools: dict[str, tuple[BaseTool, ...]] = {}
         self.tools: list[BaseTool] = [self._build_tool(), self._build_module_tool()]
 
     async def __aenter__(self) -> Self:
@@ -199,6 +202,7 @@ class AreneroInterpreterMiddleware(
     async def aclose(self) -> None:
         """Close the kernel only when this middleware created it."""
 
+        self._active_tools.clear()
         if self._owns_kernel:
             await self.kernel.close()
 
@@ -266,9 +270,7 @@ class AreneroInterpreterMiddleware(
             Model response from the next handler.
         """
 
-        prompt = self.instructions(
-            [tool for tool in request.tools or () if isinstance(tool, BaseTool)]
-        )
+        prompt = self._prepare_tools(request)
         return handler(
             request.override(
                 system_message=append_to_system_message(request.system_message, prompt)
@@ -292,14 +294,92 @@ class AreneroInterpreterMiddleware(
             Awaited model response from the next handler.
         """
 
-        prompt = self.instructions(
-            [tool for tool in request.tools or () if isinstance(tool, BaseTool)]
-        )
+        prompt = self._prepare_tools(request)
         return await handler(
             request.override(
                 system_message=append_to_system_message(request.system_message, prompt)
             )
         )
+
+    def _tool_scope(self, state: Mapping[str, Any]) -> str:
+        """Identify the graph slot that owns a filtered tool inventory.
+
+        Args:
+            state: Active private graph state.
+
+        Returns:
+            Private slot, or the original middleware's thread identity.
+        """
+        return state.get("_arenero_slot_id") or _resolve_thread_id(
+            self._fallback_thread_id
+        )
+
+    def _prepare_tools(self, request: ModelRequest[ContextT]) -> str:
+        """Use the same filtered inventory for instructions and execution.
+
+        Args:
+            request: Model request after earlier tool filters.
+
+        Returns:
+            Current interpreter instructions.
+        """
+        tools = tuple(
+            tool for tool in request.tools or () if isinstance(tool, BaseTool)
+        )
+        self._active_tools[self._tool_scope(request.state)] = tools
+        return self.instructions(tools)
+
+    def after_model(
+        self, state: AreneroAgentState, runtime: Any
+    ) -> dict[str, Any] | None:
+        """Checkpoint allowed names without storing live host tool objects.
+
+        Args:
+            state: Graph state after a completed model call.
+            runtime: Graph runtime.
+
+        Returns:
+            Private name list for tool dispatch, interrupts, and restart.
+        """
+        tools = self._active_tools.get(self._tool_scope(state))
+        return (
+            {"_arenero_active_tools": [tool.name for tool in tools]}
+            if tools is not None
+            else None
+        )
+
+    async def aafter_model(
+        self, state: AreneroAgentState, runtime: Any
+    ) -> dict[str, Any] | None:
+        """Save the same private inventory for asynchronous graph calls.
+
+        Args:
+            state: Graph state after a completed model call.
+            runtime: Graph runtime.
+
+        Returns:
+            Private allowed tool names, when a model request was captured.
+        """
+        return self.after_model(state, runtime)
+
+    def _runtime_tools(self, runtime: ToolRuntime) -> tuple[BaseTool, ...]:
+        """Select from the request inventory, not the ToolNode's full registry.
+
+        Args:
+            runtime: Current injected graph runtime.
+
+        Returns:
+            Selected tools; direct calls without a model hook keep their old behavior.
+        """
+        tools = self._active_tools.get(self._tool_scope(runtime.state))
+        names = runtime.state.get("_arenero_active_tools")
+        if tools is None or (
+            names is not None and [tool.name for tool in tools] != names
+        ):
+            tools = tuple(
+                tool for tool in runtime.tools if names is None or tool.name in names
+            )
+        return self._select_tools(tools)
 
     async def abefore_agent(
         self,
@@ -317,6 +397,7 @@ class AreneroInterpreterMiddleware(
         """
 
         thread_id = _resolve_thread_id(self._fallback_thread_id)
+        self._active_tools.pop(self._tool_scope(state), None)
         if self._mode == "turn":
             self._turn_sessions[thread_id] = self._new_session_id(thread_id, "turn")
             return None
@@ -359,6 +440,7 @@ class AreneroInterpreterMiddleware(
         """
 
         thread_id = _resolve_thread_id(self._fallback_thread_id)
+        self._active_tools.pop(self._tool_scope(state), None)
         if self._mode == "turn":
             session_id = self._turn_sessions.pop(thread_id, None)
             if session_id is not None:
@@ -615,7 +697,7 @@ class AreneroInterpreterMiddleware(
         """
 
         application_tools = hosted_tools_from_langchain(
-            self._select_tools(runtime.tools),
+            self._runtime_tools(runtime),
             config=runtime.config,
             runtime=runtime,
             limits=self._hosted_tool_config,
@@ -956,12 +1038,12 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
                 )
             else:
                 _check_alias(alias)
-        if self._namespace and aliases:
+        if self._namespace:
             methods = "\n".join(
                 f"    async def {alias.removeprefix('_arenero_backend_')}(self, **kwargs):\n        return await {alias}(**kwargs)"
                 for alias in aliases
             )
-            prefix += f"class _AreneroTools:\n{methods}\ntools = _AreneroTools()\n"
+            prefix += f"class _AreneroTools:\n{methods or '    pass'}\ntools = _AreneroTools()\n"
         return prefix
 
     async def _read_backend_source(self, path: str) -> bytes:
@@ -1066,6 +1148,7 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
 
     def close(self) -> None:
         """Close the kernel before its loop; the caller owns any backend."""
+        self._active_tools.clear()
         if self._bridge.thread.is_alive():
             self._bridge.submit(self.kernel.close()).result()
             self._bridge.stop()
@@ -1194,6 +1277,7 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             state: Graph state with its private slot.
         """
         slot = state.get("_arenero_slot_id")
+        self._active_tools.pop(self._tool_scope(state), None)
         if slot:
             await self.kernel.reset(self._thread_session_id(slot))
 
@@ -1345,7 +1429,7 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
                     self.kernel.monty_version,
                     None,
                 )
-        selected = self._select_tools(runtime.tools)
+        selected = self._runtime_tools(runtime)
         regular = [tool for tool in selected if tool.name != "task"]
         hosted = hosted_tools_from_langchain(
             regular,
@@ -1398,7 +1482,7 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             )
         hosted = HostedToolSet(tuple(wrapped), hosted.config)
         if self._rlm is not None:
-            hosted = self._rlm.hosted_tools(
+            hosted = self._rlm._on_loop(outer_loop).hosted_tools(
                 self.kernel, session_id, application_tools=hosted
             )
         control = GraphCalls()
@@ -1471,6 +1555,10 @@ def _compat_text(result: Mapping[str, Any], capture_console: bool) -> str:
             f"\nRetryable: {str(error['retryable']).lower()}"
             f"\nRecovery: {html.escape(error['recovery'])}</error>"
         )
+        if error.get("traceback"):
+            blocks.append(
+                "<traceback>\n" + html.escape(error["traceback"]) + "\n</traceback>"
+            )
     else:
         blocks.append(
             "<result>"
@@ -1478,7 +1566,17 @@ def _compat_text(result: Mapping[str, Any], capture_console: bool) -> str:
             + "</result>"
         )
     if any(result["truncated"].values()):
-        blocks.append("<truncated>Output reached the configured limit.</truncated>")
+        lengths = result["stats"]["original_output_chars"]
+        blocks.append(
+            "<truncated>Output reached the configured limit. Original characters: "
+            + html.escape(json.dumps(lengths, ensure_ascii=False))
+            + "</truncated>"
+        )
+    for name in ("output_file", "output_file_error"):
+        if result.get(name):
+            limit = max(256, result["output_limit_chars"])
+            value, _ = trim_text(str(result[name]), limit)
+            blocks.append(f"<{name}>{html.escape(value)}</{name}>")
     return "\n".join(blocks)
 
 
@@ -1507,7 +1605,7 @@ def _tool_value(value: Any) -> Any:
     """
     from langgraph.types import Command
 
-    if isinstance(value, ToolMessage):
+    if isinstance(value, BaseMessage):
         return value.content
     if isinstance(value, Command):
         messages = (
@@ -1515,7 +1613,14 @@ def _tool_value(value: Any) -> Any:
             if isinstance(value.update, Mapping)
             else []
         )
-        return _tool_value(messages[-1]) if messages else None
+        if isinstance(messages, (BaseMessage, Mapping)):
+            messages = [messages]
+        for message in reversed(messages or []):
+            if isinstance(message, BaseMessage):
+                return message.content
+            if isinstance(message, Mapping) and message.get("content") is not None:
+                return message["content"]
+        return value.update
     if isinstance(value, list) and any(
         isinstance(item, (ToolMessage, Command)) for item in value
     ):

@@ -54,8 +54,8 @@ value
 Use `async with`, `await agent.ainvoke(...)`, or `agent.astream(...)` for an async
 application. Monty work from `invoke`, `stream`, `ainvoke`, and `astream` uses
 one owned event loop. With async graph calls, selected LangChain tools,
-configured hosted tools, task subgraphs, and task stream events use the caller's
-application loop. They can reuse loop-bound clients, locks, and futures.
+configured hosted tools, task subgraphs, task events, and RLM model callbacks use
+the caller's application loop. They can reuse loop-bound clients, locks, and futures.
 With sync graph calls there is no caller loop; async tools use the owned loop.
 Do not run `interpreter.kernel` directly from another loop. Close
 the middleware after graph work finishes. It closes its own kernel and loop,
@@ -86,7 +86,7 @@ The profile now includes these ten follow-up changes:
 | --- | --- |
 | Application-loop tools | Async PTC and real task graphs use the caller loop. Sync invocation uses the owned loop. Cancellation and graph interrupts cross the bridge. |
 | Configuration guards | Empty signing keys, reserved aliases, duplicate aliases, and explicit `ptc=("task",)` fail early. Use `subagents=True` for task dispatch. |
-| Tool result values | `ToolMessage` becomes its content. A `Command` becomes its last message content. For an envelope list, use the last envelope. Plain typed values and lists stay unchanged. Parent graph updates are not applied. |
+| Tool result values | Messages become their content. A `Command` uses its last usable message content, or returns its update data when there is no content. For an envelope list, use the last envelope. Plain values stay typed. Parent graph updates are not applied. |
 | Bounded console collection | Keep a UTF-8 prefix of each stream; discard excess and count original characters. Console overflow alone does not discard Python state. |
 | Error guidance | Existing error blocks also include code, hint, retry flag, and recovery action. The rich artifact keeps the same fields. |
 | Existing configuration | Pass kernel/hosted-tool config, hosted tools, MCP, RLM, bootstrap, OS handler, and event sink. No second configuration system. |
@@ -174,8 +174,12 @@ count. Their merged `HostedToolConfig` uses the existing stricter limits. Task
 counts have a separate adapter cap but still share the aggregate hosted wall
 budget. `timeout` is guest execution time, not a model/tool wall budget.
 MCP and RLM also retain their own budgets and native worker requirements.
-MCP calls use the hub's own loop. Existing RLM model callbacks run on the kernel
-loop; do not give them clients already bound to a different loop. RLM children
+MCP calls use the hub's own loop. In async compatibility calls, RLM model calls,
+stream creation, reads, and close use the caller's application loop. Each eval
+gets a bound view of the runner; the supplied runner and client are not changed
+or closed. RLM orchestration, usage accounting, speculation, and child kernels
+stay on the Monty loop. Sync graph calls have no caller loop and use the owned
+loop for model callbacks too; use `ainvoke` for clients tied to an async app. RLM children
 need free Monty workers. The caller opens/closes the hub; the adapter owns only
 its kernel and bridge. Trusted startup code can use the active hosted namespace.
 Bootstrap effects run again in call mode, after a reset, or after a rejected
@@ -191,6 +195,8 @@ sequenceDiagram
     participant Monty
     Human->>Graph: First turn
     Graph->>Adapter: Assign private slot
+    Graph->>Adapter: Model request after earlier tool filters
+    Adapter-->>Graph: Private active tool names after the model response
     Graph->>Adapter: eval(code)
     Adapter->>Adapter: Check version, size, and optional HMAC
     Adapter->>Monty: Restore last completed graph snapshot
@@ -201,6 +207,7 @@ sequenceDiagram
     Graph->>Adapter: End turn and evict working copy
     Human->>Graph: Related second turn
     Graph->>Adapter: Same slot and stored snapshot
+    Adapter->>Adapter: Restore active names for a resumed tool step
     Adapter->>Monty: Restore functions and values
 ```
 
@@ -256,6 +263,36 @@ restore; they do not depend on host object registrations surviving a dump.
 Tool selection and instructions use the current agent inventory. A removed
 tool is no longer callable, even if a saved wrapper refers to its old name.
 
+### Active tool filters
+
+Place request-filter middleware before Arenero:
+
+```python
+agent = create_deep_agent(
+    model=model,
+    tools=[search_web, lookup_record],
+    middleware=[tool_filter, interpreter],
+)
+```
+
+Named `ptc` entries and automatic `task` dispatch use the request inventory seen
+by Arenero, not the ToolNode's complete registry. Put each visibility filter
+before Arenero; a later filter cannot change the inventory already captured.
+An empty selection does not keep old guest tool bindings. Saved helpers cannot
+call a removed host function.
+
+Both middleware profiles checkpoint only the names in private
+`_arenero_active_tools`; they do not save live tool objects. This keeps the
+selection across interrupts and adapter recreation. Host references are cleared
+at turn completion or close. The application must still supply tool objects
+after restart. Direct host tool calls and old checkpoints with no captured
+inventory retain their original runtime-inventory fallback.
+
+Explicit `BaseTool` objects in `ptc` are standalone host grants, even when absent
+from the agent registry. Configured `HostedToolSet`, backend `fs_*`, MCP, and RLM
+functions are also separate host grants. A model tool filter does not revoke
+them and does not add per-call approval to PTC.
+
 ```python
 report = await task(
     description="Count the matching records",
@@ -292,13 +329,43 @@ PTC still bypasses the parent ToolNode and parent per-tool approval middleware.
 A graph interrupt raised by the called tool itself does propagate. Arbitrary
 `Command.update` fields from nested tools are not applied to the parent graph;
 the compatibility profile extracts the final response only for all selected
-tools. Plain dictionaries, numbers, booleans, and ordinary lists stay typed.
+tools. `AIMessage`, `ToolMessage`, and serialized message dictionaries inside a
+command return their last usable content. Empty/absent message lists return the
+command's update data instead of silently returning `None`; a command with no
+update still returns `None`. This data is only a return value. It is not applied
+to the parent graph. Plain dictionaries, numbers, booleans, and ordinary lists stay typed.
 
 Error blocks include stable codes such as `ptc_call_limit`,
 `subagent_call_limit`, `hosted_tool_time_limit`, `feed_time_limit`,
 `turn_time_limit`, and `session_version_error`.
 Use the hint and recovery action instead of retrying every error. A busy worker
 may succeed later; an exhausted per-eval count needs less work in that eval.
+
+### Tracebacks and output-file status
+
+Runtime failures add optional `error.traceback` in both kernels. It uses Monty's
+native frame display, including source lines. Existing `error.message`, type,
+code, hint, retry flag, and recovery action keep their meanings. Message plus
+traceback share the existing error character cap. `truncated.error` covers both;
+the original error character count includes both. A zero cap hides both texts.
+Native generated-module/helper frames are not remapped to original source files.
+
+The compatibility tool adds escaped `<traceback>`, `<output_file>`, and
+`<output_file_error>` blocks when present. Truncation blocks include original
+character counts, so the model does not need access to `ToolMessage.artifact`
+to see important status. File status uses at most `max(256, output_limit_chars)`
+characters per field, with the normal trim marker. It remains visible at a zero
+result cap, as do the existing error code and hint. These metadata blocks and
+escaping are not part of a strict whole-message character budget.
+
+```text
+<output_file>/output.json</output_file>
+```
+
+If a write fails, the model sees `output_file_error` instead of a success path.
+The failure does not undo saved Python state. When output is offloaded, its JSON
+can include the full native traceback under the existing transfer limit. Console
+text already discarded by the collector cannot be recovered.
 
 ## Shared sandbox setup
 

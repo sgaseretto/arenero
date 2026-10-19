@@ -46,6 +46,7 @@ from .kernel import (
     _file_read_source,
     _inspection_result,
     _is_terminal_resource_error,
+    _monty_traceback,
     _mount_list,
     _operation_external_lookup,
     _operation_hosted_tools,
@@ -1184,6 +1185,7 @@ class AsyncPersistentMontyKernel:
                 streams=streams,
                 error_type=type(execution_error).__name__,
                 error_message=str(execution_error),
+                error_traceback=_monty_traceback(execution_error),
                 limit=limit,
                 limit_was_capped=limit_was_capped,
                 state_restored=restored,
@@ -1197,6 +1199,7 @@ class AsyncPersistentMontyKernel:
                 error_type=error_type_override
                 or (type(execution_error).__name__ if execution_error else None),
                 error_message=str(execution_error) if execution_error else None,
+                error_traceback=_monty_traceback(execution_error),
                 limit=limit,
                 limit_was_capped=limit_was_capped,
                 state_restored=restored,
@@ -1245,6 +1248,7 @@ class AsyncPersistentMontyKernel:
             streams=streams,
             error_type=type(execution_error).__name__ if execution_error else None,
             error_message=str(execution_error) if execution_error else None,
+            error_traceback=_monty_traceback(execution_error),
             limit=limit,
             limit_was_capped=limit_was_capped,
             state_saved=True,
@@ -1489,6 +1493,7 @@ class AsyncPersistentMontyKernel:
         streams: CollectStreams | BoundedStreams | None = None,
         error_type: str | None = None,
         error_message: str | None = None,
+        error_traceback: str | None = None,
         retryable: bool = False,
         limit: int,
         limit_was_capped: bool,
@@ -1505,6 +1510,7 @@ class AsyncPersistentMontyKernel:
             streams: Captured standard streams.
             error_type: Optional stable error category.
             error_message: Optional error details.
+            error_traceback: Optional native traceback, bounded by the error cap.
             retryable: Whether the caller can safely retry.
             limit: Effective output limit.
             limit_was_capped: Whether the hard cap changed the request.
@@ -1523,6 +1529,7 @@ class AsyncPersistentMontyKernel:
             or CollectStreams(max_bytes=self.config.max_stream_bytes),
             "error_type": error_type,
             "error_message": error_message,
+            "error_traceback": error_traceback,
             "retryable": retryable,
             "limit": limit,
             "limit_was_capped": limit_was_capped,

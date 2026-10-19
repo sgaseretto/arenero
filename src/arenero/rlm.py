@@ -8,9 +8,11 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from copy import copy
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ._loop_thread import on_loop
 from .async_kernel import AsyncPersistentMontyKernel
 from .events import emit_event
 from .hosted_tools import HostedToolConfig, HostedToolSet
@@ -567,6 +569,103 @@ class RLM:
             state,
             depth=0,
         )
+
+    def _on_loop(self, loop: asyncio.AbstractEventLoop | None) -> RLM:
+        """Bind model callbacks to a caller loop without changing this runner.
+
+        Args:
+            loop: Application loop, or None to use the kernel's loop.
+
+        Returns:
+            Operation-local runner with the same settings and callback owner.
+        """
+        if loop is None or loop is asyncio.get_running_loop():
+            return self
+
+        async def call(prompt: str, model: str | None) -> str | RLMModelResponse:
+            """Call and await the model on its application loop.
+
+            Args:
+                prompt: Complete model input.
+                model: Optional model selector.
+
+            Returns:
+                Original model response and usage.
+            """
+
+            async def run() -> str | RLMModelResponse:
+                """Create the awaitable on the loop that owns the client.
+
+                Returns:
+                    Original model response.
+                """
+                return await self.model_call(prompt, model)
+
+            return await on_loop(run(), loop)
+
+        async def stream(
+            prompt: str, model: str | None
+        ) -> AsyncIterator[str | RLMModelResponse]:
+            """Create, advance, and close the model stream on its owner loop.
+
+            Args:
+                prompt: Complete model input.
+                model: Optional model selector.
+
+            Yields:
+                Original model deltas, with backpressure and no extra queue.
+            """
+
+            async def start() -> AsyncIterator[str | RLMModelResponse]:
+                """Open the stream on its owner loop.
+
+                Returns:
+                    Model stream iterator.
+                """
+                assert self.model_stream is not None
+                return self.model_stream(prompt, model)
+
+            iterator = await on_loop(start(), loop)
+            pending: asyncio.Task | None = None
+
+            async def advance() -> str | RLMModelResponse:
+                """Read one delta on the owner loop.
+
+                Returns:
+                    Next model delta.
+                """
+                nonlocal pending
+                pending = asyncio.current_task()
+                try:
+                    return await anext(iterator)
+                finally:
+                    pending = None
+
+            try:
+                while True:
+                    try:
+                        yield await on_loop(advance(), loop)
+                    except StopAsyncIteration:
+                        return
+            finally:
+
+                async def finish() -> None:
+                    """Drain an interrupted read before closing its stream."""
+                    task = pending
+                    if task is not None:
+                        if not task.cancelling():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    close = getattr(iterator, "aclose", None)
+                    if close is not None:
+                        await close()
+
+                await on_loop(finish(), loop)
+
+        bound = copy(self)
+        bound.model_call = call
+        bound.model_stream = stream if self.model_stream is not None else None
+        return bound
 
     def catalog(
         self,

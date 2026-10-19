@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Self, TypedDict, get_args
 from weakref import WeakValueDictionary
 
 from pydantic_monty import (
@@ -19,6 +19,7 @@ from pydantic_monty import (
     MontyCrashedError,
     MontyDisconnectError,
     MontyError,
+    MontyRuntimeError,
     MontySession,
     MontyShutdown,
     MountDir,
@@ -83,6 +84,7 @@ class ExecutionError(TypedDict):
     hint: str
     retryable: bool
     recovery: RecoveryAction
+    traceback: NotRequired[str]
 
 
 class ExecutionStatistics(TypedDict):
@@ -1275,6 +1277,7 @@ class PersistentMontyKernel:
                     streams=streams,
                     error_type=type(execution_error).__name__,
                     error_message=str(execution_error),
+                    error_traceback=_monty_traceback(execution_error),
                     retryable=False,
                     limit=limit,
                     limit_was_capped=limit_was_capped,
@@ -1295,6 +1298,7 @@ class PersistentMontyKernel:
                         or (type(execution_error).__name__ if execution_error else None)
                     ),
                     error_message=str(execution_error) if execution_error else None,
+                    error_traceback=_monty_traceback(execution_error),
                     retryable=False,
                     limit=limit,
                     limit_was_capped=limit_was_capped,
@@ -1358,6 +1362,7 @@ class PersistentMontyKernel:
                 streams=streams,
                 error_type=type(execution_error).__name__ if execution_error else None,
                 error_message=str(execution_error) if execution_error else None,
+                error_traceback=_monty_traceback(execution_error),
                 retryable=False,
                 limit=limit,
                 limit_was_capped=limit_was_capped,
@@ -1661,6 +1666,7 @@ class PersistentMontyKernel:
         streams: CollectStreams,
         error_type: str | None,
         error_message: str | None,
+        error_traceback: str | None = None,
         retryable: bool,
         limit: int,
         limit_was_capped: bool,
@@ -1678,6 +1684,7 @@ class PersistentMontyKernel:
             streams: Captured standard output and error streams.
             error_type: Optional stable error category.
             error_message: Optional human-readable error details.
+            error_traceback: Optional native Python traceback, trimmed with the error.
             retryable: Whether the caller can safely retry.
             limit: Effective character limit for each output field.
             limit_was_capped: Whether the hard maximum changed the request.
@@ -1706,6 +1713,7 @@ class PersistentMontyKernel:
             streams=streams,
             error_type=error_type,
             error_message=error_message,
+            error_traceback=error_traceback,
             retryable=retryable,
             limit=limit,
             limit_was_capped=limit_was_capped,
@@ -1734,6 +1742,7 @@ def _prepare_execution_result(
     streams: CollectStreams | BoundedStreams,
     error_type: str | None,
     error_message: str | None,
+    error_traceback: str | None = None,
     retryable: bool,
     limit: int,
     limit_was_capped: bool,
@@ -1750,6 +1759,7 @@ def _prepare_execution_result(
         streams: Captured standard output and error streams.
         error_type: Optional stable error category.
         error_message: Optional human-readable error details.
+        error_traceback: Optional native traceback; shares the error character cap.
         retryable: Whether the caller can safely retry.
         limit: Effective character limit for each output field.
         limit_was_capped: Whether the hard maximum changed the request.
@@ -1799,6 +1809,12 @@ def _prepare_execution_result(
             "retryable": retryable,
             "recovery": recovery,
         }
+        if error_traceback is not None:
+            full_error["traceback"] = error_traceback
+            error["traceback"], stack_trimmed = _trim(
+                error_traceback, max(0, limit - len(short_error))
+            )
+            error_trimmed |= stack_trimmed
 
     was_trimmed = result_trimmed or stdout_trimmed or stderr_trimmed or error_trimmed
     payload = None
@@ -1847,7 +1863,7 @@ def _prepare_execution_result(
                     "result": _result_length(result),
                     "stdout": original_chars["stdout"],
                     "stderr": original_chars["stderr"],
-                    "error": len(error_message or ""),
+                    "error": len(error_message or "") + len(error_traceback or ""),
                 },
             },
             "mcp_artifacts": [],
@@ -1855,6 +1871,18 @@ def _prepare_execution_result(
         },
         payload,
     )
+
+
+def _monty_traceback(error: MontyError | None) -> str | None:
+    """Use Monty's own Python frame display without changing the error message.
+
+    Args:
+        error: Native execution failure, or None.
+
+    Returns:
+        Runtime traceback with source lines, when Monty supplies one.
+    """
+    return error.display() if isinstance(error, MontyRuntimeError) else None
 
 
 def _variables_source(

@@ -160,6 +160,46 @@ The RLM functions call model providers directly through the configured adapter.
 They do not pass through the parent LangGraph `ToolNode`. Parent per-tool human
 approval does not run for each model call.
 
+## Event-loop ownership in the compatibility middleware
+
+`CodeInterpreterMiddleware(rlm=rlm)` can use existing async model clients:
+
+```python
+from arenero.deepagents import CodeInterpreterMiddleware
+from deepagents import create_deep_agent
+
+async with CodeInterpreterMiddleware(rlm=rlm) as interpreter:
+    agent = create_deep_agent(model=model, middleware=[interpreter])
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "Use subqueries"}]}
+    )
+```
+
+For `ainvoke`/`astream`, plain and batched model calls, recursive controller model
+calls, and stream creation/advance/close run on the application's caller loop.
+Child Monty sessions, usage accounting, shared limits, and speculative planning
+stay on the owned kernel loop. A per-operation runner view uses the existing
+loop bridge; it does not modify the supplied `RLM` or close its model client.
+Different applications can share a runner only if its callback supports their
+respective loops; a client tied to one loop must still be called from that loop.
+
+Stream reads use backpressure without an extra queue. Cancellation reaches the
+client and drains a pending read before closing an iterator that supports
+`aclose`. Model errors and the existing RLM/host deadlines still apply. An
+uncooperative host callback is not forcibly stopped, and effects are not undone.
+Sync graph calls have no application loop; callbacks use the owned loop.
+Standalone RLM and the original native async middleware stay on their caller
+loop as before. No public RLM settings or call signatures change.
+
+```mermaid
+flowchart LR
+    App["Async agent on application loop"] --> Bridge["Owned Monty loop"]
+    Bridge --> Model["Plain and streaming model callbacks on application loop"]
+    Model --> Bridge
+    Bridge --> Child["Child Monty sessions and speculation"]
+    Bridge --> Usage["Existing shared usage and limits"]
+```
+
 ## Functions available inside Monty
 
 Hosted functions accept keyword arguments only and must be awaited:

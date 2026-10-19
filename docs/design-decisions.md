@@ -119,6 +119,28 @@ does not create a second config model, file store, module loader, or MCP registr
 Configured hosted tools join the operation scope so they use the current caller
 loop and budgets. Native kernel defaults and the original middleware APIs remain.
 
+The model request, not the ToolNode registry, defines the active named PTC and
+automatic task inventory. Both middleware profiles keep live references only in
+a slot-scoped host cache and save names in private graph state after each model
+response. Restart/resume can reconstruct registered tools by name. Historical
+saved names take precedence over a newer host cache. Direct calls and legacy
+state without inventory metadata keep their prior runtime-inventory fallback.
+Explicit tool objects and other configured host functions remain separate grants.
+This is a small selection fix, not a new approval or authorization system.
+
+Nested commands return their last usable message content, including serialized
+message dictionaries, or their update data when there is no message. The normal
+boundary converter handles that data. No nested graph update is applied. Native
+`MontyRuntimeError.display()` supplies optional tracebacks; one existing error
+cap bounds message plus stack. Output status and original counts are exposed in
+escaped model text without a new result type or logging dependency.
+
+An operation-local shallow view of the RLM wraps only model callbacks through
+the same loop helper. It preserves runner configuration, shared accounting,
+and child execution on the kernel loop. Streaming opens, advances, and closes
+the original iterator on its owner loop. A pending read is drained before close;
+no queue, client copy, or second RLM execution engine is added.
+
 Private kernel hooks let the compatibility profile keep a bounded console
 prefix, read module/startup bytes and write output through a shared backend, and
 refresh guest wrappers before startup and user code. Direct guest file access
@@ -128,10 +150,13 @@ and root checks. Discarded console text cannot be restored by output offloading.
 
 ```mermaid
 flowchart LR
-    Graph["Async agent graph on application loop"] --> Bridge["One owned Monty loop"]
+    Graph["Async agent graph on application loop"] --> Selection["Filtered inventory and private checkpointed names"]
+    Selection --> Bridge["One owned Monty loop"]
     Bridge --> VM["Native AsyncMonty worker"]
     VM --> Host["Bounded host function scope"]
     Host --> Graph
+    Bridge --> Model["Operation-local RLM model callback bridge"]
+    Model --> Graph
     Bridge --> File["Existing shared backend: modules, startup, output"]
     VM --> Snapshot["Full snapshot + package version + optional HMAC"]
     Snapshot --> Graph

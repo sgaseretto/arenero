@@ -299,8 +299,9 @@ sequenceDiagram
     opt checkpoint_state
         A->>K: Restore private snapshot to working store
     end
-    G->>A: awrap_model_call(live tools)
+    G->>A: awrap_model_call(filtered request tools)
     A-->>G: Dynamic limits and async function catalog
+    A-->>G: after_model saves private active names
     G->>A: python_interpreter(code) or compatibility eval(code)
     opt Compatibility profile
         A->>A: Check version and HMAC, then restore per-eval graph state
@@ -315,8 +316,8 @@ sequenceDiagram
         A-->>M: Boundary-safe value
     end
     M-->>K: Result and snapshot
-    K-->>A: Structured result and host_calls
-    A-->>G: ToolMessage
+    K-->>A: Structured result with bounded native traceback and host_calls
+    A-->>G: ToolMessage with counts and output-file success or error
     opt Compatibility thread mode
         A-->>G: Snapshot plus version and optional HMAC at each completed eval
     end
@@ -331,11 +332,20 @@ does not run for them. The outer interpreter call, the called tool, or the
 subagent must enforce the required approval policy.
 
 `CodeInterpreterMiddleware` adds an owned loop bridge for sync graph calls.
-Async tools and real task subgraphs return to the graph's caller loop. Shared
+Async tools, real task subgraphs, and RLM model callbacks return to the graph's
+caller loop. The same filtered request inventory supplies instructions and
+dispatch. Private name lists survive interrupt/resume; live tool references do
+not enter snapshots. Explicit host grants remain separate. Shared
 backend modules, startup files, and output files use the existing backend's raw
 bounded transfers, with direct guest files disabled. Guest wrappers are refreshed
 before startup and user code. The original middleware still accepts a
 caller-owned kernel. See the [profile guide](deepagents-compatibility.md).
+
+Both kernels use Monty's native runtime error display for optional traceback
+data. The shared result formatter keeps the old error message and caps message
+plus stack together. The compatibility text formatter exposes the bounded stack,
+original output counts, and file-write status; full details remain in artifacts
+or bounded output files. It does not reconstruct Python stacks in the host.
 
 ## Recursive model execution path
 
