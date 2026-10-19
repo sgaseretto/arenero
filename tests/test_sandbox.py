@@ -256,14 +256,14 @@ class SandboxTests(unittest.TestCase):
 
         self.assertEqual(restored.execute("pwd").output, "/work\n")
 
-    def test_per_call_execute_timeout_is_explicitly_unsupported(self) -> None:
-        """Reject a timeout that the persistent kernel cannot apply per call."""
+    def test_per_call_execute_timeout_accepts_a_bounded_command(self) -> None:
+        """Accept a cooperative deadline without changing kernel policy."""
         _, sandbox = self.make_sandbox()
 
         result = sandbox.execute("python -c '1 + 1'", timeout=1)
 
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("Per-call timeouts", result.output)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.output, "2")
 
     def test_file_utilities_share_text_and_binary_files(self) -> None:
         """Use the file operation and transfer planes on one filesystem."""

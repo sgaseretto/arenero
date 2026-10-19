@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Any, Literal, NotRequired, Self
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Annotated, Any, Literal, NotRequired, Self, cast
 from uuid import uuid4
 
 from deepagents.middleware._utils import append_to_system_message
@@ -20,6 +21,8 @@ from langchain.agents.middleware.types import (
     ModelResponse,
     PrivateStateAttr,
     ResponseT,
+    TracePolicy,
+    omit_payload,
 )
 from langchain.tools import BaseTool, ToolRuntime
 from langchain_core.messages import ToolMessage
@@ -27,10 +30,15 @@ from langchain_core.tools import StructuredTool
 from langgraph.config import get_config
 from pydantic import BaseModel, Field
 
+from ._graph_calls import GraphCalls
+from ._loop_thread import LoopThread
+from ._subagents import task_bridge
 from .async_kernel import AsyncPersistentMontyKernel
 from .hosted_tools import HostedToolConfig, HostedToolSet
+from .kernel import KernelConfig
 from .langchain_hosted_tools import hosted_tools_from_langchain
 from .rlm import RLM
+from .workspace import WorkspaceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +51,7 @@ class AreneroAgentState(AgentState):
 
     _arenero_snapshot: NotRequired[Annotated[bytes, PrivateStateAttr]]
     _arenero_snapshot_hmac: NotRequired[Annotated[bytes, PrivateStateAttr]]
+    _arenero_slot_id: NotRequired[Annotated[str, PrivateStateAttr]]
 
 
 class AreneroEvalInput(BaseModel):
@@ -428,14 +437,18 @@ class AreneroInterpreterMiddleware(
 
             session_id = middleware._session_for_runtime(runtime)
             hosted = middleware._hosted_for_runtime(runtime, session_id)
+            control = GraphCalls()
             try:
                 result = await middleware.kernel.execute(
                     session_id,
                     code,
                     output_limit_chars,
-                    hosted_tools=hosted,
+                    hosted_tools=control.wrap(hosted),
                     output_file=output_file,
                 )
+            except asyncio.CancelledError:
+                control.reraise()
+                raise
             finally:
                 if middleware._mode == "call":
                     await middleware.kernel.reset(session_id)
@@ -533,15 +546,19 @@ class AreneroInterpreterMiddleware(
 
             session_id = middleware._session_for_runtime(runtime)
             hosted = middleware._hosted_for_runtime(runtime, session_id)
+            control = GraphCalls()
             try:
                 result = await middleware.kernel.execute_module(
                     session_id,
                     entry_path,
                     code,
                     output_limit_chars,
-                    hosted_tools=hosted,
+                    hosted_tools=control.wrap(hosted),
                     output_file=output_file,
                 )
+            except asyncio.CancelledError:
+                control.reraise()
+                raise
             finally:
                 if middleware._mode == "call":
                     await middleware.kernel.reset(session_id)
@@ -750,3 +767,510 @@ def _resolve_thread_id(fallback: str, runtime: ToolRuntime | None = None) -> str
             config = None
     value = (config or {}).get("configurable", {}).get("thread_id")
     return str(value) if value is not None else fallback
+
+
+class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
+    """Provide the QuickJS-style agent interface with Monty Python execution.
+
+    Args:
+        memory_limit: Monty heap cap in bytes, not host RSS.
+        timeout: Interpreter time cap for each Python feed, excluding host waits.
+        max_ptc_calls: Regular hosted calls per eval; None removes this adapter cap.
+        tool_name: Interpreter tool name; defaults to eval.
+        max_result_chars: Character cap for each returned field.
+        capture_console: Collect stdout and stderr when true; otherwise discard.
+        subagents: Expose the current Deep Agents task tool when true.
+        max_subagent_concurrency: Active subagents per eval, separate from PTC.
+        max_subagent_calls: Task dispatch cap per eval.
+        ptc: Live tool names or explicit tool objects to expose as Python functions.
+        mode: Python lifetime: thread, turn, or call. None means thread.
+        max_snapshot_bytes: Graph snapshot cap; defaults to memory_limit.
+        snapshot_signing_key: Optional HMAC key bound to the private graph slot.
+        module_tool: Include the static virtual-module tool when true.
+        tools_namespace: Also expose await tools.NAME(**kwargs) when true.
+        backend: Optional shared AreneroBackend. Guest files then use its hosted
+            fs_* functions, not direct mounts. The caller owns the backend.
+        workspace: Optional direct mounted workspace, instead of a shared backend.
+    """
+
+    trace_policy = TracePolicy(
+        process_inputs=omit_payload, process_outputs=omit_payload
+    )
+
+    def __init__(
+        self,
+        *,
+        memory_limit: int = 64 * 1024 * 1024,
+        timeout: float = 5.0,
+        max_ptc_calls: int | None = 256,
+        tool_name: str = "eval",
+        max_result_chars: int = 4000,
+        capture_console: bool = True,
+        subagents: bool = True,
+        max_subagent_concurrency: int = 32,
+        max_subagent_calls: int = 100,
+        ptc: PTCOption | None = None,
+        mode: PersistenceMode | None = None,
+        max_snapshot_bytes: int | None = None,
+        snapshot_signing_key: str | bytes | None = None,
+        module_tool: bool = False,
+        tools_namespace: bool = True,
+        backend: Any = None,
+        workspace: WorkspaceConfig | None = None,
+    ) -> None:
+        """Create an optional adapter without changing the original middleware."""
+        if max_ptc_calls is not None and max_ptc_calls < 1:
+            raise ValueError("max_ptc_calls must be positive or None")
+        if min(max_subagent_concurrency, max_subagent_calls) < 1:
+            raise ValueError("subagent limits must be positive")
+        if max_result_chars < 0:
+            raise ValueError("max_result_chars must not be negative")
+        if mode not in (None, "thread", "turn", "call") or not tool_name:
+            raise ValueError("use a nonempty tool_name and thread, turn, or call mode")
+        self._capture_console = capture_console
+        self._namespace = tools_namespace
+        self._max_ptc_calls = max_ptc_calls
+        self._subagent_concurrency = max_subagent_concurrency
+        self._subagent_calls = max_subagent_calls
+        self._backend = backend
+        if backend is not None and (module_tool or workspace is not None):
+            raise ValueError(
+                "a shared backend cannot use module_tool or direct workspace"
+            )
+        config = KernelConfig(
+            max_memory_bytes=memory_limit,
+            max_feed_duration_seconds=timeout,
+            default_output_limit_chars=max_result_chars,
+            max_output_limit_chars=max(max_result_chars, 1),
+            max_state_bytes=memory_limit
+            if max_snapshot_bytes is None
+            else max_snapshot_bytes,
+        )
+        super().__init__(
+            kernel=AsyncPersistentMontyKernel(config=config, workspace=workspace),
+            tool_name=tool_name,
+            ptc=ptc,
+            subagents=subagents,
+            mode=mode or "thread",
+            checkpoint_state=(mode or "thread") == "thread",
+            max_snapshot_bytes=memory_limit
+            if max_snapshot_bytes is None
+            else max_snapshot_bytes,
+            snapshot_signing_key=snapshot_signing_key,
+            hosted_tool_config=HostedToolConfig(
+                max_calls_per_operation=2**31 - 1,
+                max_parallel_calls=10 + max_subagent_concurrency,
+            ),
+        )
+        self._bridge = LoopThread()
+        self.kernel._collect_streams = capture_console
+        self._owns_kernel = True
+        self.tools = [self._compat_tool()]
+        if module_tool:
+            self.tools.append(self._compat_tool(module=True))
+
+    def __enter__(self) -> Self:
+        """Open the interpreter for synchronous graph calls.
+
+        Returns:
+            This middleware.
+        """
+        self._bridge.submit(self.kernel.open()).result()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Close the owned interpreter and loop.
+
+        Args:
+            *exc_info: Optional context exception details.
+        """
+        self.close()
+
+    async def __aenter__(self) -> Self:
+        """Open the same interpreter for asynchronous graph calls.
+
+        Returns:
+            This middleware.
+        """
+        await asyncio.wrap_future(self._bridge.submit(self.kernel.open()))
+        return self
+
+    def close(self) -> None:
+        """Close the kernel before its loop; the caller owns any backend."""
+        if self._bridge.thread.is_alive():
+            self._bridge.submit(self.kernel.close()).result()
+            self._bridge.stop()
+
+    async def aclose(self) -> None:
+        """Close resources without blocking the caller's event loop."""
+        await asyncio.to_thread(self.close)
+
+    def instructions(self, tools: Sequence[BaseTool] = ()) -> str:
+        """Describe the Python interface and its active adapter limits.
+
+        Args:
+            tools: Current agent tools available for progressive composition.
+
+        Returns:
+            Model instructions with exact active function schemas.
+        """
+        text = (
+            super()
+            .instructions(tools)
+            .replace(
+                "Use agent.ainvoke() or agent.astream(); synchronous invocation "
+                "cannot run this interpreter. ",
+                "Use invoke/stream or ainvoke/astream. ",
+            )
+        )
+        text = text.replace(
+            "Use the module tool for small static virtual-file imports.",
+            "The optional module tool can load small static virtual-file imports when enabled.",
+        )
+        text += (
+            f"\nUse {self._tool_name}(code=...) with Python, not JavaScript. "
+            "Results use <stdout>, <stderr>, <result>, and <error> text blocks. "
+            "Send one eval at a time per graph thread. Python state is private "
+            "graph checkpoint data; files and tool effects are separate. "
+            f"Regular PTC cap: {self._max_ptc_calls}; task cap: {self._subagent_calls}; "
+            f"task concurrency: {self._subagent_concurrency}. "
+            "When a live task tool is present, "
+            "task(description=..., subagent_type=..., response_schema=None, label=None) "
+            "accepts a JSON schema of at most 4096 bytes, depth 5, 32 properties. "
+            "Subagent events use replay-stable IDs; they do not guarantee exactly-once effects."
+        )
+        if self._namespace:
+            text += "\nBare functions and await tools.NAME(**kwargs) both work."
+        if self._backend is not None:
+            text += "\nDirect pathlib/open files are disabled. Use the shared hosted fs_* functions.\n"
+            text += self._backend.instructions() + "\n"
+            text += (
+                self._backend._hosted_tools()
+                .catalog(async_mode=True)
+                .replace("_arenero_backend_fs_", "fs_")
+            )
+        if len(self.tools) == 1:
+            text += (
+                "\nNo module tool is enabled. Use inline dependency-free Monty Python."
+            )
+        return text
+
+    def before_agent(self, state: AreneroAgentState, runtime: Any) -> dict[str, Any]:
+        """Assign a private slot before synchronous graph execution.
+
+        Args:
+            state: Current graph state.
+            runtime: Graph runtime.
+
+        Returns:
+            Private slot update.
+        """
+        return self._bridge.submit(self._before(state)).result()
+
+    async def abefore_agent(
+        self, state: AreneroAgentState, runtime: Any
+    ) -> dict[str, Any]:
+        """Assign a private slot before asynchronous graph execution.
+
+        Args:
+            state: Current graph state.
+            runtime: Graph runtime.
+
+        Returns:
+            Private slot update.
+        """
+        return await asyncio.wrap_future(self._bridge.submit(self._before(state)))
+
+    async def _before(self, state: AreneroAgentState) -> dict[str, Any]:
+        """Create an invocation slot without an instance-wide fallback.
+
+        Args:
+            state: Private graph state from the previous checkpoint.
+
+        Returns:
+            New or retained slot identity.
+        """
+        slot = state.get("_arenero_slot_id") if self._mode == "thread" else None
+        return {"_arenero_slot_id": slot or uuid4().hex}
+
+    def after_agent(self, state: AreneroAgentState, runtime: Any) -> None:
+        """Evict working state after synchronous graph completion.
+
+        Args:
+            state: Completed graph state.
+            runtime: Graph runtime.
+        """
+        self._bridge.submit(self._after(state)).result()
+
+    async def aafter_agent(self, state: AreneroAgentState, runtime: Any) -> None:
+        """Evict working state after asynchronous graph completion.
+
+        Args:
+            state: Completed graph state.
+            runtime: Graph runtime.
+        """
+        await asyncio.wrap_future(self._bridge.submit(self._after(state)))
+
+    async def _after(self, state: AreneroAgentState) -> None:
+        """Remove the working copy; graph checkpoints own thread persistence.
+
+        Args:
+            state: Graph state with its private slot.
+        """
+        slot = state.get("_arenero_slot_id")
+        if slot:
+            await self.kernel.reset(self._thread_session_id(slot))
+
+    def _compat_tool(self, module: bool = False) -> BaseTool:
+        """Build one bridged tool with stable graph state updates.
+
+        Args:
+            module: Use static virtual-module input instead of a normal cell.
+
+        Returns:
+            Tool with both sync and async entry points.
+        """
+        name = self._tool_name + ("_module" if module else "")
+
+        def invoke(runtime: ToolRuntime, **kwargs: Any) -> Any:
+            """Run a cell from a synchronous ToolNode.
+
+            Args:
+                runtime: Injected parent runtime.
+                **kwargs: Validated tool inputs.
+
+            Returns:
+                Message and private checkpoint update.
+            """
+            return self._bridge.submit(
+                self._compat_eval(runtime, kwargs, module)
+            ).result()
+
+        async def ainvoke(runtime: ToolRuntime, **kwargs: Any) -> Any:
+            """Run the same cell from an asynchronous ToolNode.
+
+            Args:
+                runtime: Injected parent runtime.
+                **kwargs: Validated tool inputs.
+
+            Returns:
+                Message and private checkpoint update.
+            """
+            return await asyncio.wrap_future(
+                self._bridge.submit(self._compat_eval(runtime, kwargs, module))
+            )
+
+        return StructuredTool.from_function(
+            name=name,
+            description="Run bounded Monty Python, not JavaScript or CPython. "
+            "Await the hosted functions in the instructions. One eval per graph step. "
+            "Read <stdout>, <stderr>, <result>, and <error> blocks.",
+            func=invoke,
+            coroutine=ainvoke,
+            infer_schema=False,
+            args_schema=AreneroModuleInput if module else AreneroEvalInput,
+            metadata={
+                "arenero_kind": "code-execution",
+                "code_arg_name": "code",
+                "ls_code_input_language": "python",
+            },
+        )
+
+    async def _compat_eval(
+        self, runtime: ToolRuntime, arguments: dict[str, Any], module: bool
+    ) -> Any:
+        """Restore graph state, run a feed, and checkpoint its completed state.
+
+        Args:
+            runtime: Injected graph state and current tool inventory.
+            arguments: Validated tool arguments.
+            module: Run the optional virtual module entry point when true.
+
+        Returns:
+            LangGraph command containing a ToolMessage and private state fields.
+        """
+        from langgraph.types import Command
+
+        messages = runtime.state.get("messages", [])
+        active_calls = getattr(messages[-1], "tool_calls", []) if messages else []
+        if (
+            sum(
+                call.get("name") in {self._tool_name, self._tool_name + "_module"}
+                for call in active_calls
+            )
+            > 1
+        ):
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content='<error type="ConcurrentEval">Send one eval per graph step.</error>',
+                            status="error",
+                            name=self._tool_name,
+                            tool_call_id=runtime.tool_call_id,
+                        )
+                    ]
+                }
+            )
+
+        slot = runtime.state.get("_arenero_slot_id")
+        if not slot:
+            raise RuntimeError("before_agent must assign the private interpreter slot")
+        session_id = self._thread_session_id(slot)
+        if self._mode == "call":
+            await self.kernel.reset(session_id)
+        elif self._mode == "thread":
+            await self.kernel.reset(session_id)
+            payload = runtime.state.get("_arenero_snapshot")
+            if (
+                payload is not None
+                and len(payload) <= self._max_snapshot_bytes
+                and self._snapshot_valid(
+                    payload, cast(AreneroAgentState, runtime.state), session_id
+                )
+            ):
+                await asyncio.to_thread(
+                    self.kernel.store.save,
+                    session_id,
+                    payload,
+                    self.kernel.monty_version,
+                    None,
+                )
+        selected = self._select_tools(runtime.tools)
+        regular = [tool for tool in selected if tool.name != "task"]
+        hosted = hosted_tools_from_langchain(
+            regular,
+            config=runtime.config,
+            runtime=runtime,
+            limits=self._hosted_tool_config,
+        )
+        if self._backend is not None:
+            hosted = hosted.merged(
+                self._backend._hosted_tools(config=self._hosted_tool_config)
+            )
+        gate = asyncio.Semaphore(10)
+        calls = 0
+        from dataclasses import replace
+
+        from .hosted_tools import _invoke_tool
+
+        wrapped = []
+        for tool in hosted.tools:
+
+            async def call(args, active=tool):
+                """Apply the regular-call budget independently of tasks.
+
+                Args:
+                    args: Validated tool arguments.
+                    active: Captured hosted function.
+
+                Returns:
+                    Hosted function result.
+                """
+                nonlocal calls
+                calls += 1
+                if self._max_ptc_calls is not None and calls > self._max_ptc_calls:
+                    raise ValueError("regular PTC call limit exceeded")
+                async with gate:
+                    return await _invoke_tool(active, args)
+
+            wrapped.append(replace(tool, ainvoke=call))
+        task = next((tool for tool in selected if tool.name == "task"), None)
+        if task is not None:
+            wrapped.append(
+                task_bridge(
+                    task,
+                    runtime,
+                    concurrency=self._subagent_concurrency,
+                    max_calls=self._subagent_calls,
+                )
+            )
+        hosted = HostedToolSet(tuple(wrapped), self._hosted_tool_config)
+        control = GraphCalls()
+        code = arguments.get("code") if module else arguments["code"]
+        prefix = ""
+        if self._backend is not None:
+            prefix = (
+                "\n".join(
+                    f"async def {tool.name}(**kwargs):\n    return await {tool.alias}(**kwargs)"
+                    for tool in hosted.tools
+                    if tool.alias.startswith("_arenero_backend_fs_")
+                )
+                + "\n"
+            )
+        if self._namespace and hosted.tools and code is not None:
+            methods = "\n".join(
+                f"    async def {tool.name if tool.alias.startswith('_arenero_backend_fs_') else tool.alias}(self, **kwargs):\n        return await {tool.alias}(**kwargs)"
+                for tool in hosted.tools
+            )
+            prefix += f"class _AreneroTools:\n{methods}\ntools = _AreneroTools()\n"
+        if code is not None:
+            code = prefix + code
+        kwargs: dict[str, Any] = {
+            **arguments,
+            "code": code,
+            "hosted_tools": control.wrap(hosted),
+        }
+        if not module:
+            kwargs["filesystem"] = self._backend is None
+        try:
+            operation = self.kernel.execute_module if module else self.kernel.execute
+            result = await operation(session_id, **kwargs)
+        except asyncio.CancelledError:
+            control.reraise()
+            raise
+        message = ToolMessage(
+            content=_compat_text(result, self._capture_console),
+            tool_call_id=runtime.tool_call_id,
+            name=self._tool_name + ("_module" if module else ""),
+            status="success" if result["ok"] else "error",
+            artifact=result,
+        )
+        update: dict[str, Any] = {"messages": [message]}
+        if self._mode == "thread":
+            stored = await asyncio.to_thread(self.kernel.store.load, session_id)
+            payload = (
+                stored.state
+                if stored and len(stored.state) <= self._max_snapshot_bytes
+                else None
+            )
+            update["_arenero_snapshot"] = payload
+            update["_arenero_snapshot_hmac"] = (
+                self._sign(payload, session_id)
+                if payload and self._signing_key
+                else None
+            )
+        elif self._mode == "call":
+            await self.kernel.reset(session_id)
+        return Command(update=update)
+
+
+def _compat_text(result: Mapping[str, Any], capture_console: bool) -> str:
+    """Format bounded execution fields as independent escaped text blocks.
+
+    Args:
+        result: Existing rich Arenero execution result.
+        capture_console: Include stdout and stderr when true.
+
+    Returns:
+        Model-facing blocks; the unmodified rich result is in the artifact.
+    """
+    blocks = []
+    if capture_console:
+        for name in ("stdout", "stderr"):
+            if result[name]:
+                blocks.append(f"<{name}>\n{html.escape(result[name])}\n</{name}>")
+    if result["error"]:
+        error = result["error"]
+        blocks.append(
+            f'<error type="{html.escape(error["type"], quote=True)}">{html.escape(error["message"])}</error>'
+        )
+    else:
+        blocks.append(
+            "<result>"
+            + html.escape(json.dumps(result["result"], ensure_ascii=False))
+            + "</result>"
+        )
+    if any(result["truncated"].values()):
+        blocks.append("<truncated>Output reached the configured limit.</truncated>")
+    return "\n".join(blocks)

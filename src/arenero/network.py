@@ -8,6 +8,8 @@ from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 import urllib3
 from urllib3.util import Timeout
 
+from ._deadline import remaining as _shell_remaining
+
 _CONTROLLED_HEADERS = {
     "connection",
     "content-length",
@@ -287,6 +289,9 @@ def _fetch_once(
         raise NetworkError("URL must include a host")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     addresses = _resolve_addresses(host, port, config.deny_non_global_addresses)
+    shell_remaining = _shell_remaining()
+    if shell_remaining is not None:
+        timeout_seconds = min(timeout_seconds, shell_remaining)
     address = addresses[0]
     target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
     request_headers = dict(headers)
@@ -331,6 +336,7 @@ def _fetch_once(
         ):
             raise NetworkError("response body exceeds the network limit")
         response_body = response.read(config.max_response_bytes + 1)
+        _shell_remaining()
         if len(response_body) > config.max_response_bytes:
             raise NetworkError("response body exceeds the network limit")
         return NetworkResponse(

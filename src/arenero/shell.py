@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic_monty import MontyError
 
+from ._deadline import remaining
 from .events import emit_event
 from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, PersistentMontyKernel, _output_limit
@@ -278,7 +279,9 @@ class VirtualShell:
             command_chars=len(command),
         )
         with self.kernel.filesystem_guard():
+            remaining()
             result = self._execute_locked(command, output_limit_chars, output_file)
+            remaining()
         emit_event(
             self.kernel.event_sink,
             "execution",
@@ -381,11 +384,13 @@ class VirtualShell:
         last_result = ShellResult("", 0)
         truncated = False
         for pipeline in pipelines:
+            remaining()
             if pipeline.operator == "&&" and last_result.exit_code != 0:
                 continue
             if pipeline.operator == "||" and last_result.exit_code == 0:
                 continue
             last_result, cwd = self._execute_pipeline(pipeline.commands, cwd)
+            remaining()
             self._last_status = last_result.exit_code
             output, shortened = _trim(
                 output + last_result.output,
@@ -411,6 +416,7 @@ class VirtualShell:
         pipeline_input: str | None = None
         truncated = False
         for parsed in commands:
+            remaining()
             arguments = self._expand_words(parsed.arguments, cwd)
             input_path = self._expanded_path(parsed.input_path, cwd)
             output_path = self._expanded_path(parsed.output_path, cwd)
@@ -435,6 +441,7 @@ class VirtualShell:
                 result = ShellResult("", 0)
             else:
                 result = self._run(arguments, pipeline_input, cwd)
+            remaining()
             truncated = truncated or result.truncated
             if result.exit_code != 0:
                 return ShellResult(result.output, result.exit_code, truncated), cwd
@@ -955,8 +962,12 @@ class VirtualShell:
             ),
             config,
             follow_redirects=options.follow_redirects,
-            timeout_seconds=options.timeout_seconds,
+            timeout_seconds=min(
+                options.timeout_seconds or config.timeout_seconds,
+                remaining() or config.timeout_seconds,
+            ),
         )
+        remaining()
         emit_event(
             self.kernel.event_sink,
             "network",

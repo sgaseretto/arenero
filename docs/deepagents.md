@@ -1,5 +1,11 @@
 # Deep Agents interpreter middleware
 
+There are two optional interfaces. This page describes the existing
+`AreneroInterpreterMiddleware`. For a single `eval` tool, sync and async graph
+calls, graph-owned state, and an optional shared backend, use
+[`CodeInterpreterMiddleware`](deepagents-compatibility.md). Existing APIs and
+defaults have not changed.
+
 `AreneroInterpreterMiddleware` gives a Deep Agents or LangChain agent one
 asynchronous Monty interpreter. The model gets two tools:
 
@@ -266,3 +272,61 @@ agent when the kernel or tool list can change.
 The output-file and module-export tests run a complete mocked model-driven graph
 over two human turns. The second call keeps Python state and loads a module, then
 writes its full result through the same two fixed interpreter tool names.
+
+## Compatibility review: 2026-10-18
+
+This section records the pinned sources used to build the optional Python
+compatibility profile and file/sandbox backend. It is not JavaScript source compatibility,
+QuickJS snapshot compatibility, or full CPython.
+
+### Reference versions and sources
+
+Arenero was reviewed at `f8e63a64e4f7c4958f2768bc8e72349c624e1d79`, with Monty
+`1.1.0`. The project lockfile has Deep Agents `0.7.11`, LangChain `1.3.18`, and
+LangGraph `1.2.11`. A separate test environment used Deep Agents `0.7.28`,
+LangChain `1.4.6`, and LangGraph `1.2.16`; the project environment was not changed.
+
+The reference middleware package was `langchain-quickjs==0.3.9` and its runtime
+was `quickjs-rs==0.2.5`. Current main source was pinned for later comparison:
+
+- [Deep Agents interpreter guide](https://docs.langchain.com/oss/python/deepagents/interpreters)
+  and the supplied [Markdown endpoint](https://docs.langchain.com/oss/python/deepagents/interpreters.md).
+- [Deep Agents source at `4bf5022`](https://github.com/langchain-ai/deepagents/tree/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs).
+- [Middleware API and lifecycle](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs/langchain_quickjs/middleware.py).
+- [REPL execution and callback bridge](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs/langchain_quickjs/_repl.py).
+- [Subagent schemas, events, and replay IDs](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs/langchain_quickjs/_subagent.py).
+- [Result formatter](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs/langchain_quickjs/_format.py)
+  and [snapshot delta encoding](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/partners/quickjs/langchain_quickjs/_snapshot.py).
+- [Deep Agents backend contract](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/deepagents/deepagents/backends/protocol.py)
+  and [shell-based BaseSandbox](https://github.com/langchain-ai/deepagents/blob/4bf50225d9f2bd777c1b2aa722e76273eb772ab0/libs/deepagents/deepagents/backends/sandbox.py).
+- [quickjs-rs repository](https://github.com/langchain-ai/quickjs-rs), pinned at
+  [commit `278cf32`](https://github.com/langchain-ai/quickjs-rs/tree/278cf32d17b07a9ba2951ebc826256eef703182d).
+
+Keep documentation and implementation versions separate. The interpreter guide
+still warns that restored functions become inaccessible, but the reviewed
+runtime uses full WebAssembly heap snapshots. Its source and examples preserve
+functions and closures. Do not claim that callable-state persistence is unique
+to Arenero. Some partner README descriptions also still mention a native PyO3
+runtime; the reviewed runtime package uses WebAssembly and Wasmtime.
+
+### Implementation
+
+The ten recommended additions are now available through
+`CodeInterpreterMiddleware` and `AreneroBackend`. See the
+[Python compatibility guide](deepagents-compatibility.md) for setup, settings,
+examples, diagrams, checkpoint behavior, and remaining differences.
+
+The original middleware keeps its public constructor, two-tool interface,
+JSON results, async-only execution, and store-backed default. Nested graph
+control signals now propagate instead of becoming Monty error envelopes.
+
+The adapters reuse Monty, the existing sandbox, file transfers, runtime injection,
+and the Deep Agents glob matcher. They do not add another interpreter, an import
+engine, a filesystem, or shell-based `BaseSandbox` wrappers. Full snapshots are
+used instead of adding a binary-delta dependency.
+
+Validation uses fake models and local workers. It covers two human turns with a
+new middleware instance, sync and async graph calls, interruption and replay,
+subagent schemas/events/budgets, shared file calls, backend records, and shell
+deadlines. Both the locked dependencies and the separate current dependency set
+are covered. No real LLM calls are needed.

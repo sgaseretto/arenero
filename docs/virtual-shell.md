@@ -42,6 +42,36 @@ The implementation is in `src/arenero/shell.py`. `AreneroSandbox.execute()`,
 `ManagedSandbox.run_shell()`, the LangChain or LangGraph `virtual_shell` tool,
 and REPL shell cells use this implementation.
 
+### Per-call deadlines
+
+`AreneroSandbox.execute(command, timeout=...)` and the optional Deep Agents
+`AreneroBackend.execute` accept a cooperative wall deadline in seconds. A
+positive timeout is checked before/after commands and pipelines, after DNS,
+and after an HTTP body read. Remaining time lowers curl's network timeout.
+`None` or `0` adds no per-call deadline; all normal runtime/network limits remain.
+Negative or nonfinite values return exit `2`. Expiry returns exit `124`, stops
+later commands, and does not undo completed file or external effects.
+
+This is not an exact wall-time kill. An active Monty operation, system sleep,
+DNS lookup, file operation, or host callback can finish after the deadline.
+Partial console output need not be returned on expiry. Keep the native
+interpreter, request, and network limits too. The deadline is call-local and
+does not mutate shared kernel policy or lower limits inside a restored snapshot.
+
+```mermaid
+flowchart LR
+    Call["execute with timeout"] --> Check{"Time remains?"}
+    Check -->|Yes| Command["Run one bounded virtual command"]
+    Command --> More{"More commands?"}
+    More -->|Yes| Check
+    More -->|No| Done["Return result"]
+    Check -->|No| Expired["Exit 124; no later commands"]
+    Command --> Effects["Completed file effects remain"]
+```
+
+This deadline is available on the sandbox execute API. It does not add a new
+timeout argument to shell cells or `ManagedSandbox.run_shell`.
+
 ## Entry points
 
 Use a single-line notebook form:

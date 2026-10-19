@@ -61,6 +61,22 @@ sync/async tool merging and collision errors, fresh call budgets, async callback
 priority, sync thread offloading, error/cancellation propagation, and native async
 execution/reset while the file lock is held. These checks use no live model.
 
+`tests/test_deepagents_compat.py` covers the optional Python compatibility
+profile and backend with fake models and real local Monty workers. It checks
+two human turns across middleware recreation, private slots without thread IDs,
+sync invoke/stream and async invoke/custom streams, result blocks, print discard,
+snapshot authentication and size, all state modes, graph interrupt/resume and
+cancellation, stable task IDs, schema bounds, separate task budgets/concurrency,
+events, live tool namespaces, and the optional module workaround. A complete
+mocked Deep Agents graph writes through outer file tools and reads/writes from
+Python through the same backend, including a file pool with one worker. Backend
+checks cover a* methods, native records, paging, binary batches and errors, root
+bounds, upstream glob rules, exact grep caps, scan limits, and cooperative shell
+deadlines. The suite is tested with the locked dependencies and an isolated
+Deep Agents 0.7.28 / LangChain 1.4.6 / LangGraph 1.2.16 environment. It uses no
+provider credentials or real LLM calls. See the
+[compatibility guide](deepagents-compatibility.md).
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |

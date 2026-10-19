@@ -136,6 +136,7 @@ def _inject_runtime(
     tool: BaseTool,
     arguments: dict[str, Any],
     runtime: ToolRuntime | None,
+    child_id: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Inject LangGraph runtime values for a programmatic tool call.
 
@@ -143,6 +144,7 @@ def _inject_runtime(
         tool: Tool whose hidden arguments must be detected.
         arguments: Model-visible keyword arguments.
         runtime: Outer REPL tool runtime, or ``None`` outside LangGraph.
+        child_id: Optional stable replay identity for a nested dispatch.
 
     Returns:
         Enriched arguments and a synthetic child tool-call ID when available.
@@ -156,7 +158,7 @@ def _inject_runtime(
         return dict(arguments), None
 
     injected = _get_all_injected_args(tool)
-    child_id = f"arenero_{tool.name}_{uuid4().hex[:8]}"
+    child_id = child_id or f"arenero_{tool.name}_{uuid4().hex[:8]}"
     derived = type(runtime)(
         state=runtime.state,
         context=runtime.context,
@@ -229,6 +231,8 @@ def _programmatic_result(tool: BaseTool, result: Any) -> Any:
 
     if tool.name != "task":
         return result
+    if hasattr(result, "content"):
+        return result.content
     update = getattr(result, "update", None)
     if not isinstance(update, Mapping):
         return result

@@ -73,6 +73,15 @@ if TYPE_CHECKING:
     from .session import AsyncSessionHandle
 
 
+def _discard_print(stream: str, text: str) -> None:
+    """Discard console chunks without forwarding them to the host terminal.
+
+    Args:
+        stream: Monty stream name.
+        text: Buffered guest output chunk.
+    """
+
+
 class AsyncPersistentMontyKernel:
     """Run persistent Python sessions on a native asynchronous Monty pool."""
 
@@ -173,6 +182,7 @@ class AsyncPersistentMontyKernel:
         self._filesystem_lock = asyncio.Lock()
         self._filesystem_enabled = self.os_handler is not None or bool(self.mounts)
         self._closed = False
+        self._collect_streams = True
 
     async def __aenter__(self) -> Self:
         """Open and return this kernel.
@@ -1382,7 +1392,7 @@ class AsyncPersistentMontyKernel:
             code,
             inputs=dict(inputs) if inputs is not None else None,
             external_lookup=external_lookup,
-            print_callback=streams,
+            print_callback=streams if self._collect_streams else _discard_print,
             mount=self.mounts if filesystem else None,
             os=self.os_handler if filesystem else None,
             skip_type_check=skip_type_check,

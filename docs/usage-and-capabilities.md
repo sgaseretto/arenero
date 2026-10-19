@@ -586,11 +586,14 @@ operations instead of random-access update modes.
 sandbox.execute("python -c '21 * 2'", timeout=1)
 ```
 
-The facade returns exit code `2`; per-call timeout overrides are not part of
-this API. Set `KernelConfig.max_feed_duration_seconds`, optional
-`max_turn_duration_seconds`, and `request_timeout_seconds` when the kernel is
-created. Host waits are not interpreter time. Virtual `curl --max-time` can only
-lower the network timeout.
+The facade accepts a cooperative wall deadline. Expiry returns exit `124` and
+stops later commands. Zero or `None` adds no call deadline; negative or nonfinite
+values return exit `2`. Active host calls, DNS, worker operations, and system
+sleep can finish after the deadline. Completed effects remain. Keep
+`KernelConfig.max_feed_duration_seconds`, optional `max_turn_duration_seconds`,
+and `request_timeout_seconds` too. Host waits are not interpreter time. Virtual
+`curl --max-time` can lower the network timeout. See
+[shell deadlines](virtual-shell.md#per-call-deadlines).
 
 ## Verified Monty Python shape
 

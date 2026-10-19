@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic_monty import MontyError
 
+from ._deadline import shell_deadline
 from .cell import execute_repl_cell
 from .hosted_tools import HostedToolSet
 from .kernel import ExecutionResult, PersistentMontyKernel, StatePolicy
@@ -86,7 +87,11 @@ managed sandbox for those tasks.
 
 Results have output, exit_code, and truncated fields. Check truncated before you
 treat output as complete. Set output_file to an absolute virtual path to save
-larger bounded output when the response is trimmed."""
+larger bounded output when the response is trimmed. The sandbox execute API
+accepts a cooperative per-call timeout: expiry returns exit 124 and stops later
+commands. It cannot preempt an active worker, host callback, DNS lookup, or
+system sleep. Completed effects remain. None or zero adds no call deadline;
+negative values fail with exit 2. Shell cells do not add a timeout argument."""
 
 MONTY_SANDBOX_INSTRUCTIONS = (
     "## Arenero virtual shell\n\n" + VIRTUAL_SHELL_TOOL_DESCRIPTION
@@ -234,29 +239,27 @@ class AreneroSandbox:
 
         Args:
             command: Text in the documented virtual shell grammar.
-            timeout: Unsupported per-call timeout. Configure ``KernelConfig``.
+            timeout: Cooperative wall deadline in seconds; None or zero uses
+                configured limits only. In-progress host work is not preempted.
             output_limit_chars: Optional final output limit below the hard maximum.
             output_file: Optional absolute virtual path used when output is trimmed.
 
         Returns:
             Combined output, exit code, and truncation state.
         """
-        if timeout is not None:
-            return SandboxExecuteResult(
-                output=(
-                    "Per-call timeouts are not supported. Configure "
-                    "KernelConfig.max_feed_duration_seconds and "
-                    "request_timeout_seconds."
-                ),
-                exit_code=2,
-            )
-        return _shell_response(
-            VirtualShell(self.kernel, self.session_id).execute(
-                command,
-                output_limit_chars,
-                output_file=output_file,
-            )
-        )
+        try:
+            with shell_deadline(timeout):
+                return _shell_response(
+                    VirtualShell(self.kernel, self.session_id).execute(
+                        command,
+                        output_limit_chars,
+                        output_file=output_file,
+                    )
+                )
+        except TimeoutError as exc:
+            return SandboxExecuteResult(output=str(exc), exit_code=124)
+        except ValueError as exc:
+            return SandboxExecuteResult(output=str(exc), exit_code=2)
 
     def execute_python(
         self,

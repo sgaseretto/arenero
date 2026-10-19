@@ -97,6 +97,9 @@ arbitrary executables, or a real shell.
 - [Deep Agents interpreter middleware](docs/deepagents.md) explains async agent
   integration, dynamic tool discovery, programmatic composition, session modes,
   subagents, and checkpoint snapshots.
+- [Python compatibility profile](docs/deepagents-compatibility.md) explains the
+  single eval tool, sync/async graphs, private state, subagent events, and shared
+  Deep Agents file and limited-shell backend.
 - [Recursive Language Models](docs/rlm.md) explains external context, plain and
   recursive model calls, child sessions, budgets, worker needs, adapters, and
   filesystem limits.
@@ -559,6 +562,58 @@ asyncio.run(main())
 ```
 
 ### Deep Agents interpreter middleware
+
+For a QuickJS-style interface with Python, use the optional compatibility profile:
+
+```python
+from arenero.deepagents import CodeInterpreterMiddleware
+from deepagents import create_deep_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+with CodeInterpreterMiddleware(ptc=("search_web",)) as interpreter:
+    agent = create_deep_agent(
+        model=model, tools=[search_web], middleware=[interpreter],
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "conversation-42"}}
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Calculate and remember the result."}]},
+        config,
+    )
+```
+
+The model sees one `eval(code=...)` tool. It can run Python such as
+`found = await tools.search_web(query="Monty")`, then process the result in the
+same call. `invoke`, `stream`, `ainvoke`, and `astream` work. A graph checkpointer
+keeps Python values and functions between human turns. Without a thread ID and
+with fresh input state, invocations get separate private sessions.
+
+```mermaid
+flowchart LR
+    Graph["Deep Agents or LangChain graph"] --> Eval["eval: Monty Python"]
+    Eval --> State["Private graph snapshots"]
+    Eval --> Tools["Selected tools and subagents"]
+    Eval -. "optional fs_* bridge" .-> Backend["AreneroBackend"]
+    Graph -. "outer file and execute tools" .-> Backend
+    Backend --> Files["One virtual file store and limited shell"]
+```
+
+Add `AreneroBackend` from `arenero.deepagents_backend` for native Deep Agents file
+records and a limited `execute` tool. Pass the same backend to the graph and
+`CodeInterpreterMiddleware(backend=backend)`. This enables async guest file
+calls such as `await fs_read(file_path="/report.txt")` without re-entering the
+active Python session. Files are separate from Python checkpoints.
+
+This is Python interface compatibility, not JavaScript, full CPython, or Bash.
+Normal third-party imports do not work. An optional `module_tool=True` with a
+direct `workspace` provides the existing bounded static-module workaround; it
+cannot be combined with shared-backend mode. Shell timeouts are cooperative,
+not exact wall-time process kills. Send one eval per graph step. PTC bypasses
+parent per-tool approval, and graph replay does not roll back external effects.
+See the [compatibility guide](docs/deepagents-compatibility.md) for settings,
+working examples, backend setup, subagent events, and all remaining differences.
+
+The existing interface remains available without changes:
 
 The `deepagents` extra provides an async middleware with live tool declarations,
 programmatic tool composition, three state lifetimes, optional checkpoint-backed
@@ -1391,10 +1446,12 @@ secret.
 
 Use
 `KernelConfig.allowed_shell_commands` to enable only selected virtual commands.
-Per-call timeout overrides are not available; configure time and request limits
-on `KernelConfig`. The supported `curl --max-time` option can only lower the
-network timeout in `NetworkConfig`. It does not have every timing guarantee of
-system curl.
+`AreneroSandbox.execute(timeout=...)` also accepts a cooperative wall deadline.
+Expiry returns exit `124` and stops later commands, but cannot preempt active
+host or worker work. Keep time and request limits on `KernelConfig`. The
+supported `curl --max-time` option lowers the network timeout; it does not have
+every timing guarantee of system curl. See the
+[deadline rules](docs/virtual-shell.md#per-call-deadlines).
 
 Shell `grep` uses literal text by default and Python regular-expression syntax
 with `-E`. `glob`, `find`, and automatic argument expansion support only `*`, `?`,

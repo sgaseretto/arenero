@@ -2,9 +2,11 @@
 
 This report compares Arenero with the utilities described in the LangChain
 [Deep Agents sandbox documentation](https://docs.langchain.com/oss/python/deepagents/sandboxes).
-Arenero does not implement the Deep Agents `BaseSandbox` backend contract. It
-provides the independent sandbox utilities and an optional async interpreter
-middleware for Deep Agents.
+Arenero provides independent sandbox utilities and two optional interpreter
+interfaces. `AreneroBackend` implements Deep Agents `SandboxBackendProtocol`
+with native file records and limited execute. It does not inherit `BaseSandbox`
+or claim to run its OS-dependent shell wrappers. See the
+[Python compatibility guide](deepagents-compatibility.md).
 
 ```mermaid
 flowchart TD
@@ -49,6 +51,9 @@ executables.
 | Async facade | `AsyncAreneroSandbox` runs the synchronous facade through worker threads while keeping the same locks and state. |
 | Native async Python | `AsyncPersistentMontyKernel` runs independent session IDs on a shared `AsyncMonty` pool. Its small agent adapter does not include the virtual shell. |
 | Deep Agents interpreter | `AreneroInterpreterMiddleware` adds async code and static-module tools, live capability instructions, PTC, subagent dispatch, state modes, and optional private checkpoint snapshots. It is middleware, not a `BaseSandbox`. |
+| Python compatibility profile | `CodeInterpreterMiddleware` adds one eval tool, sync/async graph calls, graph-owned snapshots, graph control signals, tool namespaces, and bounded subagent schemas/events. |
+| Deep Agents backend | `AreneroBackend` supplies native result records, a* methods, paging, upstream glob rules, literal grep, ordered binary transfers, and shared-backend interpreter file calls. |
+| Per-call shell deadline | A positive execute timeout stops at cooperative checks with exit 124. Zero or None uses configured limits. Active host/worker work is not forcibly stopped. |
 | Static virtual modules | `execute_module` resolves a bounded graph of top-level virtual imports. It is not CPython importlib and generated feeds skip type checking. |
 | Session administration | Stores and kernels list safe session metadata and delete expired sessions without exposing snapshot bytes. |
 | Stable sandbox identifier | `AreneroSandbox.id` is available. |
@@ -93,21 +98,21 @@ package workflow can create only a dependency-free Monty source ZIP. See
 See [the virtual shell reference](virtual-shell.md) for its exact grammar, command
 flags, limits, exit codes, and unsupported features.
 
-## Feasible next adapters
+## Remaining optional adapters
 
-These additions are practical if direct Deep Agents compatibility becomes useful:
+The [2026-10-18 review](deepagents.md#compatibility-review-2026-10-18) records the
+pinned upstream sources. Its ten recommended additions are implemented in the
+[optional adapters](deepagents-compatibility.md). Remaining work is optional:
 
 | Addition | Difficulty | Notes |
 | --- | --- | --- |
-| Deep Agents `BaseSandbox` facade | Low to medium | Wrap existing file and limited-execute methods while stating that execute is not an arbitrary shell. |
 | File metadata | Low to medium | Add byte size and timestamps where the selected filesystem backend can supply them. |
-| Per-call lower timeout | Medium | Requires a new disposable checkout policy or a worker request deadline per call. It must not restore unsafe state. |
-| More complete glob rules | Medium | Add brace expansion and the exact hidden-file rules used by Deep Agents. |
+| Strict full-command wall timeout | High | Needs a disposable process boundary that can stop active work, not an abandoned worker thread. Cooperative deadlines already work. |
 | Permission or approval hooks | Medium | Add callbacks before mutation or execution, or use agent middleware. |
 
 Do not let a shell-based `BaseSandbox` send commands outside Arenero's documented
-allowlist. A future adapter must implement filesystem methods directly and must
-not claim that Arenero can run arbitrary shell commands.
+allowlist. The adapter implements file methods directly and keeps the shell's
+existing limits. Its glob matcher does not widen the core shell grammar.
 
 ## Not feasible without changing the product
 
