@@ -7,6 +7,28 @@ from threading import Thread, current_thread
 from typing import Any
 
 
+async def on_loop(
+    coroutine: Coroutine[Any, Any, Any], loop: asyncio.AbstractEventLoop | None
+) -> Any:
+    """Await host work on its caller loop and forward cancellation.
+
+    Args:
+        coroutine: Host operation to run.
+        loop: Application loop, or None to use the current loop.
+
+    Returns:
+        Host operation result.
+    """
+    if loop is None or loop is asyncio.get_running_loop():
+        return await coroutine
+    future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+    try:
+        return await asyncio.wrap_future(future)
+    except asyncio.CancelledError:
+        future.cancel()
+        raise
+
+
 class LoopThread:
     """Own a loop so an adapter can serve both graph invocation styles."""
 

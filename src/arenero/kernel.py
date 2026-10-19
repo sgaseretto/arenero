@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict, get_args
+from weakref import WeakValueDictionary
 
 from pydantic_monty import (
     CollectStreams,
@@ -27,6 +28,7 @@ from pydantic_monty import (
     TypeCheckFormat,
 )
 
+from ._streams import BoundedStreams
 from .events import EventSink, emit_event
 from .filesystem import (
     FILESYSTEM_TYPE_CHECK_STUBS,
@@ -392,7 +394,7 @@ class PersistentMontyKernel:
             if self._owned_mount is not None:
                 self._owned_mount.__exit__(None, None, None)
             raise
-        self._locks: dict[str, threading.Lock] = {}
+        self._locks: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
         self._locks_guard = threading.Lock()
         self._filesystem_lock = threading.RLock()
         self._filesystem_enabled = self.os_handler is not None or bool(self.mounts)
@@ -1729,7 +1731,7 @@ class PersistentMontyKernel:
 def _prepare_execution_result(
     *,
     result: Any,
-    streams: CollectStreams,
+    streams: CollectStreams | BoundedStreams,
     error_type: str | None,
     error_message: str | None,
     retryable: bool,
@@ -1764,6 +1766,13 @@ def _prepare_execution_result(
     full_stderr = "".join(text for stream, text in streams.output if stream == "stderr")
     stdout, stdout_trimmed = _trim(full_stdout, limit)
     stderr, stderr_trimmed = _trim(full_stderr, limit)
+    original_chars = (
+        streams.original_chars
+        if isinstance(streams, BoundedStreams)
+        else {"stdout": len(full_stdout), "stderr": len(full_stderr)}
+    )
+    stdout_trimmed |= original_chars["stdout"] > len(full_stdout)
+    stderr_trimmed |= original_chars["stderr"] > len(full_stderr)
     safe_result, result_trimmed = _safe_result(result, limit)
 
     error: ExecutionError | None = None
@@ -1836,8 +1845,8 @@ def _prepare_execution_result(
                 "state_after_bytes": 0,
                 "original_output_chars": {
                     "result": _result_length(result),
-                    "stdout": len(full_stdout),
-                    "stderr": len(full_stderr),
+                    "stdout": original_chars["stdout"],
+                    "stderr": original_chars["stderr"],
                     "error": len(error_message or ""),
                 },
             },
@@ -2175,6 +2184,10 @@ def _error_code(error_type: str, message: str) -> str:
     if error_type == "VirtualModuleError":
         return "virtual_module_error"
     lowered = message.lower()
+    if "regular ptc call limit" in lowered:
+        return "ptc_call_limit"
+    if "subagent call limit" in lowered:
+        return "subagent_call_limit"
     if "suspension limit" in lowered:
         return "suspension_limit"
     if "sleep limit" in lowered:
@@ -2183,6 +2196,10 @@ def _error_code(error_type: str, message: str) -> str:
         return "hosted_tool_call_limit"
     if "hosted tool" in lowered and "time limit" in lowered:
         return "hosted_tool_time_limit"
+    if "feed time limit" in lowered:
+        return "feed_time_limit"
+    if "turn time limit" in lowered:
+        return "turn_time_limit"
     if "unresolved-reference" in lowered:
         return "unresolved_reference"
     if "import" in lowered or "no module" in lowered:
@@ -2223,6 +2240,8 @@ def _error_hint(error_type: str, message: str, retryable: bool) -> str:
     if error_type in hints:
         return hints[error_type]
     lowered = message.lower()
+    if "regular ptc call limit" in lowered or "subagent call limit" in lowered:
+        return "Use fewer calls in this eval or split the work across evals."
     if "suspension limit" in lowered:
         return "Use fewer host or OS calls, or split the work across executions."
     if "sleep limit" in lowered:
@@ -2231,6 +2250,8 @@ def _error_hint(error_type: str, message: str, retryable: bool) -> str:
         return "Use fewer hosted calls or split the work across executions."
     if "hosted tool" in lowered and "time limit" in lowered:
         return "Use less hosted work or split the work across executions."
+    if "feed time limit" in lowered or "turn time limit" in lowered:
+        return "Shorten the Python work or raise the interpreter time limit; host wait budgets are separate."
     if "unresolved-reference" in lowered:
         return (
             "Define the name. If it is a newly added hosted tool, use restart=True "

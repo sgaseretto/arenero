@@ -13,6 +13,7 @@ from langchain.tools import BaseTool, ToolRuntime
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphBubbleUp
 
+from ._loop_thread import on_loop
 from .hosted_tools import HostedTool
 from .langchain_hosted_tools import _inject_runtime, _programmatic_result
 
@@ -30,6 +31,7 @@ def task_bridge(
     *,
     concurrency: int,
     max_calls: int,
+    outer_loop: asyncio.AbstractEventLoop | None = None,
 ) -> HostedTool:
     """Make one task function with its own concurrency and dispatch budget.
 
@@ -38,6 +40,7 @@ def task_bridge(
         runtime: Parent eval runtime, including its replay-stable call ID.
         concurrency: Maximum active subagents in this eval.
         max_calls: Maximum task dispatches in this eval.
+        outer_loop: Application loop for async graph and provider calls.
 
     Returns:
         Hosted task with optional response schema and stream labels.
@@ -98,9 +101,12 @@ def task_bridge(
                     "description": arguments["description"][:200],
                     "label": (arguments.get("label") or arguments["description"])[:120],
                 },
+                outer_loop,
             )
             try:
-                result = await tool.arun(args, config=config, tool_call_id=dispatch_id)
+                result = await on_loop(
+                    tool.arun(args, config=config, tool_call_id=dispatch_id), outer_loop
+                )
                 result = _programmatic_result(tool, result)
                 if schema is not None and isinstance(result, str):
                     result = json.loads(result)
@@ -115,6 +121,7 @@ def task_bridge(
                         "error": str(exc)[:200],
                         "duration_ms": int((time.monotonic() - started) * 1000),
                     },
+                    outer_loop,
                 )
                 raise
             _emit(
@@ -124,6 +131,7 @@ def task_bridge(
                     "phase": "complete",
                     "duration_ms": int((time.monotonic() - started) * 1000),
                 },
+                outer_loop,
             )
         return result
 
@@ -172,14 +180,22 @@ def _validate_schema(schema: dict[str, Any]) -> None:
             raise ValueError("response_schema exceeds 32 properties")
 
 
-def _emit(runtime: ToolRuntime, event: dict[str, Any]) -> None:
+def _emit(
+    runtime: ToolRuntime,
+    event: dict[str, Any],
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> None:
     """Send an optional custom event without changing dispatch behavior.
 
     Args:
         runtime: Parent runtime with its stream writer.
         event: Bounded subagent event record.
+        loop: Optional application loop for a loop-bound stream writer.
     """
     try:
+        if loop is not None and loop is not asyncio.get_running_loop():
+            loop.call_soon_threadsafe(_emit, runtime, event)
+            return
         runtime.stream_writer(event)
     except Exception:
         logging.getLogger(__name__).debug("Subagent event sink failed", exc_info=True)

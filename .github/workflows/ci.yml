@@ -7,14 +7,26 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dependencies: [locked, newer]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - run: uv sync --all-extras
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
-      - run: uv run ty check src/arenero
-      - run: uv run python -m unittest discover -s tests -v
+      - if: matrix.dependencies == 'locked'
+        run: uv sync --all-extras --frozen
+      - if: matrix.dependencies == 'newer'
+        run: uv sync --all-extras --upgrade
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ty check src scripts
+      - run: uv run --frozen python -m unittest discover -s tests -v
       - run: uv build
+      - name: Check the wheel without optional agent packages
+        run: |
+          uv venv /tmp/arenero-core-check
+          uv pip install --python /tmp/arenero-core-check/bin/python dist/*.whl
+          /tmp/arenero-core-check/bin/python -c 'from arenero import PersistentMontyKernel; from importlib.util import find_spec; assert find_spec("deepagents") is None; kernel = PersistentMontyKernel(); assert kernel.execute("smoke", "20+22")["result"] == 42; kernel.close()'

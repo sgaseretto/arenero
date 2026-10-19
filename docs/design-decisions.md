@@ -105,6 +105,49 @@ and previous error fields stay unchanged. Missing thread IDs do not run work.
 The native async no-file execution and reset paths use standard
 `contextlib.nullcontext()` instead of a custom no-op context manager.
 
+## The Python compatibility profile reuses native components
+
+The compatibility middleware still owns one native async Monty kernel and one
+loop thread. Async graph tools and task subgraphs return to the application
+loop; synchronous graph calls use the owned loop. One small loop helper forwards
+results, errors, and cancellation. Feed cleanup drains unfinished host callbacks.
+It does not stop a sync function already running in a thread or undo effects.
+
+Advanced options use existing `KernelConfig`, `HostedToolConfig`, `HostedToolSet`,
+`McpHub`, `RLM`, bootstrap, OS handler, and event callback types. The middleware
+does not create a second config model, file store, module loader, or MCP registry.
+Configured hosted tools join the operation scope so they use the current caller
+loop and budgets. Native kernel defaults and the original middleware APIs remain.
+
+Private kernel hooks let the compatibility profile keep a bounded console
+prefix, read module/startup bytes and write output through a shared backend, and
+refresh guest wrappers before startup and user code. Direct guest file access
+stays disabled with a shared backend. This avoids holding the interpreter's file
+lock while a nested file operation needs it. All transfers retain existing byte
+and root checks. Discarded console text cannot be restored by output offloading.
+
+```mermaid
+flowchart LR
+    Graph["Async agent graph on application loop"] --> Bridge["One owned Monty loop"]
+    Bridge --> VM["Native AsyncMonty worker"]
+    VM --> Host["Bounded host function scope"]
+    Host --> Graph
+    Bridge --> File["Existing shared backend: modules, startup, output"]
+    VM --> Snapshot["Full snapshot + package version + optional HMAC"]
+    Snapshot --> Graph
+```
+
+New graph snapshot signatures bind package version, slot, and bytes. A known
+version mismatch is rejected before native load. Legacy version-less dumps keep
+their existing native format/policy checks and old tag format; their original
+package provenance is unknown. New dumps gain version metadata after execution.
+This adds a guard, not a new snapshot format or a store migration.
+
+Session lock maps in both kernels use weak values. An owner or waiter keeps a
+strong lock reference. When no operation refers to a lock, its map entry can
+disappear. This removes idle bookkeeping without manual deletion races or a
+background cleanup task. Store lifetime and worker-pool lifetime do not change.
+
 ## MCP clients are optional and stay on the host
 
 The core package does not import the MCP SDK. Applications import

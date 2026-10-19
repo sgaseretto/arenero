@@ -15,6 +15,7 @@ class GraphCalls:
         """Record the task that owns the current interpreter operation."""
         self.owner = asyncio.current_task()
         self.signal: GraphBubbleUp | None = None
+        self.tasks: set[asyncio.Task] = set()
 
     def wrap(self, tools: HostedToolSet) -> HostedToolSet:
         """Wrap async host calls without changing their schemas or budgets.
@@ -38,6 +39,9 @@ class GraphCalls:
                 Returns:
                     The tool result on normal completion.
                 """
+                task = asyncio.current_task()
+                assert task is not None
+                self.tasks.add(task)
                 try:
                     return await _invoke_tool(active, arguments)
                 except GraphBubbleUp as exc:
@@ -46,9 +50,19 @@ class GraphCalls:
                     self.owner.cancel()
                     # Do not return a catchable guest exception or permit more work.
                     await asyncio.Future()
+                finally:
+                    self.tasks.discard(task)
 
             wrapped.append(replace(tool, ainvoke=invoke))
         return HostedToolSet(tuple(wrapped), tools.config)
+
+    async def close(self) -> None:
+        """Cancel and drain host callbacks left behind by a cancelled feed."""
+        tasks = tuple(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def reraise(self) -> None:
         """Raise the saved signal after the cancelled checkout has ended."""

@@ -630,9 +630,16 @@ class HostedToolScope:
                     remaining = self._deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("hosted tool operation time limit exceeded")
-                    result = await asyncio.wait_for(
-                        _invoke_tool(tool, kwargs), timeout=remaining
-                    )
+                    timer = asyncio.timeout(remaining)
+                    try:
+                        async with timer:
+                            result = await _invoke_tool(tool, kwargs)
+                    except TimeoutError as exc:
+                        if not timer.expired():
+                            raise
+                        raise TimeoutError(
+                            "hosted tool operation time limit exceeded"
+                        ) from exc
             except BaseException as exc:
                 self._finish(record, started_at, error=exc)
                 raise

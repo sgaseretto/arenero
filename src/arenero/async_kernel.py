@@ -8,9 +8,10 @@ import importlib.metadata
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Self
+from weakref import WeakValueDictionary
 
 from pydantic_monty import (
     AsyncMonty,
@@ -22,6 +23,7 @@ from pydantic_monty import (
     OsHandler,
 )
 
+from ._streams import BoundedStreams
 from .events import EventSink, emit_event
 from .filesystem import (
     FilesystemConfig,
@@ -178,7 +180,14 @@ class AsyncPersistentMontyKernel:
         )
         self._pool: AsyncMonty | None = None
         self._open_lock = asyncio.Lock()
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._bounded_streams = False
+        self._source_reader: Callable[[str], Coroutine[Any, Any, bytes]] | None = None
+        self._output_writer: (
+            Callable[[str, bytes], Coroutine[Any, Any, None]] | None
+        ) = None
+        self._module_filesystem = True
+        self._guest_prelude: Callable[[Mapping[str, Any]], str] | None = None
         self._filesystem_lock = asyncio.Lock()
         self._filesystem_enabled = self.os_handler is not None or bool(self.mounts)
         self._closed = False
@@ -811,10 +820,11 @@ class AsyncPersistentMontyKernel:
                 Source text, or ``None`` when the file is not readable.
             """
 
-            future = asyncio.run_coroutine_threadsafe(self.download_file(path), loop)
+            reader = self._source_reader or self.download_file
+            future = asyncio.run_coroutine_threadsafe(reader(path), loop)
             try:
                 return future.result().decode()
-            except MontyError:
+            except (MontyError, FileNotFoundError):
                 return None
 
         def build() -> str:
@@ -847,6 +857,7 @@ class AsyncPersistentMontyKernel:
             hosted_tools=hosted_tools,
             inputs=inputs,
             skip_type_check=True,
+            filesystem=self._module_filesystem,
         )
 
     async def _execute(
@@ -941,11 +952,14 @@ class AsyncPersistentMontyKernel:
             result["mcp_artifacts"] = artifacts
             if payload is not None and output_file is not None:
                 try:
-                    if not filesystem:
+                    if self._output_writer is not None:
+                        await self._output_writer(output_file, payload)
+                    elif not filesystem:
                         raise ValueError(
                             "filesystem access is disabled for this operation"
                         )
-                    await self.upload_file(output_file, payload)
+                    else:
+                        await self.upload_file(output_file, payload)
                 except (MontyError, ValueError, TypeError, RuntimeError) as exc:
                     result["output_file_error"] = str(exc)
                 else:
@@ -1027,7 +1041,11 @@ class AsyncPersistentMontyKernel:
                 output_file=output_file,
             )
 
-        streams = CollectStreams(max_bytes=self.config.max_stream_bytes)
+        streams = (
+            BoundedStreams(self.config.max_stream_bytes)
+            if self._bounded_streams
+            else CollectStreams(max_bytes=self.config.max_stream_bytes)
+        )
         result: Any = None
         execution_error: MontyError | None = None
         error_type_override: str | None = None
@@ -1239,7 +1257,7 @@ class AsyncPersistentMontyKernel:
     async def _prepare_session(
         self,
         session: AsyncMontySession,
-        streams: CollectStreams,
+        streams: CollectStreams | BoundedStreams,
         external_lookup: dict[str, Any] | None,
         *,
         filesystem: bool,
@@ -1273,6 +1291,15 @@ class AsyncPersistentMontyKernel:
                 filesystem=filesystem,
                 skip_type_check=True,
             )
+        if self._guest_prelude is not None:
+            await self._feed(
+                session,
+                streams,
+                self._guest_prelude(external_lookup or {}),
+                external_lookup,
+                filesystem=filesystem,
+                skip_type_check=True,
+            )
         if not new_session:
             return
         await self._feed(
@@ -1291,7 +1318,7 @@ class AsyncPersistentMontyKernel:
                 external_lookup,
                 skip_type_check=True,
             )
-        for path in self.bootstrap_files if filesystem else ():
+        for path in self.bootstrap_files if filesystem or self._source_reader else ():
             await self._run(
                 session, streams, None, path, external_lookup, None, filesystem
             )
@@ -1307,7 +1334,7 @@ class AsyncPersistentMontyKernel:
     async def _run(
         self,
         session: AsyncMontySession,
-        streams: CollectStreams,
+        streams: CollectStreams | BoundedStreams,
         code: str | None,
         file_path: str | None,
         external_lookup: dict[str, Any] | None,
@@ -1337,14 +1364,17 @@ class AsyncPersistentMontyKernel:
                 inputs=inputs,
                 filesystem=filesystem,
             )
-        path, source = await self._feed(
-            session,
-            streams,
-            _file_read_source(file_path),
-            external_lookup,
-            filesystem=filesystem,
-            skip_type_check=True,
-        )
+        if self._source_reader is not None:
+            path, source = file_path, (await self._source_reader(file_path)).decode()
+        else:
+            path, source = await self._feed(
+                session,
+                streams,
+                _file_read_source(file_path),
+                external_lookup,
+                filesystem=filesystem,
+                skip_type_check=True,
+            )
         result = await self._feed(
             session,
             streams,
@@ -1366,7 +1396,7 @@ class AsyncPersistentMontyKernel:
     async def _feed(
         self,
         session: AsyncMontySession,
-        streams: CollectStreams,
+        streams: CollectStreams | BoundedStreams,
         code: str,
         external_lookup: dict[str, Any] | None,
         *,
@@ -1456,7 +1486,7 @@ class AsyncPersistentMontyKernel:
         self,
         *,
         result: Any = None,
-        streams: CollectStreams | None = None,
+        streams: CollectStreams | BoundedStreams | None = None,
         error_type: str | None = None,
         error_message: str | None = None,
         retryable: bool = False,

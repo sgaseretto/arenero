@@ -572,12 +572,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 with CodeInterpreterMiddleware(ptc=("search_web",)) as interpreter:
     agent = create_deep_agent(
-        model=model, tools=[search_web], middleware=[interpreter],
+        model=model,
+        tools=[search_web],
+        middleware=[interpreter],
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "conversation-42"}}
     result = agent.invoke(
-        {"messages": [{"role": "user", "content": "Calculate and remember the result."}]},
+        {
+            "messages": [
+                {"role": "user", "content": "Calculate and remember the result."}
+            ]
+        },
         config,
     )
 ```
@@ -591,9 +597,11 @@ with fresh input state, invocations get separate private sessions.
 ```mermaid
 flowchart LR
     Graph["Deep Agents or LangChain graph"] --> Eval["eval: Monty Python"]
-    Eval --> State["Private graph snapshots"]
-    Eval --> Tools["Selected tools and subagents"]
+    Eval --> State["Private snapshots with Monty version and optional HMAC"]
+    Eval --> Monty["Owned native async Monty loop"]
+    Monty --> Tools["Selected tools and subagents on caller loop for async graphs"]
     Eval -. "optional fs_* bridge" .-> Backend["AreneroBackend"]
+    Monty -. "module/startup reads and bounded output writes" .-> Backend
     Graph -. "outer file and execute tools" .-> Backend
     Backend --> Files["One virtual file store and limited shell"]
 ```
@@ -605,13 +613,35 @@ calls such as `await fs_read(file_path="/report.txt")` without re-entering the
 active Python session. Files are separate from Python checkpoints.
 
 This is Python interface compatibility, not JavaScript, full CPython, or Bash.
-Normal third-party imports do not work. An optional `module_tool=True` with a
-direct `workspace` provides the existing bounded static-module workaround; it
-cannot be combined with shared-backend mode. Shell timeouts are cooperative,
+Normal third-party imports do not work. Optional `module_tool=True` works with a
+direct `workspace` or a shared backend through the same bounded static loader.
+Shell timeouts are cooperative,
 not exact wall-time process kills. Send one eval per graph step. PTC bypasses
 parent per-tool approval, and graph replay does not roll back external effects.
 See the [compatibility guide](docs/deepagents-compatibility.md) for settings,
 working examples, backend setup, subagent events, and all remaining differences.
+
+Reuse existing limits and host integrations instead of adding another runtime:
+
+```python
+from arenero import HostedToolConfig, KernelConfig
+
+with CodeInterpreterMiddleware(
+    kernel_config=KernelConfig(max_worker_processes=4, max_stream_bytes=64_000),
+    hosted_tool_config=HostedToolConfig(max_total_call_seconds=20),
+    bootstrap_code="def twice(value):\n    return value * 2",
+    # Optional: backend=backend, module_tool=True, mcp_hub=hub, rlm=runner,
+) as interpreter:
+    agent = create_deep_agent(model=model, middleware=[interpreter])
+```
+
+The compatibility profile discards excess console text without discarding Python
+state. Its rich artifact reports original character counts and truncation. Error
+blocks include a stable code and recovery hint. `output_file` can save retained
+bounded output through the shared backend. Discarded console text cannot be
+recovered. New graph snapshots check the exact Monty version before loading.
+Configured hubs and backends remain caller-owned. See the guide for limit
+precedence, callback loops, and legacy snapshot rules.
 
 The existing interface remains available without changes:
 

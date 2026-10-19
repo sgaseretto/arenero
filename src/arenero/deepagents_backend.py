@@ -386,6 +386,26 @@ class AreneroBackend(SandboxBackendProtocol):
             config or HostedToolConfig(),
         )
 
+    def _read_source(self, path: str) -> bytes:
+        """Read bounded source bytes through the existing backend root.
+
+        Args:
+            path: Absolute virtual source path.
+
+        Returns:
+            Unpaged bytes, without changing persistent Python state.
+        """
+        return self.sandbox.kernel.download_file(self._path(path))
+
+    def _write_output(self, path: str, content: bytes) -> None:
+        """Write bounded output through the same backend authority.
+
+        Args:
+            path: Absolute virtual destination path.
+            content: Output JSON bytes, subject to the normal transfer cap.
+        """
+        self.sandbox.kernel.upload_file(self._path(path), content)
+
 
 def _transfer_error(exc: BaseException) -> str:
     """Map common file failures to the backend transfer vocabulary.

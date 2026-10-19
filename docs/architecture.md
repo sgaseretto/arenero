@@ -255,7 +255,7 @@ Python state and file state are intentionally separate:
 | Caller-supplied mounts | Caller-owned `MountDir` objects | Follows the selected mount mode and host directory. |
 | Host functions | `external_lookup` on each kernel checkout | Never stored in a snapshot. The application supplies them again. |
 | Hosted tool catalog, callbacks, and call budgets | Host process and one execution scope | Catalog configuration is process memory. Call budgets and records reset for each operation. |
-| Deep Agents graph snapshot | Private LangGraph state when enabled | Contains full Monty bytes and optional HMAC. It does not contain files or host resources. |
+| Deep Agents graph snapshot | Private LangGraph state when enabled | Full Monty bytes and optional HMAC; the compatibility profile also records and signs the package version. No files or host resources. |
 | Network policy | `NetworkConfig` in the host process | Never enters Monty state. |
 | MCP clients, credentials, dynamic server config, and catalog | Shared `McpHub` in the host process | Live while the hub is active. Recreate after restart. Never enters a snapshot or SQLite. |
 
@@ -301,18 +301,25 @@ sequenceDiagram
     end
     G->>A: awrap_model_call(live tools)
     A-->>G: Dynamic limits and async function catalog
-    G->>A: python_interpreter(code)
+    G->>A: python_interpreter(code) or compatibility eval(code)
+    opt Compatibility profile
+        A->>A: Check version and HMAC, then restore per-eval graph state
+    end
     A->>K: execute(session_id, operation tools)
     K->>M: Run Monty feed
     opt Programmatic tool call
         M->>A: await selected_tool(...)
         A->>T: Inject derived ToolRuntime and call ainvoke
+        Note over A,T: Compatibility async tools use the caller application loop
         T-->>A: Plain value or task response text
         A-->>M: Boundary-safe value
     end
     M-->>K: Result and snapshot
     K-->>A: Structured result and host_calls
     A-->>G: ToolMessage
+    opt Compatibility thread mode
+        A-->>G: Snapshot plus version and optional HMAC at each completed eval
+    end
     G->>A: aafter_agent
     opt checkpoint_state
         A-->>G: Private full snapshot and HMAC
@@ -322,6 +329,13 @@ sequenceDiagram
 Nested PTC calls bypass the parent ToolNode. Parent per-tool approval middleware
 does not run for them. The outer interpreter call, the called tool, or the
 subagent must enforce the required approval policy.
+
+`CodeInterpreterMiddleware` adds an owned loop bridge for sync graph calls.
+Async tools and real task subgraphs return to the graph's caller loop. Shared
+backend modules, startup files, and output files use the existing backend's raw
+bounded transfers, with direct guest files disabled. Guest wrappers are refreshed
+before startup and user code. The original middleware still accepts a
+caller-owned kernel. See the [profile guide](deepagents-compatibility.md).
 
 ## Recursive model execution path
 
@@ -402,6 +416,8 @@ flowchart LR
 `worker_checkout_timeout_seconds`, and `max_checkouts_per_worker` configure both
 kernel types. The native async kernel must stay on one application event loop.
 Its async host functions do not block that loop while they wait.
+Both kernel lock maps use weak values: active owners and waiters keep their
+session lock, while idle entries disappear without a cleanup task.
 
 The shared filesystem lock is still a batch bottleneck by design. A kernel with
 `OSAccess`, mounts, or `WorkspaceConfig` serializes complete filesystem-capable

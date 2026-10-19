@@ -77,6 +77,24 @@ Deep Agents 0.7.28 / LangChain 1.4.6 / LangGraph 1.2.16 environment. It uses no
 provider credentials or real LLM calls. See the
 [compatibility guide](deepagents-compatibility.md).
 
+`tests/test_deepagents_hardening.py` adds regression checks for all ten adapter
+follow-ups. A fake-model graph calls a loop-bound async tool across two human
+turns. Real Deep Agents child graphs use fake models for a structured response,
+a loop-bound child tool, and interrupt/resume. Other tests cover cancellation
+of pending callbacks, message/command result values, discarded large console
+output with saved state, snapshot version rejection before load, old HMAC tags,
+metadata tampering, config precedence, startup code and files, configured hosted
+tools, an in-process MCP server, fake RLM responses, shared module/output files,
+namespace setup before module code, error codes, host deadlines, and idle locks
+with active waiters. No test calls a real model or remote server.
+
+CI runs the full suite in two dependency lanes: the checked-in `uv.lock` with
+`--frozen`, and a fresh resolution of newer allowed releases with `--upgrade`.
+The latter does not commit its generated lock file. Monty remains pinned to
+1.1.0 in both lanes. Each lane builds the wheel, installs it in a clean core-only
+environment, checks that Deep Agents is absent, and executes `20 + 22` in Monty.
+The matrix tests compatibility, not every possible dependency combination.
+
 | Layer | Purpose | Main examples |
 | --- | --- | --- |
 | Unit | Check one small component with no network. | Static planning, canonical call identity, limits, redaction, and error codes. |
@@ -146,6 +164,14 @@ Run the internal cleanup checks only:
 
 ```console
 uv run --frozen python -m unittest tests.test_cleanup -v
+```
+
+Run the Python interpreter adapter checks only:
+
+```console
+uv run --frozen python -m unittest \
+  tests.test_deepagents tests.test_deepagents_compat \
+  tests.test_deepagents_hardening -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

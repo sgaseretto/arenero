@@ -9,7 +9,8 @@ import html
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Annotated, Any, Literal, NotRequired, Self, cast
+from dataclasses import replace
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, Self, cast
 from uuid import uuid4
 
 from deepagents.middleware._utils import append_to_system_message
@@ -31,14 +32,20 @@ from langgraph.config import get_config
 from pydantic import BaseModel, Field
 
 from ._graph_calls import GraphCalls
-from ._loop_thread import LoopThread
+from ._loop_thread import LoopThread, on_loop
 from ._subagents import task_bridge
 from .async_kernel import AsyncPersistentMontyKernel
-from .hosted_tools import HostedToolConfig, HostedToolSet
+from .events import EventSink
+from .hosted_tools import HostedToolConfig, HostedToolSet, python_identifier
 from .kernel import KernelConfig
 from .langchain_hosted_tools import hosted_tools_from_langchain
 from .rlm import RLM
 from .workspace import WorkspaceConfig
+
+if TYPE_CHECKING:
+    from pydantic_monty import OsHandler
+
+    from .mcp import McpHub
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,7 @@ class AreneroAgentState(AgentState):
     _arenero_snapshot: NotRequired[Annotated[bytes, PrivateStateAttr]]
     _arenero_snapshot_hmac: NotRequired[Annotated[bytes, PrivateStateAttr]]
     _arenero_slot_id: NotRequired[Annotated[str, PrivateStateAttr]]
+    _arenero_monty_version: NotRequired[Annotated[str, PrivateStateAttr]]
 
 
 class AreneroEvalInput(BaseModel):
@@ -147,6 +155,8 @@ class AreneroInterpreterMiddleware(
             raise ValueError("max_snapshot_bytes must be greater than 0")
         if not tool_name or not session_prefix:
             raise ValueError("tool_name and session_prefix must not be empty")
+        if snapshot_signing_key is not None and not snapshot_signing_key:
+            raise ValueError("snapshot_signing_key must not be empty")
         self.kernel = kernel or AsyncPersistentMontyKernel()
         self._owns_kernel = kernel is None
         self._tool_name = tool_name
@@ -791,6 +801,16 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         backend: Optional shared AreneroBackend. Guest files then use its hosted
             fs_* functions, not direct mounts. The caller owns the backend.
         workspace: Optional direct mounted workspace, instead of a shared backend.
+        kernel_config: Existing kernel limits and OS policy. When supplied, these
+            replace memory_limit and timeout. Adapter display limits still apply.
+        hosted_tool_config: Existing aggregate host budgets, including task waits.
+        mcp_hub: Optional caller-owned MCP hub, with its normal lifecycle.
+        hosted_tools: Optional configured framework-neutral hosted functions.
+        rlm: Optional existing recursive model runner.
+        bootstrap_code: Trusted startup Python for each new session.
+        bootstrap_files: Trusted virtual startup files for each new session.
+        os_handler: Optional direct virtual filesystem and clock handler.
+        event_sink: Optional existing kernel event callback.
     """
 
     trace_policy = TracePolicy(
@@ -817,6 +837,15 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         tools_namespace: bool = True,
         backend: Any = None,
         workspace: WorkspaceConfig | None = None,
+        kernel_config: KernelConfig | None = None,
+        hosted_tool_config: HostedToolConfig | None = None,
+        mcp_hub: McpHub | None = None,
+        hosted_tools: HostedToolSet | None = None,
+        rlm: RLM | None = None,
+        bootstrap_code: str | None = None,
+        bootstrap_files: tuple[str, ...] = (),
+        os_handler: OsHandler | None = None,
+        event_sink: EventSink | None = None,
     ) -> None:
         """Create an optional adapter without changing the original middleware."""
         if max_ptc_calls is not None and max_ptc_calls < 1:
@@ -827,17 +856,29 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             raise ValueError("max_result_chars must not be negative")
         if mode not in (None, "thread", "turn", "call") or not tool_name:
             raise ValueError("use a nonempty tool_name and thread, turn, or call mode")
+        if snapshot_signing_key is not None and not snapshot_signing_key:
+            raise ValueError("snapshot_signing_key must not be empty")
+        for entry in ptc or ():
+            name = entry if isinstance(entry, str) else entry.name
+            if name == "task":
+                raise ValueError("task is selected by subagents, not ptc")
+            _check_alias(python_identifier(name))
+        for tool in hosted_tools.tools if hosted_tools else ():
+            _check_alias(tool.alias)
+            if tool.alias == "task":
+                raise ValueError("task is selected by subagents, not hosted_tools")
         self._capture_console = capture_console
         self._namespace = tools_namespace
         self._max_ptc_calls = max_ptc_calls
         self._subagent_concurrency = max_subagent_concurrency
         self._subagent_calls = max_subagent_calls
         self._backend = backend
-        if backend is not None and (module_tool or workspace is not None):
+        self._configured_tools = hosted_tools or HostedToolSet()
+        if backend is not None and (workspace is not None or os_handler is not None):
             raise ValueError(
-                "a shared backend cannot use module_tool or direct workspace"
+                "a shared backend cannot use a direct workspace or os_handler"
             )
-        config = KernelConfig(
+        config = kernel_config or KernelConfig(
             max_memory_bytes=memory_limit,
             max_feed_duration_seconds=timeout,
             default_output_limit_chars=max_result_chars,
@@ -846,28 +887,156 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             if max_snapshot_bytes is None
             else max_snapshot_bytes,
         )
+        snapshot_limit = (
+            config.max_state_bytes if max_snapshot_bytes is None else max_snapshot_bytes
+        )
+        config = replace(
+            config,
+            default_output_limit_chars=min(
+                max_result_chars, config.max_output_limit_chars
+            ),
+            max_output_limit_chars=min(
+                max(max_result_chars, 1), config.max_output_limit_chars
+            ),
+            max_state_bytes=min(snapshot_limit, config.max_state_bytes),
+        )
         super().__init__(
-            kernel=AsyncPersistentMontyKernel(config=config, workspace=workspace),
+            kernel=AsyncPersistentMontyKernel(
+                config=config,
+                workspace=workspace,
+                os_handler=os_handler,
+                mcp_hub=mcp_hub,
+                bootstrap_code=bootstrap_code,
+                bootstrap_files=bootstrap_files,
+                event_sink=event_sink,
+            ),
             tool_name=tool_name,
             ptc=ptc,
             subagents=subagents,
             mode=mode or "thread",
             checkpoint_state=(mode or "thread") == "thread",
-            max_snapshot_bytes=memory_limit
-            if max_snapshot_bytes is None
-            else max_snapshot_bytes,
+            max_snapshot_bytes=config.max_state_bytes,
             snapshot_signing_key=snapshot_signing_key,
-            hosted_tool_config=HostedToolConfig(
+            hosted_tool_config=hosted_tool_config
+            or HostedToolConfig(
                 max_calls_per_operation=2**31 - 1,
                 max_parallel_calls=10 + max_subagent_concurrency,
             ),
+            rlm=rlm,
         )
         self._bridge = LoopThread()
         self.kernel._collect_streams = capture_console
+        self.kernel._bounded_streams = True
+        self.kernel._guest_prelude = self._guest_prelude
+        if backend is not None:
+            self.kernel._source_reader = self._read_backend_source
+            self.kernel._output_writer = self._write_backend_output
+            self.kernel._module_filesystem = False
         self._owns_kernel = True
         self.tools = [self._compat_tool()]
         if module_tool:
             self.tools.append(self._compat_tool(module=True))
+
+    def _guest_prelude(self, lookup: Mapping[str, Any]) -> str:
+        """Refresh plain guest wrappers before bootstrap, module, or cell code.
+
+        Args:
+            lookup: Active host functions, including MCP and backend aliases.
+
+        Returns:
+            Trusted Python helper definitions, rebuilt after every restore.
+        """
+        aliases = [name for name, value in lookup.items() if callable(value)]
+        prefix = ""
+        for alias in aliases:
+            if alias.startswith("_arenero_backend_fs_"):
+                name = alias.removeprefix("_arenero_backend_")
+                prefix += (
+                    f"async def {name}(**kwargs):\n    return await {alias}(**kwargs)\n"
+                )
+            else:
+                _check_alias(alias)
+        if self._namespace and aliases:
+            methods = "\n".join(
+                f"    async def {alias.removeprefix('_arenero_backend_')}(self, **kwargs):\n        return await {alias}(**kwargs)"
+                for alias in aliases
+            )
+            prefix += f"class _AreneroTools:\n{methods}\ntools = _AreneroTools()\n"
+        return prefix
+
+    async def _read_backend_source(self, path: str) -> bytes:
+        """Read shared source without taking the interpreter's file lock.
+
+        Args:
+            path: Absolute virtual source file.
+
+        Returns:
+            Bounded bytes from the caller-owned backend.
+        """
+        return await asyncio.to_thread(self._backend._read_source, path)
+
+    async def _write_backend_output(self, path: str, content: bytes) -> None:
+        """Write output through the shared backend's existing transfer limits.
+
+        Args:
+            path: Absolute virtual output path.
+            content: Bounded JSON output bytes.
+        """
+        await asyncio.to_thread(self._backend._write_output, path, content)
+
+    def _select_tools(self, available: Sequence[BaseTool]) -> tuple[BaseTool, ...]:
+        """Select current tools and reject aliases that shadow adapter helpers.
+
+        Args:
+            available: Current graph tools.
+
+        Returns:
+            Selected tools with valid, non-reserved Python aliases.
+        """
+        selected = super()._select_tools(available)
+        for tool in selected:
+            _check_alias(python_identifier(tool.name))
+        return selected
+
+    def _checkpoint_tag(
+        self, payload: bytes, session_id: str, version: str | None
+    ) -> bytes:
+        """Bind new signatures to both version and slot; accept old tag format.
+
+        Args:
+            payload: Raw Monty dump.
+            session_id: Bound graph slot.
+            version: Package version, or None for a legacy checkpoint.
+
+        Returns:
+            HMAC over all restore metadata and snapshot bytes.
+        """
+        return self._sign(
+            (version.encode() + b"\0" if version else b"") + payload, session_id
+        )
+
+    def _snapshot_valid(
+        self, payload: bytes, state: AreneroAgentState, session_id: str
+    ) -> bool:
+        """Validate version-bound tags, including legacy unversioned tags.
+
+        Args:
+            payload: Saved dump bytes.
+            state: Private graph checkpoint fields.
+            session_id: Bound graph slot.
+
+        Returns:
+            True for unsigned mode or a matching HMAC.
+        """
+        if self._signing_key is None:
+            return True
+        tag = state.get("_arenero_snapshot_hmac")
+        return isinstance(tag, bytes) and hmac.compare_digest(
+            tag,
+            self._checkpoint_tag(
+                payload, session_id, state.get("_arenero_monty_version")
+            ),
+        )
 
     def __enter__(self) -> Self:
         """Open the interpreter for synchronous graph calls.
@@ -941,6 +1110,13 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         )
         if self._namespace:
             text += "\nBare functions and await tools.NAME(**kwargs) both work."
+        text += "\n" + self._configured_tools.catalog(async_mode=True)
+        text += (
+            "\nConsole collection keeps a bounded prefix and discards excess output; "
+            "check truncated and stats.original_output_chars in the artifact. "
+            "Async application tools and task subgraphs run on the calling graph loop. "
+            f"Aggregate hosted-call wall budget: {self._hosted_tool_config.max_total_call_seconds} seconds."
+        )
         if self._backend is not None:
             text += "\nDirect pathlib/open files are disabled. Use the shared hosted fs_* functions.\n"
             text += self._backend.instructions() + "\n"
@@ -1057,7 +1233,11 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
                 Message and private checkpoint update.
             """
             return await asyncio.wrap_future(
-                self._bridge.submit(self._compat_eval(runtime, kwargs, module))
+                self._bridge.submit(
+                    self._compat_eval(
+                        runtime, kwargs, module, asyncio.get_running_loop()
+                    )
+                )
             )
 
         return StructuredTool.from_function(
@@ -1077,7 +1257,11 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         )
 
     async def _compat_eval(
-        self, runtime: ToolRuntime, arguments: dict[str, Any], module: bool
+        self,
+        runtime: ToolRuntime,
+        arguments: dict[str, Any],
+        module: bool,
+        outer_loop: asyncio.AbstractEventLoop | None = None,
     ) -> Any:
         """Restore graph state, run a feed, and checkpoint its completed state.
 
@@ -1085,6 +1269,7 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             runtime: Injected graph state and current tool inventory.
             arguments: Validated tool arguments.
             module: Run the optional virtual module entry point when true.
+            outer_loop: Application loop for selected tools and subagents.
 
         Returns:
             LangGraph command containing a ToolMessage and private state fields.
@@ -1122,6 +1307,30 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         elif self._mode == "thread":
             await self.kernel.reset(session_id)
             payload = runtime.state.get("_arenero_snapshot")
+            version = runtime.state.get("_arenero_monty_version")
+            if (
+                payload is not None
+                and version is not None
+                and version != self.kernel.monty_version
+            ):
+                result = self.kernel._error_result(
+                    "SessionVersionError",
+                    "Saved Monty package version differs from the active version.",
+                    arguments.get("output_limit_chars"),
+                )
+                return Command(
+                    update={
+                        "messages": [
+                            ToolMessage(
+                                content=_compat_text(result, self._capture_console),
+                                artifact=result,
+                                status="error",
+                                name=self._tool_name + ("_module" if module else ""),
+                                tool_call_id=runtime.tool_call_id,
+                            )
+                        ]
+                    }
+                )
             if (
                 payload is not None
                 and len(payload) <= self._max_snapshot_bytes
@@ -1144,14 +1353,13 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             runtime=runtime,
             limits=self._hosted_tool_config,
         )
+        hosted = hosted.merged(self._configured_tools)
         if self._backend is not None:
             hosted = hosted.merged(
                 self._backend._hosted_tools(config=self._hosted_tool_config)
             )
         gate = asyncio.Semaphore(10)
         calls = 0
-        from dataclasses import replace
-
         from .hosted_tools import _invoke_tool
 
         wrapped = []
@@ -1172,7 +1380,9 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
                 if self._max_ptc_calls is not None and calls > self._max_ptc_calls:
                     raise ValueError("regular PTC call limit exceeded")
                 async with gate:
-                    return await _invoke_tool(active, args)
+                    return _tool_value(
+                        await on_loop(_invoke_tool(active, args), outer_loop)
+                    )
 
             wrapped.append(replace(tool, ainvoke=call))
         task = next((tool for tool in selected if tool.name == "task"), None)
@@ -1183,29 +1393,16 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
                     runtime,
                     concurrency=self._subagent_concurrency,
                     max_calls=self._subagent_calls,
+                    outer_loop=outer_loop,
                 )
             )
-        hosted = HostedToolSet(tuple(wrapped), self._hosted_tool_config)
+        hosted = HostedToolSet(tuple(wrapped), hosted.config)
+        if self._rlm is not None:
+            hosted = self._rlm.hosted_tools(
+                self.kernel, session_id, application_tools=hosted
+            )
         control = GraphCalls()
         code = arguments.get("code") if module else arguments["code"]
-        prefix = ""
-        if self._backend is not None:
-            prefix = (
-                "\n".join(
-                    f"async def {tool.name}(**kwargs):\n    return await {tool.alias}(**kwargs)"
-                    for tool in hosted.tools
-                    if tool.alias.startswith("_arenero_backend_fs_")
-                )
-                + "\n"
-            )
-        if self._namespace and hosted.tools and code is not None:
-            methods = "\n".join(
-                f"    async def {tool.name if tool.alias.startswith('_arenero_backend_fs_') else tool.alias}(self, **kwargs):\n        return await {tool.alias}(**kwargs)"
-                for tool in hosted.tools
-            )
-            prefix += f"class _AreneroTools:\n{methods}\ntools = _AreneroTools()\n"
-        if code is not None:
-            code = prefix + code
         kwargs: dict[str, Any] = {
             **arguments,
             "code": code,
@@ -1219,6 +1416,8 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
         except asyncio.CancelledError:
             control.reraise()
             raise
+        finally:
+            await control.close()
         message = ToolMessage(
             content=_compat_text(result, self._capture_console),
             tool_call_id=runtime.tool_call_id,
@@ -1236,9 +1435,12 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
             )
             update["_arenero_snapshot"] = payload
             update["_arenero_snapshot_hmac"] = (
-                self._sign(payload, session_id)
+                self._checkpoint_tag(payload, session_id, self.kernel.monty_version)
                 if payload and self._signing_key
                 else None
+            )
+            update["_arenero_monty_version"] = (
+                self.kernel.monty_version if payload else None
             )
         elif self._mode == "call":
             await self.kernel.reset(session_id)
@@ -1263,7 +1465,11 @@ def _compat_text(result: Mapping[str, Any], capture_console: bool) -> str:
     if result["error"]:
         error = result["error"]
         blocks.append(
-            f'<error type="{html.escape(error["type"], quote=True)}">{html.escape(error["message"])}</error>'
+            f'<error type="{html.escape(error["type"], quote=True)}">'
+            f"{html.escape(error['message'])}\nCode: {html.escape(error['code'])}"
+            f"\nHint: {html.escape(error['hint'])}"
+            f"\nRetryable: {str(error['retryable']).lower()}"
+            f"\nRecovery: {html.escape(error['recovery'])}</error>"
         )
     else:
         blocks.append(
@@ -1274,3 +1480,51 @@ def _compat_text(result: Mapping[str, Any], capture_console: bool) -> str:
     if any(result["truncated"].values()):
         blocks.append("<truncated>Output reached the configured limit.</truncated>")
     return "\n".join(blocks)
+
+
+def _check_alias(alias: str) -> None:
+    """Reject names that can replace adapter or native filesystem helpers.
+
+    Args:
+        alias: Normalized Python tool alias.
+    """
+    if (
+        alias in {"tools", "_AreneroTools"}
+        or alias.startswith(("_arenero_", "fs_"))
+        or (alias.startswith("__") and alias.endswith("__"))
+    ):
+        raise ValueError(f"reserved interpreter tool alias: {alias}")
+
+
+def _tool_value(value: Any) -> Any:
+    """Unwrap LangChain message envelopes while preserving plain typed values.
+
+    Args:
+        value: Raw tool result, command, or list of message envelopes.
+
+    Returns:
+        Last tool message content for envelopes, otherwise the original value.
+    """
+    from langgraph.types import Command
+
+    if isinstance(value, ToolMessage):
+        return value.content
+    if isinstance(value, Command):
+        messages = (
+            value.update.get("messages", [])
+            if isinstance(value.update, Mapping)
+            else []
+        )
+        return _tool_value(messages[-1]) if messages else None
+    if isinstance(value, list) and any(
+        isinstance(item, (ToolMessage, Command)) for item in value
+    ):
+        return next(
+            (
+                _tool_value(item)
+                for item in reversed(value)
+                if isinstance(item, (ToolMessage, Command))
+            ),
+            None,
+        )
+    return value

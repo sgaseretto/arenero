@@ -487,6 +487,7 @@ class CompatibilityGraphTests(unittest.IsolatedAsyncioTestCase):
                 [task],
             )
             self.assertIn("subagent call limit", capped.content)
+            self.assertEqual(capped.artifact["error"]["code"], "subagent_call_limit")
 
     async def test_schema_bounds_reject_before_dispatch(self) -> None:
         """Do not send oversized, deep, or wide schemas to a child model."""

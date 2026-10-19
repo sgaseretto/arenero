@@ -31,7 +31,11 @@ with CodeInterpreterMiddleware(ptc=("search_web",)) as interpreter:
     )
     config = {"configurable": {"thread_id": "conversation-42"}}
     first = agent.invoke(
-        {"messages": [{"role": "user", "content": "Calculate and remember 37 squared."}]},
+        {
+            "messages": [
+                {"role": "user", "content": "Calculate and remember 37 squared."}
+            ]
+        },
         config,
     )
     second = agent.invoke(
@@ -43,15 +47,21 @@ with CodeInterpreterMiddleware(ptc=("search_web",)) as interpreter:
 The model sees one `eval(code=...)` tool by default. The code is Monty Python:
 
 ```python
-value = 37 ** 2
+value = 37**2
 value
 ```
 
 Use `async with`, `await agent.ainvoke(...)`, or `agent.astream(...)` for an async
-application. `invoke`, `stream`, `ainvoke`, and `astream` all use the same owned
-event loop. Do not run `interpreter.kernel` directly from another loop. Close
+application. Monty work from `invoke`, `stream`, `ainvoke`, and `astream` uses
+one owned event loop. With async graph calls, selected LangChain tools,
+configured hosted tools, task subgraphs, and task stream events use the caller's
+application loop. They can reuse loop-bound clients, locks, and futures.
+With sync graph calls there is no caller loop; async tools use the owned loop.
+Do not run `interpreter.kernel` directly from another loop. Close
 the middleware after graph work finishes. It closes its own kernel and loop,
-but not a caller-supplied backend.
+but not a caller-supplied backend or MCP hub. Host callbacks are cancelled and
+drained when a feed is cancelled. A sync host function already running in a
+worker thread cannot be forcibly stopped. Its completed effects remain.
 
 ## The ten additions
 
@@ -70,6 +80,21 @@ but not a caller-supplied backend.
 
 ## Settings and limits
 
+The profile now includes these ten follow-up changes:
+
+| Change | Use and limits |
+| --- | --- |
+| Application-loop tools | Async PTC and real task graphs use the caller loop. Sync invocation uses the owned loop. Cancellation and graph interrupts cross the bridge. |
+| Configuration guards | Empty signing keys, reserved aliases, duplicate aliases, and explicit `ptc=("task",)` fail early. Use `subagents=True` for task dispatch. |
+| Tool result values | `ToolMessage` becomes its content. A `Command` becomes its last message content. For an envelope list, use the last envelope. Plain typed values and lists stay unchanged. Parent graph updates are not applied. |
+| Bounded console collection | Keep a UTF-8 prefix of each stream; discard excess and count original characters. Console overflow alone does not discard Python state. |
+| Error guidance | Existing error blocks also include code, hint, retry flag, and recovery action. The rich artifact keeps the same fields. |
+| Existing configuration | Pass kernel/hosted-tool config, hosted tools, MCP, RLM, bootstrap, OS handler, and event sink. No second configuration system. |
+| Shared source and output | Modules, bootstrap files, and output files use the shared backend's existing bounded transfers. No direct guest filesystem access is enabled. |
+| Snapshot version guard | Record the exact Monty package version. Reject a known mismatch before load. New HMACs bind version, slot, and bytes. |
+| Idle lock cleanup | Sync and async session locks remain while owned or awaited; idle entries disappear. Completed private slots do not accumulate lock entries. |
+| Compatibility tests | CI runs locked and newer allowed dependencies, fake-model real subgraphs, and a core-only wheel smoke test. No real model call is used. |
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `memory_limit` | 64 MiB | Monty allocator cap, not host process RSS. |
@@ -84,25 +109,77 @@ but not a caller-supplied backend.
 | `ptc` | `None` | Explicit tool names or tool objects; no ordinary tools are exposed by default. |
 | `mode` | `thread` | `thread`, `turn`, or `call`; `None` also means `thread`. |
 | `max_snapshot_bytes` | `memory_limit` | Snapshot acceptance and kernel state-save cap. Oversized new state is not committed. |
-| `snapshot_signing_key` | `None` | Optional HMAC over the full snapshot and private slot identity. |
+| `snapshot_signing_key` | `None` | Optional nonempty HMAC key; binds version, snapshot, and private slot. |
 | `tools_namespace` | `True` | Generate `tools.NAME(**kwargs)` as well as bare function access. |
 | `module_tool` | `False` | Add `eval_module(entry_path, code=None, ...)` for the existing static module workaround. |
 | `workspace` | `None` | Optional direct `WorkspaceConfig` mount, without a shared backend. |
-| `backend` | `None` | Optional caller-owned `AreneroBackend`; mutually exclusive with direct workspace and module tool. |
+| `backend` | `None` | Optional caller-owned `AreneroBackend`; mutually exclusive with direct workspace and OS handler, not the module tool. |
+| `kernel_config` | `None` | Existing `KernelConfig` for resource, pool, clock/OS policy, and type-check settings. |
+| `hosted_tool_config` | `None` | Existing aggregate call/time/concurrency and record settings. |
+| `hosted_tools` | `None` | Existing `HostedToolSet`, included in the per-eval PTC scope and live namespace. |
+| `mcp_hub` | `None` | Caller-owned `McpHub`; discovery, call, promotion, and reload functions. |
+| `rlm` | `None` | Existing `RLM` runner and its own model/recursion limits. |
+| `bootstrap_code`, `bootstrap_files` | `None`, `()` | Trusted startup sources, once per new session, after guest wrappers are installed. |
+| `os_handler` | `None` | Direct virtual file/clock handler, instead of shared-backend files. |
+| `event_sink` | `None` | Existing kernel event callback. |
 
 The kernel still enforces its other defaults: 1000 suspensions per checkout,
 10 seconds of system sleep per checkout, a 10-second worker request timeout,
-1 MB of collected streams, and bounded recursion and file transfers. Hosted
+1 MB retained for each console stream, and bounded recursion and file transfers. Hosted
 calls share a 30-second operation wall budget. Task and regular call counts are
 separate, but tasks do not bypass that aggregate host budget or native limits.
 The stream collection cap and the returned-text cap are different limits.
+The compatibility collector discards excess instead of raising `MemoryError`.
+`stats.original_output_chars` records the full printed character counts, and
+`truncated.stdout` / `truncated.stderr` report omitted text. Discarded text is
+not recoverable through `output_file`. The low-level kernels keep their existing
+strict stream collector unless this compatibility profile owns them.
 Disabling console capture does not disable interpreter memory/time limits.
 
 `eval` also accepts `output_limit_chars` to lower the response cap and
-`output_file` to offload larger bounded JSON when a direct workspace is present.
-Check the rich artifact for `output_file_error`. Shared-backend mode disables
-direct kernel files, including this native output-file route. Use `fs_write`
-for explicit shared-backend output instead.
+`output_file` to offload larger bounded JSON through direct files or the shared
+backend. Check the rich artifact for `output_file_error`. Only retained console
+prefixes can be saved. Result values remain subject to the existing transfer
+byte cap. The backend checks its root before each source read or output write.
+
+### Reuse configuration
+
+```python
+from arenero import HostedToolConfig, KernelConfig
+from arenero.deepagents import CodeInterpreterMiddleware
+
+interpreter = CodeInterpreterMiddleware(
+    kernel_config=KernelConfig(
+        max_memory_bytes=32 * 1024 * 1024,
+        max_feed_duration_seconds=2,
+        max_worker_processes=4,
+        max_stream_bytes=64_000,
+    ),
+    hosted_tool_config=HostedToolConfig(max_total_call_seconds=20),
+    max_result_chars=2000,
+    bootstrap_code="def twice(value):\n    return value * 2",
+    # mcp_hub=hub, rlm=runner, hosted_tools=toolset,
+)
+```
+
+When `kernel_config` is supplied, it sets interpreter and pool limits;
+`memory_limit` and `timeout` do not override it. The adapter display cap still
+applies, bounded by the config's output hard cap. The effective snapshot cap is
+the smaller of `max_snapshot_bytes` (when supplied) and the config's state cap.
+Without a config, all existing defaults stay the same. Keep the config fixed
+after construction, as with the native kernel.
+
+Selected tools, configured hosted tools, and shared file bridges share the PTC
+count. Their merged `HostedToolConfig` uses the existing stricter limits. Task
+counts have a separate adapter cap but still share the aggregate hosted wall
+budget. `timeout` is guest execution time, not a model/tool wall budget.
+MCP and RLM also retain their own budgets and native worker requirements.
+MCP calls use the hub's own loop. Existing RLM model callbacks run on the kernel
+loop; do not give them clients already bound to a different loop. RLM children
+need free Monty workers. The caller opens/closes the hub; the adapter owns only
+its kernel and bridge. Trusted startup code can use the active hosted namespace.
+Bootstrap effects run again in call mode, after a reset, or after a rejected
+snapshot starts a fresh session; they are not exactly-once effects.
 
 ## State, checkpoints, and replay
 
@@ -115,9 +192,11 @@ sequenceDiagram
     Human->>Graph: First turn
     Graph->>Adapter: Assign private slot
     Graph->>Adapter: eval(code)
+    Adapter->>Adapter: Check version, size, and optional HMAC
     Adapter->>Monty: Restore last completed graph snapshot
+    Adapter->>Monty: Refresh host wrappers before startup and user code
     Monty-->>Adapter: Value and idle snapshot
-    Adapter-->>Graph: ToolMessage plus private snapshot update
+    Adapter-->>Graph: ToolMessage plus versioned private snapshot update
     Graph->>Graph: Checkpoint completed tool step
     Graph->>Adapter: End turn and evict working copy
     Human->>Graph: Related second turn
@@ -141,6 +220,15 @@ sequenceDiagram
   oversized snapshots are not restored. Keep the same signing key when a graph
   resumes in a new middleware instance. Snapshots still require exact Monty
   versions and compatible execution policy.
+- A known version mismatch returns `SessionVersionError` without loading or
+  replacing the graph snapshot. Start a new graph slot, or explicitly clear
+  `_arenero_snapshot`, `_arenero_snapshot_hmac`, and `_arenero_monty_version`
+  in application-managed graph state before retry. Resetting only the working
+  kernel cannot remove a graph-owned checkpoint.
+- Old checkpoints without version metadata still use native format/policy checks.
+  Their original package version cannot be proved. Old signed tags remain valid;
+  after a successful feed, the new snapshot records the current package version.
+  Removing version metadata from a newly signed checkpoint invalidates its tag.
 - A nested graph interrupt cancels the checkout without saving partial Python
   state. Resume replays that eval from its last completed graph checkpoint.
   Earlier file, network, or provider effects are not rolled back. Make those
@@ -159,7 +247,10 @@ titles[:5]
 ```
 
 The namespace uses Python keyword arguments, not JavaScript input objects or
-automatic camelCase conversion. `tools` and `_arenero_*` are reserved names.
+automatic camelCase conversion. `tools`, `_AreneroTools`, `_arenero_*`, and `fs_*`
+and Python `__dunder__` names are reserved tool aliases, including after
+Python-safe alias conversion. Do not
+select `task` through `ptc` or configure a hosted `task`; use `subagents` instead.
 Bare aliases remain available. The wrappers are refreshed after snapshot
 restore; they do not depend on host object registrations surviving a dump.
 Tool selection and instructions use the current agent inventory. A removed
@@ -200,7 +291,14 @@ of exactly-once external effects. Schema and labels use Python names:
 PTC still bypasses the parent ToolNode and parent per-tool approval middleware.
 A graph interrupt raised by the called tool itself does propagate. Arbitrary
 `Command.update` fields from nested tools are not applied to the parent graph;
-the task bridge extracts the final response only.
+the compatibility profile extracts the final response only for all selected
+tools. Plain dictionaries, numbers, booleans, and ordinary lists stay typed.
+
+Error blocks include stable codes such as `ptc_call_limit`,
+`subagent_call_limit`, `hosted_tool_time_limit`, `feed_time_limit`,
+`turn_time_limit`, and `session_version_error`.
+Use the hint and recovery action instead of retrying every error. A busy worker
+may succeed later; an exhausted per-eval count needs less work in that eval.
 
 ## Shared sandbox setup
 
@@ -219,9 +317,16 @@ with PersistentMontyKernel(os_handler=OSAccess()) as file_kernel:
             backend=backend,
             middleware=[interpreter],
         )
-        result = agent.invoke({"messages": [{
-            "role": "user", "content": "Create a report and check its contents."
-        }]})
+        result = agent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Create a report and check its contents.",
+                    }
+                ]
+            }
+        )
 ```
 
 The model can use the outer Deep Agents file tools or these async guest calls:
@@ -245,8 +350,11 @@ flowchart LR
     Eval --> Loop["Owned async loop"]
     Loop --> Python["Native AsyncMonty pool, direct files disabled"]
     Python --> Host["Await fs_* or selected file tool"]
+    Host --> App["Caller loop for async tools and task graphs"]
     Agent --> Outer["Deep Agents file tools"]
-    Host --> Backend["AreneroBackend"]
+    App --> Backend["AreneroBackend"]
+    Loop --> Source["Module/bootstrap reads and output-file writes"]
+    Source --> Backend
     Outer --> Backend
     Agent --> Shell["execute limited virtual shell"]
     Shell --> Backend
@@ -261,6 +369,15 @@ pool. Do not call a bound interpreter session from a hosted file function.
 The backend does not own or close its supplied kernel. Close the middleware
 first, then the file kernel, as the nested contexts show. File locks coordinate
 one kernel, not separate processes that share a host directory.
+
+Use `CodeInterpreterMiddleware(backend=backend, module_tool=True,
+bootstrap_files=("/startup.py",))` for shared helper files. The model can call
+`eval_module(entry_path="/helpers/main.py", code="value + 1",
+output_file="/output.json")`. Source reads are raw UTF-8, not paged/numbered
+backend text records. Missing files, decoding failures, root violations, and
+unsupported imports fail under the existing static resolver. No second module
+loader or guest `importlib` is added. Loading a module without follow-up code
+also installs the current host namespace first.
 
 For backend-only use, pass `system_prompt=backend.instructions()` to
 `create_deep_agent`. The combined middleware adds these instructions for you.
@@ -318,13 +435,13 @@ background thread.
 - Default interpreter-only mode can call selected Deep Agents file tools through
   PTC. Those tools retain their own file authority. Add `backend` when you want
   the explicit shared `fs_*` interface and the limited shell.
-- For a direct mounted workspace and small dependency-free helpers, set
-  `workspace=WorkspaceConfig(...)` and `module_tool=True`. The static module
+- For small dependency-free helpers, set `module_tool=True` with either
+  `workspace=WorkspaceConfig(...)` or the shared backend. The static module
   resolver remains bounded and rejects dynamic, wildcard, nested virtual-file,
   circular, and third-party imports. It is not ES module resolution or importlib.
-- `AreneroInterpreterMiddleware` remains the API for caller-configured native
-  kernels, store-owned persistence, RLM, MCP, and other existing advanced options.
-  The small compatibility constructor does not duplicate every kernel setting.
+- `AreneroInterpreterMiddleware` remains the API for caller-owned native kernels
+  and store-owned persistence. The compatibility profile reuses configuration
+  objects and MCP/RLM hooks, but always owns its kernel and graph slots.
 - Full Monty snapshots are used, not QuickJS heap dumps or binary deltas. Python
   functions and plain guest classes survive compatible snapshots. Direct host
   object registrations and external connections do not.
@@ -336,7 +453,8 @@ background thread.
 See the [pinned source review](deepagents.md#compatibility-review-2026-10-18),
 [Monty limitations](monty-updates.md), and
 [sandbox comparison](sandbox-compatibility.md). The compatibility suite in
-`tests/test_deepagents_compat.py` uses scripted fake models, real local Monty
-workers, and mocked child agents. It includes graph restart, both invocation
+`tests/test_deepagents_compat.py` and `tests/test_deepagents_hardening.py` use
+scripted fake models, real local Monty workers, and real local child graphs as
+well as mock task tools. They include graph restart, both invocation
 styles, interruption/resume, cancellation, task limits/events, file sharing,
 backend records, binary transfers, matching, and deadline behavior.
