@@ -300,7 +300,7 @@ sequenceDiagram
         A->>K: Restore private snapshot to working store
     end
     G->>A: awrap_model_call(filtered request tools)
-    A-->>G: Dynamic limits and async function catalog
+    A-->>G: Dynamic limits, async catalog, and correct stock backend descriptions
     A-->>G: after_model saves private active names
     G->>A: python_interpreter(code) or compatibility eval(code)
     opt Compatibility profile
@@ -346,6 +346,33 @@ data. The shared result formatter keeps the old error message and caps message
 plus stack together. The compatibility text formatter exposes the bounded stack,
 original output counts, and file-write status; full details remain in artifacts
 or bounded output files. It does not reconstruct Python stacks in the host.
+
+The backend profiles share one file implementation. `AreneroFilesBackend` uses
+`BackendProtocol` and does not provide execute. This lets Deep Agents enforce
+path permissions on its built-in tools. `AreneroBackend` adds the virtual shell
+and the `BaseSandbox` type gate needed for native capture. All async file methods
+explicitly use the existing thread forwarding, not BaseSandbox scripts. Capture
+is opt-in and observes bounded virtual output before the final display trim,
+then uses raw transfer after the shell call. The shell source and limits are not
+changed. A failed write never repeats the command.
+
+```mermaid
+flowchart LR
+    Model["Model request after tool filters"] --> Guidance["Backend middleware or combined interpreter"]
+    Guidance --> Tools["Same tool schemas and callbacks; corrected stock descriptions"]
+    Tools --> Rules["Built-in file tool permission checks"]
+    Rules --> FileAPI["AreneroFilesBackend: shared file implementation"]
+    Tools --> ShellAPI["AreneroBackend: existing virtual shell"]
+    ShellAPI --> FileAPI
+    ShellAPI -. "capture enabled" .-> Capture["Bounded pre-display output"]
+    Capture --> Transfer["Raw upload; native pointer and preview"]
+```
+
+This does not put graph permission rules inside the kernel. Direct `fs_*`,
+mounts, transfers, MCP tools, and other host grants retain their authority.
+Nested PTC calls do not run parent per-tool approval middleware. Composite routes
+are backend routing, not shell mounts. See the
+[permission and capture contracts](deepagents-compatibility.md#file-only-backend-and-permissions).
 
 ## Recursive model execution path
 

@@ -73,9 +73,25 @@ Python through the same backend, including a file pool with one worker. Backend
 checks cover a* methods, native records, paging, binary batches and errors, root
 bounds, upstream glob rules, exact grep caps, scan limits, and cooperative shell
 deadlines. The suite is tested with the locked dependencies and an isolated
-Deep Agents 0.7.28 / LangChain 1.4.6 / LangGraph 1.2.16 environment. It uses no
+Deep Agents 0.7.29 / LangChain 1.4.6 / LangGraph 1.2.16 environment. It uses no
 provider credentials or real LLM calls. See the
 [compatibility guide](deepagents-compatibility.md).
+
+`tests/test_deepagents_backends.py` makes the review probes permanent. Scripted
+models drive real Deep Agents graphs and Monty workers. Checks cover file-only
+and execution-capable profiles, unchanged tool schemas/callbacks, custom
+descriptions, filtered execute visibility, binary transfers and image blocks,
+bulk read redaction, first-match permission ordering, protected deletion,
+approval/rejection and resume, two human turns, real child graph permission
+inheritance/override, and composite routes that are not shell mounts. Explicit
+boundary tests prove that PTC does not apply parent per-tool approval and direct
+fs_* grants do not acquire graph permission rules.
+
+Native capture tests check sync/async execute, capture opt-in, no inherited file
+scripts, a graph reading its saved output, nonzero exit status, no command retry,
+UTF-8/zero-byte limits, incomplete output, invalid root/budget rejection before
+execution, transfer caps, and failed capture writes. These tests do not run an
+OS shell, use a real LLM, or contact a remote sandbox service.
 
 `tests/test_deepagents_hardening.py` adds regression checks for all ten adapter
 follow-ups. A fake-model graph calls a loop-bound async tool across two human
@@ -183,7 +199,8 @@ Run the Python interpreter adapter checks only:
 ```console
 uv run --frozen python -m unittest \
   tests.test_deepagents tests.test_deepagents_compat \
-  tests.test_deepagents_hardening tests.test_interpreter_fixes -v
+  tests.test_deepagents_hardening tests.test_interpreter_fixes \
+  tests.test_deepagents_backends -v
 ```
 
 These tests use real Monty workers. They cover all presets, bound state, relative

@@ -2,7 +2,9 @@
 
 Use `CodeInterpreterMiddleware` when you want the Deep Agents interpreter
 interface with Python instead of JavaScript. Use `AreneroBackend` when you also
-want shared files and the limited virtual shell. Both need the optional extra:
+want shared files and the limited virtual shell. Use `AreneroFilesBackend` for
+files without shell execution, including Deep Agents path permissions. All use
+the same optional extra:
 
 ```console
 uv add 'arenero[deepagents]'
@@ -113,7 +115,7 @@ The profile now includes these ten follow-up changes:
 | `tools_namespace` | `True` | Generate `tools.NAME(**kwargs)` as well as bare function access. |
 | `module_tool` | `False` | Add `eval_module(entry_path, code=None, ...)` for the existing static module workaround. |
 | `workspace` | `None` | Optional direct `WorkspaceConfig` mount, without a shared backend. |
-| `backend` | `None` | Optional caller-owned `AreneroBackend`; mutually exclusive with direct workspace and OS handler, not the module tool. |
+| `backend` | `None` | Optional caller-owned `AreneroBackend` or `AreneroFilesBackend`; enables direct fs_* grants. Mutually exclusive with direct workspace and OS handler, not the module tool. |
 | `kernel_config` | `None` | Existing `KernelConfig` for resource, pool, clock/OS policy, and type-check settings. |
 | `hosted_tool_config` | `None` | Existing aggregate call/time/concurrency and record settings. |
 | `hosted_tools` | `None` | Existing `HostedToolSet`, included in the per-eval PTC scope and live namespace. |
@@ -446,9 +448,82 @@ unsupported imports fail under the existing static resolver. No second module
 loader or guest `importlib` is added. Loading a module without follow-up code
 also installs the current host namespace first.
 
-For backend-only use, pass `system_prompt=backend.instructions()` to
-`create_deep_agent`. The combined middleware adds these instructions for you.
-Do not give the model the general Bash contract of a full OS sandbox.
+For backend-only use, add `AreneroBackendMiddleware(backend)` from
+`arenero.deepagents_backend`. It adds the existing backend instructions and
+corrects the standard `execute` and `grep` descriptions. In particular, it does
+not suggest unavailable `rg` commands. When execute is visible, regex guidance
+uses virtual `grep -E` with Python regex syntax, if that command is enabled.
+Earlier tool filters stay in effect; hidden tools are not added again. Schemas,
+callbacks, and explicit custom descriptions are unchanged. Put filters before
+this middleware and before the interpreter. Do not stack the backend middleware
+with `CodeInterpreterMiddleware(backend=backend)`: the combined setup already
+adds the same guidance. The previous `system_prompt=backend.instructions()`
+setup still works, but does not rewrite tool descriptions.
+
+### File-only backend and permissions
+
+```python
+from arenero.deepagents_backend import AreneroBackendMiddleware, AreneroFilesBackend
+from deepagents import FilesystemPermission
+
+with PersistentMontyKernel(os_handler=OSAccess()) as file_kernel:
+    files = AreneroFilesBackend(AreneroSandbox(file_kernel))
+    with CodeInterpreterMiddleware(ptc=("read_file", "write_file")) as interpreter:
+        agent = create_deep_agent(
+            model=model,
+            backend=files,
+            permissions=[
+                FilesystemPermission(
+                    operations=["write"], paths=["/policies/**"], mode="deny"
+                )
+            ],
+            middleware=[AreneroBackendMiddleware(files), interpreter],
+        )
+        # Run agent.invoke or agent.ainvoke here.
+```
+
+`AreneroFilesBackend(sandbox, root=None)` has the same file methods, native
+records, binary transfers, root checks, and thread-based async methods as
+`AreneroBackend`. It is a `BackendProtocol`, not a `SandboxBackendProtocol`.
+Deep Agents hides `execute`; this class has no execute method. It owns no kernel
+or store and closes nothing. Both profiles can use the same underlying files.
+
+Rules come from Deep Agents, not a second Arenero permission engine:
+
+- Rules use first-match order and allow unmatched operations. Deny a directory
+  itself as well as its descendants when its name must also be hidden, for
+  example `paths=["/secret", "/secret/**"]`.
+- The built-in read/list/glob/grep and write/edit/delete tools enforce their
+  rules. Directory deletion is refused when a protected descendant can overlap.
+- `mode="interrupt"` needs a graph checkpointer. The reviewer can approve or
+  reject an outer file call before the change happens.
+- Subagents inherit parent permissions unless their own rules replace them.
+- Selected built-in file tools called through PTC keep their built-in deny
+  checks. Parent per-tool approval wrappers do not run inside PTC. Use
+  `interrupt_on={"eval": True}` to review the whole outer program, or keep
+  approval-required file operations as outer tool calls.
+- Host transfers, mounts, custom/MCP tools, and directly granted `fs_*`
+  functions are outside these rules. For the example above, leave the
+  interpreter's `backend`, `workspace`, and `os_handler` unset. Passing
+  `CodeInterpreterMiddleware(backend=files)` deliberately grants direct `fs_*`
+  access and module/output transfers; it does **not** apply graph permissions.
+- Deep Agents rejects path rules over an execution-capable `AreneroBackend`.
+  A `CompositeBackend` can apply rules to known non-sandbox routes. Routes do not
+  become shell mounts: execute uses only its default backend's files. Choose
+  separate storage when route data must not be visible to that default backend.
+
+```mermaid
+flowchart TD
+    Graph["Agent and subagents"] --> Outer["Built-in file tool"]
+    Outer --> Rules["Deep Agents allow, deny, or interrupt rules"]
+    Rules --> FilesOnly["AreneroFilesBackend"]
+    Eval["Monty eval"] --> PTC["Selected built-in file tool through PTC"]
+    PTC --> Deny["Built-in deny checks; no parent per-tool approval"]
+    Deny --> FilesOnly
+    Eval -. "Separate explicit grant: not covered by graph rules" .-> Direct["fs_*, mounts, or host tools"]
+    FilesOnly --> Store["Existing virtual files"]
+    Direct --> Store
+```
 
 ### File contracts
 
@@ -480,8 +555,10 @@ Do not give the model the general Bash contract of a full OS sandbox.
 `backend.execute(command, timeout=...)` and `backend.aexecute(...)` return the
 native `ExecuteResponse`. The command grammar remains the
 [limited virtual shell](virtual-shell.md), not Bash. File methods do not call
-shell wrappers. The adapter does not inherit `BaseSandbox`'s OS-dependent
-capture/offload scripts.
+shell wrappers. `AreneroBackend` now subclasses `BaseSandbox` only to enter Deep
+Agents' native capture path. All public sync/async file operations and capture
+use Arenero implementations; no OS-dependent helper script is used. The
+file-only base remains independent of `BaseSandbox`.
 
 A positive timeout sets a call-local cooperative wall deadline. It is checked
 before and after commands and pipelines, after DNS, and after an HTTP body read.
@@ -496,6 +573,90 @@ not change saved Monty policy or apply unsafe shared configuration mutations.
 Use the native interpreter/request/network limits too. A strict full-command
 wall-time kill needs a disposable process/container boundary, not an abandoned
 background thread.
+
+### Opt-in execute output capture
+
+```python
+from arenero.deepagents_backend import AreneroBackend, AreneroBackendMiddleware
+
+backend = AreneroBackend(AreneroSandbox(file_kernel))
+backend.enable_capture_offload = True  # Configure before graph calls.
+agent = create_deep_agent(
+    model=model,
+    backend=backend,
+    middleware=[AreneroBackendMiddleware(backend)],
+)
+```
+
+Existing execute behavior and constructor defaults are unchanged; capture is off
+by default. When enabled and Deep Agents' normal output eviction is enabled,
+the native execute tool can save output under `/large_tool_results/CALL_ID`,
+return a head/tail preview and file pointer, and let a later `read_file` inspect
+the output. Exit codes, including nonzero command exits, are preserved.
+
+The same host operation is available directly:
+
+```python
+capture = backend.execute_with_offload(
+    "cat /report.txt",
+    "/output/report.txt",
+    max_inline_bytes=4000,
+    max_capture_bytes=100_000,
+    timeout=5,
+)
+# Async equivalent: await backend.aexecute_with_offload(...).
+```
+
+The virtual shell runs once. A private observer keeps its bounded output before
+the final display trim. After the shell finishes, the existing raw upload saves
+UTF-8 bytes. No command wrapping, rerun, CPython execution, or global limit
+mutation is used. Small results remain inline and do not create a capture file.
+
+Limits and failure rules:
+
+- `max_inline_bytes` and `max_capture_bytes` are nonnegative byte limits. The
+  inline budget also cannot exceed `KernelConfig.default_output_limit_chars`
+  bytes, a conservative bound below its character cap. None for capture uses
+  `FilesystemConfig.max_transfer_bytes`; an explicit cap can only lower it.
+- Existing command, pipeline, result, stream, shell, transfer, and worker caps
+  remain. Capture cannot recover text already removed by a hard limit, including
+  Python-command output clipped before it reaches the shell observer.
+- UTF-8 prefixes and previews omit incomplete edge characters. `truncated=True`
+  reports incomplete captured output, not just a shortened saved-output preview.
+  Deep Agents marks an incomplete saved file in the model-visible message.
+- A failed capture write returns no successful file pointer, reports truncation,
+  and retains a bounded failure message. Completed command effects remain. The
+  command is not retried. A timeout retains the usual cooperative exit 124 rules.
+- Capture paths must be inside `backend.root`; invalid paths and negative byte
+  budgets fail before command execution when capture is enabled. With capture
+  disabled, the method delegates unchanged to normal execute.
+- Deep Agents attempts capture only if its artifact path resolves to this
+  executing backend. For a root such as `/workspace`, use
+  `CompositeBackend(default=backend, routes={}, artifacts_root=backend.root)` so
+  `/workspace/large_tool_results/...` is inside that root. If an artifact path
+  routes to different storage, Deep Agents skips native capture and uses its
+  normal bounded execute/eviction path.
+- Files keep their normal backend lifetime. No automatic capture-file cleanup is
+  added. Async capture uses a worker thread; cancelling the await does not kill
+  that thread or undo a completed command or file write.
+
+```mermaid
+sequenceDiagram
+    participant G as Deep Agents execute tool
+    participant B as AreneroBackend
+    participant S as Existing virtual shell
+    participant F as Existing virtual files
+    G->>B: execute_with_offload, if capture path stays on this backend
+    B->>S: Run original command once with existing limits
+    S-->>B: Bounded output before final display trim, plus exit code
+    alt Output exceeds inline budget and capture is enabled
+        B->>F: Write bounded UTF-8 output
+        B-->>G: Preview, exit code, and incomplete-capture flag
+        G-->>G: Return native file pointer and truncation notice
+    else Small output or capture disabled
+        B-->>G: Normal inline result
+    end
+```
 
 ## Workarounds and remaining differences
 
@@ -525,3 +686,7 @@ scripted fake models, real local Monty workers, and real local child graphs as
 well as mock task tools. They include graph restart, both invocation
 styles, interruption/resume, cancellation, task limits/events, file sharing,
 backend records, binary transfers, matching, and deadline behavior.
+`tests/test_deepagents_backends.py` adds full mocked graph checks for stock tool
+descriptions, file-only profiles, permission ordering, bulk-result filtering,
+approval/rejection, real child graphs, PTC boundaries, binary image blocks,
+native capture/readback, capture failures, byte caps, and sync/async entry points.

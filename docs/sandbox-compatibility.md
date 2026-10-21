@@ -4,8 +4,10 @@ This report compares Arenero with the utilities described in the LangChain
 [Deep Agents sandbox documentation](https://docs.langchain.com/oss/python/deepagents/sandboxes).
 Arenero provides independent sandbox utilities and two optional interpreter
 interfaces. `AreneroBackend` implements Deep Agents `SandboxBackendProtocol`
-with native file records and limited execute. It does not inherit `BaseSandbox`
-or claim to run its OS-dependent shell wrappers. See the
+with native file records and limited execute. It uses the `BaseSandbox` type
+gate for opt-in output capture, but overrides all file and capture operations;
+it never runs OS-dependent wrappers. `AreneroFilesBackend` provides the same file
+methods without execution or that type gate. See the
 [Python compatibility guide](deepagents-compatibility.md).
 
 ```mermaid
@@ -53,6 +55,9 @@ executables.
 | Deep Agents interpreter | `AreneroInterpreterMiddleware` adds async code and static-module tools, live capability instructions, PTC, subagent dispatch, state modes, and optional private checkpoint snapshots. It is middleware, not a `BaseSandbox`. |
 | Python compatibility profile | `CodeInterpreterMiddleware` adds one eval tool, sync/async graph calls, graph-owned snapshots, graph control signals, tool namespaces, and bounded subagent schemas/events. |
 | Deep Agents backend | `AreneroBackend` supplies native result records, a* methods, paging, upstream glob rules, literal grep, ordered binary transfers, and shared-backend interpreter file calls. |
+| File-only Deep Agents backend | `AreneroFilesBackend` omits execution so built-in file tools can use Deep Agents allow/deny/interrupt rules. Direct host grants remain outside those rules. |
+| Model-facing backend guidance | `AreneroBackendMiddleware` corrects stock execute/grep descriptions and adds instructions. Shared-backend interpreter mode does this automatically. |
+| Native execute capture | Opt-in `enable_capture_offload=True` saves bounded virtual-shell output before final display trimming and returns the native Deep Agents file pointer. No command rerun or OS wrapper. |
 | Per-call shell deadline | A positive execute timeout stops at cooperative checks with exit 124. Zero or None uses configured limits. Active host/worker work is not forcibly stopped. |
 | Static virtual modules | `execute_module` resolves a bounded graph of top-level virtual imports. It is not CPython importlib and generated feeds skip type checking. |
 | Session administration | Stores and kernels list safe session metadata and delete expired sessions without exposing snapshot bytes. |
@@ -108,11 +113,14 @@ pinned upstream sources. Its ten recommended additions are implemented in the
 | --- | --- | --- |
 | File metadata | Low to medium | Add byte size and timestamps where the selected filesystem backend can supply them. |
 | Strict full-command wall timeout | High | Needs a disposable process boundary that can stop active work, not an abandoned worker thread. Cooperative deadlines already work. |
-| Permission or approval hooks | Medium | Add callbacks before mutation or execution, or use agent middleware. |
+| Broader permission or approval hooks | Medium | Built-in Deep Agents file rules work with the file-only profile. Direct host grants and nested PTC approvals still need their own policy. |
 
 Do not let a shell-based `BaseSandbox` send commands outside Arenero's documented
 allowlist. The adapter implements file methods directly and keeps the shell's
-existing limits. Its glob matcher does not widen the core shell grammar.
+existing limits. Its glob matcher does not widen the core shell grammar. Native
+capture is off by default, respects existing hard limits, and cannot recover
+data already removed by those limits. See the
+[permission and capture guide](deepagents-compatibility.md#file-only-backend-and-permissions).
 
 ## Not feasible without changing the product
 

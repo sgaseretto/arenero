@@ -443,6 +443,34 @@ does not cache a broad startup catalog because upstream middleware can filter
 tools. Explicit PTC selection is therefore checked again at execution time.
 Nested interpreter and control tools are excluded.
 
+## Deep Agents backend profiles share file code and keep capture opt-in
+
+`AreneroFilesBackend` holds the existing direct file operations. It is a native
+file backend without execute. `AreneroBackend` adds the current virtual shell.
+The old constructor, file signatures, execute result, and defaults stay the same.
+Deep Agents already provides path rules, first-match ordering, inherited
+subagent rules, and approval interrupts for file tools, so we reuse those rules
+instead of writing another permission engine. Host transfers, mounts, and direct
+interpreter file grants are separate authority. PTC still bypasses parent
+per-tool approval wrappers.
+
+Deep Agents gates native execute capture on `BaseSandbox`, not a structural
+capture protocol. The executing profile therefore subclasses `BaseSandbox`,
+but overrides capture and every sync/async file path that would otherwise use
+its scripts. Capture stays disabled by default. A private shell observer retains
+one already-bounded result before final display trimming; the existing raw upload
+then writes its UTF-8 bytes. We add no Bash wrapper, new execution engine,
+temporary host file, global limit mutation, or command retry. Native records
+carry the preview, exit code, and incomplete-capture flag. Earlier hard-limit
+losses remain losses. Failed writes keep completed effects and return no success
+pointer. Capture files use the normal file lifetime, without a new cleanup job.
+
+One small `AreneroBackendMiddleware` adds current backend instructions and adjusts
+only standard execute/grep descriptions. The combined interpreter reuses its
+request helper. Tool filters, schemas, callbacks, and custom descriptions remain
+unchanged. This fixes unavailable `rg` guidance without replacing Deep Agents'
+filesystem middleware or changing the external agent tools.
+
 ## RLM recursion uses new sessions, not interpreter re-entry
 
 `llm_query` calls one configured async model on the host. `rlm_query` creates a

@@ -1,6 +1,6 @@
 import asyncio
 import base64
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -247,10 +247,40 @@ class AreneroSandbox:
         Returns:
             Combined output, exit code, and truncation state.
         """
+        return self._execute_shell(
+            command,
+            timeout=timeout,
+            output_limit_chars=output_limit_chars,
+            output_file=output_file,
+        )
+
+    def _execute_shell(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        output_limit_chars: int | None = None,
+        output_file: str | None = None,
+        capture: Callable[[ShellResult], None] | None = None,
+    ) -> SandboxExecuteResult:
+        """Use the same shell with an optional bounded pre-display capture.
+
+        Args:
+            command: Documented virtual shell source.
+            timeout: Cooperative deadline, or None/zero for configured limits.
+            output_limit_chars: Optional returned-text cap.
+            output_file: Optional existing overflow destination.
+            capture: Private observer of output before final display trimming.
+
+        Returns:
+            The unchanged public shell result.
+        """
         try:
             with shell_deadline(timeout):
+                shell = VirtualShell(self.kernel, self.session_id)
+                shell._capture_output = capture
                 return _shell_response(
-                    VirtualShell(self.kernel, self.session_id).execute(
+                    shell.execute(
                         command,
                         output_limit_chars,
                         output_file=output_file,

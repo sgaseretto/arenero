@@ -270,6 +270,7 @@ class AreneroInterpreterMiddleware(
             Model response from the next handler.
         """
 
+        request = self._model_request(request)
         prompt = self._prepare_tools(request)
         return handler(
             request.override(
@@ -294,6 +295,7 @@ class AreneroInterpreterMiddleware(
             Awaited model response from the next handler.
         """
 
+        request = self._model_request(request)
         prompt = self._prepare_tools(request)
         return await handler(
             request.override(
@@ -313,6 +315,17 @@ class AreneroInterpreterMiddleware(
         return state.get("_arenero_slot_id") or _resolve_thread_id(
             self._fallback_thread_id
         )
+
+    def _model_request(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
+        """Keep the current request unless a profile adds backend guidance.
+
+        Args:
+            request: Current filtered model request.
+
+        Returns:
+            The same request by default.
+        """
+        return request
 
     def _prepare_tools(self, request: ModelRequest[ContextT]) -> str:
         """Use the same filtered inventory for instructions and execution.
@@ -1156,6 +1169,21 @@ class CodeInterpreterMiddleware(AreneroInterpreterMiddleware):
     async def aclose(self) -> None:
         """Close resources without blocking the caller's event loop."""
         await asyncio.to_thread(self.close)
+
+    def _model_request(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
+        """Use the shared backend's standard tool descriptions when configured.
+
+        Args:
+            request: Current filtered model request.
+
+        Returns:
+            Request with unchanged schemas, callbacks, and visible tool names.
+        """
+        if self._backend is None:
+            return request
+        from .deepagents_backend import _backend_request
+
+        return _backend_request(request, self._backend)
 
     def instructions(self, tools: Sequence[BaseTool] = ()) -> str:
         """Describe the Python interface and its active adapter limits.

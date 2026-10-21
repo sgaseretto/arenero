@@ -604,8 +604,12 @@ flowchart LR
     Monty --> Tools["Selected tools, subagents, and RLM model calls on async caller loop"]
     Eval -. "optional fs_* bridge" .-> Backend["AreneroBackend"]
     Monty -. "module/startup reads and bounded output writes" .-> Backend
+    Graph --> Permissions["Built-in file tools: Deep Agents permission checks"]
+    Permissions --> FileOnly["AreneroFilesBackend: no execute"]
     Graph -. "outer file and execute tools" .-> Backend
     Backend --> Files["One virtual file store and limited shell"]
+    FileOnly --> Files
+    Backend -. "opt-in native output capture" .-> Saved["Bounded file plus preview"]
 ```
 
 Add `AreneroBackend` from `arenero.deepagents_backend` for native Deep Agents file
@@ -613,6 +617,49 @@ records and a limited `execute` tool. Pass the same backend to the graph and
 `CodeInterpreterMiddleware(backend=backend)`. This enables async guest file
 calls such as `await fs_read(file_path="/report.txt")` without re-entering the
 active Python session. Files are separate from Python checkpoints.
+
+For file access with Deep Agents path permissions, use the new
+`AreneroFilesBackend` instead. It reuses the same files and native results but
+does not provide `execute`. Pass it only as the graph backend, then expose
+selected built-in file tools through `ptc`:
+
+```python
+from arenero import AreneroSandbox, PersistentMontyKernel
+from arenero.deepagents import CodeInterpreterMiddleware
+from arenero.deepagents_backend import AreneroBackendMiddleware, AreneroFilesBackend
+from deepagents import FilesystemPermission, create_deep_agent
+from pydantic_monty import OSAccess
+
+with PersistentMontyKernel(os_handler=OSAccess()) as file_kernel:
+    files = AreneroFilesBackend(AreneroSandbox(file_kernel))
+    with CodeInterpreterMiddleware(ptc=("read_file", "write_file")) as interpreter:
+        agent = create_deep_agent(
+            model=model,
+            backend=files,
+            permissions=[
+                FilesystemPermission(
+                    operations=["write"], paths=["/policies/**"], mode="deny"
+                )
+            ],
+            middleware=[AreneroBackendMiddleware(files), interpreter],
+        )
+        # Invoke the agent inside these contexts.
+```
+
+`AreneroBackendMiddleware` adds backend instructions and corrects the standard
+`execute`/`grep` descriptions. It does not add tools or change their schemas.
+The combined `CodeInterpreterMiddleware(backend=backend)` setup does this
+automatically. Custom tool descriptions stay unchanged. For shell output
+capture, set `backend.enable_capture_offload = True` before graph execution.
+Deep Agents can then return a preview and a virtual file path. Capture is off by
+default and never runs an OS wrapper. Existing output and transfer caps still
+apply; an incomplete saved file is marked as such.
+
+Path permissions apply to built-in file tools, not host uploads, mounts, MCP
+tools, or direct `fs_*` grants. Do not pass `backend=files` to the interpreter
+when you want all guest file access to use the built-in permission checks.
+Deep Agents still rejects path rules over the execution-capable
+`AreneroBackend`; supported composite routes can have their own rules.
 
 This is Python interface compatibility, not JavaScript, full CPython, or Bash.
 Normal third-party imports do not work. Optional `module_tool=True` works with a

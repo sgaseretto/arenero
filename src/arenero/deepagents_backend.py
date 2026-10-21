@@ -1,12 +1,16 @@
 """Optional Deep Agents backend records over the existing Arenero sandbox."""
 
+import asyncio
 import posixpath
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import Any
 
 from deepagents.backends.protocol import (
+    BackendProtocol,
     DeleteResult,
     EditResult,
+    ExecuteOffloadResult,
     ExecuteResponse,
     FileDownloadResponse,
     FileInfo,
@@ -15,23 +19,55 @@ from deepagents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
-    SandboxBackendProtocol,
     WriteResult,
 )
+from deepagents.backends.sandbox import BaseSandbox
 from deepagents.backends.utils import compile_grep_include_glob, create_file_data
+from deepagents.middleware import filesystem as _filesystem
+from deepagents.middleware._utils import append_to_system_message
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ContextT,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain.tools import BaseTool
 
 from .hosted_tools import HostedTool, HostedToolConfig, HostedToolSet
 from .sandbox import MONTY_SANDBOX_INSTRUCTIONS, AreneroSandbox, SandboxErrors
+from .shell import ShellResult
+
+_EXECUTE_DESCRIPTIONS = {
+    _filesystem.EXECUTE_TOOL_DESCRIPTION,
+    _filesystem._EXECUTE_TOOL_DESCRIPTION_WITH_GREP_ONLY,
+    _filesystem._EXECUTE_TOOL_DESCRIPTION_WITH_GLOB_ONLY,
+    _filesystem._EXECUTE_TOOL_DESCRIPTION_WITHOUT_SEARCH,
+}
+_GREP_DESCRIPTIONS = {
+    _filesystem.GREP_TOOL_DESCRIPTION,
+    _filesystem._GREP_TOOL_DESCRIPTION_WITHOUT_EXECUTE,
+}
 
 
-class AreneroBackend(SandboxBackendProtocol):
-    """Adapt a caller-owned sandbox without shell-based file wrappers.
+class AreneroFilesBackend(BackendProtocol):
+    """Expose existing files without granting shell execution.
 
     Args:
         sandbox: Sync sandbox whose kernel owns all files and shell state.
         root: Absolute virtual root for file operations. Defaults to the kernel
             workspace root. This is not a new shell confinement boundary.
     """
+
+    # Keep native thread forwarding, even in the BaseSandbox subclass below.
+    als = BackendProtocol.als
+    aread = BackendProtocol.aread
+    awrite = BackendProtocol.awrite
+    aedit = BackendProtocol.aedit
+    adelete = BackendProtocol.adelete
+    aglob = BackendProtocol.aglob
+    agrep = BackendProtocol.agrep
+    aupload_files = BackendProtocol.aupload_files
+    adownload_files = BackendProtocol.adownload_files
 
     def __init__(self, sandbox: AreneroSandbox, *, root: str | None = None) -> None:
         """Bind existing storage; inherited a* methods use worker threads."""
@@ -73,17 +109,16 @@ class AreneroBackend(SandboxBackendProtocol):
         return path
 
     def instructions(self) -> str:
-        """Describe the limited shell and shared file authority for an agent.
+        """Describe the file-only surface for an agent.
 
         Returns:
-            Current shell rules, file root, and cooperative timeout limits.
+            File root and permission boundaries.
         """
         return (
-            MONTY_SANDBOX_INSTRUCTIONS
-            + f"\nFile tools use the virtual root {self.root}. "
-            "execute is not Bash. Its per-call timeout is cooperative: exit 124 "
-            "stops later commands, but cannot preempt an active host call, "
-            "DNS lookup, worker operation, or system sleep. Completed effects remain."
+            f"Arenero file tools use the virtual root {self.root}. "
+            "This backend does not provide execute or a shell. Use the registered "
+            "file tools. Deep Agents permissions apply to those tools, not direct "
+            "host transfers, mounts, MCP tools, or separately granted fs_* functions."
         )
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
@@ -299,21 +334,6 @@ class AreneroBackend(SandboxBackendProtocol):
         except SandboxErrors as exc:
             return GrepResult(error=str(exc))
 
-    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        """Run the limited virtual shell, never a host process.
-
-        Args:
-            command: Documented Arenero shell grammar and allowlisted commands.
-            timeout: Cooperative deadline; zero or None uses configured limits.
-
-        Returns:
-            Combined bounded output; exit 124 means deadline exceeded.
-        """
-        result = self.sandbox.execute(command, timeout=timeout)
-        return ExecuteResponse(
-            output=result.output, exit_code=result.exit_code, truncated=result.truncated
-        )
-
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload bytes independently, preserving order and partial success.
 
@@ -405,6 +425,291 @@ class AreneroBackend(SandboxBackendProtocol):
             content: Output JSON bytes, subject to the normal transfer cap.
         """
         self.sandbox.kernel.upload_file(self._path(path), content)
+
+
+class AreneroBackend(AreneroFilesBackend, BaseSandbox):
+    """Add the existing virtual shell and opt-in native output capture.
+
+    Args:
+        sandbox: Caller-owned sandbox; no host process is started.
+        root: Absolute file root, or None for the kernel workspace root.
+
+    Attributes:
+        enable_capture_offload: False by default. Set True to let Deep Agents
+            save large, bounded execute output before display trimming.
+    """
+
+    def instructions(self) -> str:
+        """Describe the limited shell and file authority.
+
+        Returns:
+            Shell rules, file root, and cooperative timeout limits.
+        """
+        return (
+            MONTY_SANDBOX_INSTRUCTIONS
+            + f"\nFile tools use the virtual root {self.root}. "
+            "execute is not Bash. Its per-call timeout is cooperative: exit 124 "
+            "stops later commands, but cannot preempt an active host call, "
+            "DNS lookup, worker operation, or system sleep. Completed effects remain."
+        )
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        """Run the limited virtual shell, never a host process.
+
+        Args:
+            command: Documented Arenero shell grammar and allowlisted commands.
+            timeout: Cooperative deadline; zero or None uses configured limits.
+
+        Returns:
+            Combined bounded output; exit 124 means deadline exceeded.
+        """
+        result = self.sandbox.execute(command, timeout=timeout)
+        return ExecuteResponse(
+            output=result.output, exit_code=result.exit_code, truncated=result.truncated
+        )
+
+    def execute_with_offload(
+        self,
+        command: str,
+        capture_path: str,
+        *,
+        max_inline_bytes: int,
+        max_capture_bytes: int | None = None,
+        timeout: int | None = None,
+    ) -> ExecuteOffloadResult:
+        """Capture bounded virtual output without a Bash wrapper or rerun.
+
+        Args:
+            command: Normal virtual shell command.
+            capture_path: Absolute destination inside the backend file root.
+            max_inline_bytes: Nonnegative inline UTF-8 byte budget.
+            max_capture_bytes: Optional nonnegative capture cap, further bounded
+                by the kernel transfer limit. None uses that limit.
+            timeout: Existing cooperative deadline.
+
+        Returns:
+            Native offload record. Truncation marks incomplete capture, not a
+            shortened preview. A failed write returns no file pointer and does
+            not repeat or roll back the command.
+        """
+        if not self.enable_capture_offload:
+            return ExecuteOffloadResult(
+                offloaded=False, response=self.execute(command, timeout=timeout)
+            )
+        path = self._path(capture_path)
+        if max_inline_bytes < 0 or (
+            max_capture_bytes is not None and max_capture_bytes < 0
+        ):
+            raise ValueError("capture and inline byte limits must be nonnegative")
+        config = self.sandbox.kernel.config
+        cap = self.sandbox.kernel.filesystem_config.max_transfer_bytes
+        if max_capture_bytes is not None:
+            cap = min(cap, max_capture_bytes)
+        captured: list[ShellResult] = []
+        result = self.sandbox._execute_shell(
+            command, timeout=timeout, capture=captured.append
+        )
+        source = captured[-1] if captured and result.exit_code != 124 else result
+        data = source.output.encode("utf-8")
+        truncated = source.truncated or len(data) > cap
+        data = data[:cap].decode("utf-8", errors="ignore").encode("utf-8")
+        budget = min(max_inline_bytes, config.default_output_limit_chars)
+        if len(data) <= budget:
+            return ExecuteOffloadResult(
+                offloaded=False,
+                response=ExecuteResponse(
+                    output=data.decode("utf-8"),
+                    exit_code=result.exit_code,
+                    truncated=truncated,
+                ),
+            )
+        try:
+            self._write_output(path, data)
+        except SandboxErrors as exc:
+            output = _preview(
+                f"Output capture failed: {exc}. Command effects remain.\n".encode()
+                + data,
+                budget,
+            )
+            return ExecuteOffloadResult(
+                offloaded=False,
+                response=ExecuteResponse(
+                    output=output, exit_code=result.exit_code, truncated=True
+                ),
+            )
+        return ExecuteOffloadResult(
+            offloaded=True,
+            response=ExecuteResponse(
+                output=_preview(data, budget),
+                exit_code=result.exit_code,
+                truncated=truncated,
+            ),
+        )
+
+    async def aexecute_with_offload(
+        self,
+        command: str,
+        capture_path: str,
+        *,
+        max_inline_bytes: int,
+        max_capture_bytes: int | None = None,
+        timeout: int | None = None,
+    ) -> ExecuteOffloadResult:
+        """Offload the same capture operation to a host thread.
+
+        Args:
+            command: Virtual shell command.
+            capture_path: Absolute capture destination.
+            max_inline_bytes: Nonnegative inline UTF-8 byte budget.
+            max_capture_bytes: Optional bounded file byte cap.
+            timeout: Cooperative shell deadline.
+
+        Returns:
+            Native offload record. Cancellation does not stop an active thread.
+        """
+        return await asyncio.to_thread(
+            self.execute_with_offload,
+            command,
+            capture_path,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
+
+
+def _preview(data: bytes, limit: int) -> str:
+    """Return a UTF-8 head/tail preview within a byte limit.
+
+    Args:
+        data: Bounded UTF-8 capture.
+        limit: Nonnegative byte budget.
+
+    Returns:
+        Text with incomplete edge characters omitted.
+    """
+    if len(data) <= limit:
+        return data.decode("utf-8")
+    marker = b"\n... <trimmed> ...\n"
+    if limit <= len(marker):
+        return data[:limit].decode("utf-8", errors="ignore")
+    head = (limit - len(marker)) // 2
+    tail = limit - len(marker) - head
+    return (
+        data[:head].decode("utf-8", errors="ignore")
+        + marker.decode()
+        + data[-tail:].decode("utf-8", errors="ignore")
+    )
+
+
+def _backend_request(
+    request: ModelRequest[ContextT], backend: AreneroFilesBackend
+) -> ModelRequest[ContextT]:
+    """Adjust stock tool descriptions without changing tools or filters.
+
+    Args:
+        request: Current filtered model request.
+        backend: Explicit Arenero backend for this graph.
+
+    Returns:
+        Copied request with accurate standard descriptions. Custom descriptions
+        and the registered tool schemas and callbacks are unchanged.
+    """
+    execution = isinstance(backend, AreneroBackend) and any(
+        (t.name if isinstance(t, BaseTool) else t.get("name")) == "execute"
+        for t in request.tools
+    )
+    tools = []
+    for tool in request.tools:
+        name = tool.name if isinstance(tool, BaseTool) else tool.get("name")
+        description = (
+            tool.description
+            if isinstance(tool, BaseTool)
+            else tool.get("description", "")
+        )
+        updated = description
+        if name == "execute" and execution and description in _EXECUTE_DESCRIPTIONS:
+            updated = (
+                "Run Arenero's limited virtual shell, not Bash or CPython. "
+                "Use help for enabled commands and flags. Text pipes, redirects, "
+                "and Monty python -c/file.py are supported. No rg, Git, pip, "
+                "arbitrary executables, or full Bash scripts. Prefer the registered "
+                "file tools for files and searches. timeout is cooperative; exit "
+                "124 does not undo completed effects. Check truncation notices."
+            )
+        elif name == "grep" and description in _GREP_DESCRIPTIONS:
+            updated = (
+                "Search for a LITERAL case-sensitive text pattern, not regex. "
+                "Use separate calls for alternatives; foo|bar matches that exact "
+                "text. Results use one-based lines and bounded output."
+            )
+            if execution:
+                updated += " For regex, execute can use virtual grep -E with Python regex syntax, if enabled; rg is unavailable."
+        if updated != description:
+            tool = (
+                tool.model_copy(update={"description": updated})
+                if isinstance(tool, BaseTool)
+                else {**tool, "description": updated}
+            )
+        tools.append(tool)
+    return request.override(tools=tools)
+
+
+class AreneroBackendMiddleware(AgentMiddleware):
+    """Add Arenero backend instructions and accurate stock tool descriptions.
+
+    Args:
+        backend: Caller-owned file-only or virtual-shell backend used by the graph.
+    """
+
+    def __init__(self, backend: AreneroFilesBackend) -> None:
+        """Bind a backend without opening or closing its resources."""
+        self.backend = backend
+
+    def _prepare(self, request: ModelRequest) -> ModelRequest:
+        """Build one model request using only the currently visible tools.
+
+        Args:
+            request: Filtered model request.
+
+        Returns:
+            Request with backend instructions and unchanged tool authority.
+        """
+        request = _backend_request(request, self.backend)
+        return request.override(
+            system_message=append_to_system_message(
+                request.system_message, self.backend.instructions()
+            )
+        )
+
+    def wrap_model_call(
+        self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]
+    ) -> ModelResponse:
+        """Prepare a synchronous model call.
+
+        Args:
+            request: Current model request.
+            handler: Next middleware or model.
+
+        Returns:
+            Model response.
+        """
+        return handler(self._prepare(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """Prepare an asynchronous model call.
+
+        Args:
+            request: Current model request.
+            handler: Next middleware or model.
+
+        Returns:
+            Awaited model response.
+        """
+        return await handler(self._prepare(request))
 
 
 def _transfer_error(exc: BaseException) -> str:

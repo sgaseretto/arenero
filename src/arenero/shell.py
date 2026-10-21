@@ -196,6 +196,7 @@ class VirtualShell:
         self._current_cwd = self.kernel.default_working_directory
         self._command_budget = self.kernel.config.max_shell_commands
         self._script_depth = 0
+        self._capture_output: Callable[[ShellResult], None] | None = None
         self._commands: dict[
             str, Callable[[list[str], str | None, str], ShellResult]
         ] = {
@@ -334,6 +335,9 @@ class VirtualShell:
             result = saved
         if usage_error:
             return result
+
+        if self._capture_output is not None:
+            self._capture_output(result)
 
         output = result.output
         last_result = result

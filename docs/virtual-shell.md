@@ -485,6 +485,13 @@ save the larger bounded shell output when only the returned view is trimmed.
 
 ## Result contract
 
+The optional Deep Agents `AreneroBackend` can also use native execute capture.
+Set `enable_capture_offload=True` before graph calls to save bounded output before
+the final display trim. This observes the same virtual command execution; it
+does not add shell syntax, run an OS wrapper, or bypass hard output/transfer
+limits. See [native capture](deepagents-compatibility.md#opt-in-execute-output-capture)
+for the file pointer, preview, failure, and lifetime rules.
+
 `execute()` returns `output`, `exit_code`, and `truncated`:
 
 - `0` means success.
