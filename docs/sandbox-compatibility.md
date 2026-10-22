@@ -58,6 +58,8 @@ executables.
 | File-only Deep Agents backend | `AreneroFilesBackend` omits execution so built-in file tools can use Deep Agents allow/deny/interrupt rules. Direct host grants remain outside those rules. |
 | Model-facing backend guidance | `AreneroBackendMiddleware` corrects stock execute/grep descriptions and adds instructions. Shared-backend interpreter mode does this automatically. |
 | Native execute capture | Opt-in `enable_capture_offload=True` saves bounded virtual-shell output before final display trimming and returns the native Deep Agents file pointer. No command rerun or OS wrapper. |
+| Root-aware agent setup | `deepagents_settings` aligns native artifact paths and file roots. Read-only setup checks report profile errors and direct-file permission warnings. |
+| Optional file metadata | Deep Agents ls/glob return native byte sizes for mounts and memory files. Direct mounts also supply real UTC mtime to listings and reads. Unknown dates are omitted. |
 | Per-call shell deadline | A positive execute timeout stops at cooperative checks with exit 124. Zero or None uses configured limits. Active host/worker work is not forcibly stopped. |
 | Static virtual modules | `execute_module` resolves a bounded graph of top-level virtual imports. It is not CPython importlib and generated feeds skip type checking. |
 | Session administration | Stores and kernels list safe session metadata and delete expired sessions without exposing snapshot bytes. |
@@ -111,7 +113,7 @@ pinned upstream sources. Its ten recommended additions are implemented in the
 
 | Addition | Difficulty | Notes |
 | --- | --- | --- |
-| File metadata | Low to medium | Add byte size and timestamps where the selected filesystem backend can supply them. |
+| More metadata providers | Low to medium | Native mount metadata and memory-file size work. Callback/custom handlers need an explicit reliable metadata source; no timestamp store is added. |
 | Strict full-command wall timeout | High | Needs a disposable process boundary that can stop active work, not an abandoned worker thread. Cooperative deadlines already work. |
 | Broader permission or approval hooks | Medium | Built-in Deep Agents file rules work with the file-only profile. Direct host grants and nested PTC approvals still need their own policy. |
 

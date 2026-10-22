@@ -115,6 +115,7 @@ again.
 | Speculative call coordinator | `speculation.py` | Inspect streamed code, run selected calls early, use a forked Monty shadow, and let real execution claim matching results. |
 | LangChain RLM adapter | `langchain_rlm.py` | Call or stream chat models through `ainvoke()` and `astream()`, then normalize text and reported usage. |
 | Doctor | `doctor.py` | Check Monty, worker startup, optional packages, workspace access, and MCP status. |
+| Deep Agents setup | `deepagents_setup.py` | Build root-aware native agent settings and report adapter wiring errors or warnings without changing grants. |
 | Persistent sync kernel | `kernel.py` | Restore, execute, limit, save, reset, and inspect Monty sessions. |
 | Persistent async kernel | `async_kernel.py` | Run Python, percent cells, binary transfer, overflow output, files, and static modules on native `AsyncMonty` workers; keep the shell on the sync surface. |
 | Session stores | `store.py` | Keep opaque snapshots in memory, SQLite, or nowhere. Apply revision checks and expiry. |
@@ -356,6 +357,14 @@ is opt-in and observes bounded virtual output before the final display trim,
 then uses raw transfer after the shell call. The shell source and limits are not
 changed. A failed write never repeats the command.
 
+The optional settings helper returns native composite-backend and existing
+middleware arguments. It aligns artifact and file roots without adding an owner
+or more agent tools. Separate read-only setup checks reuse doctor records and
+kernel capabilities. Metadata uses a disposable native stat feed with the same
+mounts and file handler. Listings add supported size/mtime fields; reads no longer
+invent dates. Memory files have no real modification clock, so their dates stay
+absent. Callback and custom-handler metadata stays unknown.
+
 ```mermaid
 flowchart LR
     Model["Model request after tool filters"] --> Guidance["Backend middleware or combined interpreter"]
@@ -366,6 +375,11 @@ flowchart LR
     ShellAPI --> FileAPI
     ShellAPI -. "capture enabled" .-> Capture["Bounded pre-display output"]
     Capture --> Transfer["Raw upload; native pointer and preview"]
+    Settings["Root-aware settings helper"] --> Guidance
+    Settings --> Root["Native CompositeBackend: artifact root = file root"]
+    Root --> Transfer
+    FileAPI --> Stat["Disposable native stat: same file authority"]
+    Stat --> Metadata["Optional real bytes and mtime; no saved Python state"]
 ```
 
 This does not put graph permission rules inside the kernel. Direct `fs_*`,

@@ -471,6 +471,35 @@ request helper. Tool filters, schemas, callbacks, and custom descriptions remain
 unchanged. This fixes unavailable `rg` guidance without replacing Deep Agents'
 filesystem middleware or changing the external agent tools.
 
+`deepagents_settings` returns a plain kwargs dictionary, not another agent or
+resource owner. A native CompositeBackend with no routes sets artifacts_root to
+the Arenero file root. This prevents native capture from requesting
+`/large_tool_results` outside a `/workspace` backend. A directly configured
+interpreter still receives the underlying backend, not a composite that lacks
+its private file bridges. Existing manual construction and capture defaults stay unchanged.
+Native permissions are passed through; we do not silently drop execution or
+change the backend profile.
+
+`check_deepagents_setup` reuses doctor records and existing kernel capabilities.
+It checks explicit adapter settings without worker probes or side effects.
+When an MCP hub is configured, it defers the normal capability report because
+that report can connect servers. No live kernel settings are changed to hide it.
+Invalid roots and executing-backend permission rules are required failures.
+Direct file grants and different interpreter/graph backends are warnings, not
+new restrictions. Routes and custom host authority remain the application's job.
+
+Native Path.stat already has mount confinement, so metadata reuses an isolated
+Monty feed instead of a second host-path resolver. Only bounded returned entries
+are inspected. Mounted mtime is real; default OSAccess dates are generated at
+stat time and must not be presented as file history. Memory files therefore
+report size only, callback/custom metadata remains unknown, and read records no
+longer invent creation dates. No sidecar timestamp store, new stat tool, or
+creation-time guess is added. Optional metadata failure does not invalidate
+successful content reads. Read/scan/stat operations are not an atomic snapshot.
+For standard OSAccess, a small pinned tree lookup identifies active MemoryFile
+entries under the existing file lock. Its registration list can be stale after
+rename/delete, so that list must not decide whether stat can trigger a callback.
+
 ## RLM recursion uses new sessions, not interpreter re-entry
 
 `llm_query` calls one configured async model on the host. `rlm_query` creates a

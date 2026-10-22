@@ -711,7 +711,8 @@ class BackendContractTests(unittest.IsolatedAsyncioTestCase):
             (2, 2, 2, 3),
         )
         self.assertEqual(page.file_data["content"], "two\n")
-        self.assertIn("created_at", page.file_data)
+        self.assertNotIn("created_at", page.file_data)
+        self.assertNotIn("modified_at", page.file_data)
         self.assertIsNone((await self.backend.aedit("/a.txt", "two", "TWO")).error)
         self.assertEqual(len((await self.backend.als("/")).entries), 1)
         self.assertEqual(len((await self.backend.aglob("*.txt")).matches), 1)

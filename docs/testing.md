@@ -93,6 +93,24 @@ UTF-8/zero-byte limits, incomplete output, invalid root/budget rejection before
 execution, transfer caps, and failed capture writes. These tests do not run an
 OS shell, use a real LLM, or contact a remote sandbox service.
 
+`tests/test_deepagents_setup.py` checks root-aware settings through sync and async
+fake-model graphs. A mounted `/workspace` graph captures output, reads the saved
+path, keeps a nonzero exit code, and writes its side effect only once. Another
+graph preserves Python state across two human turns while native file denies
+still apply through PTC. Combined direct-file grants continue to work and produce
+an advisory setup warning. Read-only diagnostics detect bad roots, invalid
+execution/permission profiles, and mismatched backends without running a probe.
+
+Metadata checks compare native listing/glob/read sizes and UTC mtime with real
+temporary files, then update them through backend, shell, and Python writes.
+They check UTF-8 byte counts, memory/binary files, absent synthetic dates,
+callback-free listing, overlay dates, isolated Python state, optional stat
+failure, callback replacement/rename, and unsafe symlink confinement. The complete
+436-test suite passes in both dependency environments. A configured MCP hub also
+defers the capability probe, so read-only setup checks cannot connect servers.
+Tests do not add host-file authority,
+real model calls, or remote service calls.
+
 `tests/test_deepagents_hardening.py` adds regression checks for all ten adapter
 follow-ups. A fake-model graph calls a loop-bound async tool across two human
 turns. Real Deep Agents child graphs use fake models for a structured response,

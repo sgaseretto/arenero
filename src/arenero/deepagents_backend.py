@@ -4,6 +4,8 @@ import asyncio
 import posixpath
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents.backends.protocol import (
@@ -22,7 +24,7 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
-from deepagents.backends.utils import compile_grep_include_glob, create_file_data
+from deepagents.backends.utils import compile_grep_include_glob
 from deepagents.middleware import filesystem as _filesystem
 from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import (
@@ -32,6 +34,7 @@ from langchain.agents.middleware.types import (
     ModelResponse,
 )
 from langchain.tools import BaseTool
+from pydantic_monty import MemoryFile, OSAccess
 
 from .hosted_tools import HostedTool, HostedToolConfig, HostedToolSet
 from .sandbox import MONTY_SANDBOX_INSTRUCTIONS, AreneroSandbox, SandboxErrors
@@ -133,12 +136,17 @@ class AreneroFilesBackend(BackendProtocol):
             File data and valid paging metadata, or an error.
         """
         if limit <= 0:
-            return ReadResult(file_data=create_file_data(""), no_lines_requested=True)
+            return ReadResult(
+                file_data={"content": "", "encoding": "utf-8"}, no_lines_requested=True
+            )
         try:
-            result = self.sandbox.read(self._path(file_path), offset, limit)
+            path = self._path(file_path)
+            result = self.sandbox.read(path, offset, limit)
             data = asdict(result)
             if result.file_data is not None:
-                data["file_data"] = create_file_data(**result.file_data)
+                metadata = self._metadata([path]).get(path, {})
+                if "modified_at" in metadata:
+                    data["file_data"]["modified_at"] = metadata["modified_at"]
             if result.start_line is None:
                 data.update(total_lines=None, next_offset=None)
             return ReadResult(**data)
@@ -238,9 +246,14 @@ class AreneroFilesBackend(BackendProtocol):
         """
         try:
             result = self._scan(self._path(path), False)
+            metadata = self._metadata([entry["path"] for entry in result["entries"]])
             return LsResult(
                 entries=[
-                    {"path": entry["path"], "is_dir": entry["type"] == "directory"}
+                    {
+                        "path": entry["path"],
+                        "is_dir": entry["type"] == "directory",
+                        **metadata.get(entry["path"], {}),
+                    }
                     for entry in result["entries"]
                 ],
                 error="listing reached the filesystem scan limit"
@@ -270,9 +283,77 @@ class AreneroFilesBackend(BackendProtocol):
                 if entry["type"] == "file"
                 and match(posixpath.relpath(entry["path"], root))
             ]
+            metadata = self._metadata([entry["path"] for entry in entries])
+            for entry in entries:
+                entry.update(metadata.get(entry["path"], {}))
             return GlobResult(matches=entries, truncated=result["truncated"])
         except SandboxErrors as exc:
             return GlobResult(error=str(exc))
+
+    def _metadata(self, paths: list[str]) -> dict[str, Any]:
+        """Read optional metadata through Monty's existing file authority.
+
+        Args:
+            paths: Bounded virtual paths already checked by this backend.
+
+        Returns:
+            Byte sizes and real mounted-file modification times. Memory files
+            have sizes only. Callback files and unknown handlers are omitted.
+            Failed stats do not turn successful file operations into errors.
+        """
+        kernel = self.sandbox.kernel
+        try:
+            with kernel.filesystem_guard():
+                selected = []
+                for path in paths:
+                    mount = next(
+                        (
+                            mount
+                            for mount in kernel.mounts or ()
+                            if path == str(mount.virtual_path).rstrip("/")
+                            or path.startswith(
+                                str(mount.virtual_path).rstrip("/") + "/"
+                            )
+                        ),
+                        None,
+                    )
+                    # The registration list can be stale after rename/delete.
+                    # Inspect the active tree only for the pinned standard handler.
+                    memory_file = type(kernel.os_handler) is OSAccess and (
+                        type(kernel.os_handler._get_entry(PurePosixPath(path)))
+                        is MemoryFile
+                    )
+                    if mount is not None or memory_file:
+                        selected.append(
+                            (path, mount is not None and mount.mode != "overlay")
+                        )
+                if not selected:
+                    return {}
+                stats = kernel._run_isolated(
+                    "from pathlib import Path\n"
+                    "metadata = {}\n"
+                    "for path, real_time in paths:\n"
+                    "    try:\n"
+                    "        stat = Path(path).stat()\n"
+                    "        metadata[path] = (stat.st_size, stat.st_mtime if real_time else None)\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "metadata",
+                    inputs={"paths": selected},
+                )
+        except SandboxErrors:
+            return {}
+        return {
+            path: {
+                "size": size,
+                **(
+                    {"modified_at": datetime.fromtimestamp(mtime, UTC).isoformat()}
+                    if mtime is not None
+                    else {}
+                ),
+            }
+            for path, (size, mtime) in stats.items()
+        }
 
     def grep(
         self,

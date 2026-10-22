@@ -460,6 +460,89 @@ with `CodeInterpreterMiddleware(backend=backend)`: the combined setup already
 adds the same guidance. The previous `system_prompt=backend.instructions()`
 setup still works, but does not rewrite tool descriptions.
 
+### Root-aware settings and setup checks
+
+Use the optional `arenero.deepagents_setup` helpers when you do not need custom
+composite routes. They reuse the existing adapters and native CompositeBackend:
+
+```python
+from arenero import WorkspaceConfig
+from arenero.deepagents_setup import check_deepagents_setup, deepagents_settings
+
+with PersistentMontyKernel(workspace=WorkspaceConfig("./agent-files")) as file_kernel:
+    backend = AreneroBackend(AreneroSandbox(file_kernel))  # /workspace
+    with CodeInterpreterMiddleware(backend=backend) as interpreter:
+        settings = deepagents_settings(
+            backend, interpreter=interpreter, capture_output=True
+        )
+        report = check_deepagents_setup(
+            backend,
+            artifacts_root=settings["backend"].artifacts_root,
+            interpreter=interpreter,
+        )
+        assert report["ok"], report["checks"]
+        agent = create_deep_agent(model=model, **settings)
+        # Invoke inside the contexts. Close interpreter before file_kernel.
+```
+
+`deepagents_settings(backend, interpreter=None, permissions=None,
+capture_output=False)` returns a plain dictionary for `create_deep_agent`:
+
+- `backend` is `CompositeBackend(default=backend, routes={},
+  artifacts_root=backend.root)`. Native output files stay inside the file root.
+  It adds no routes, mounts, or shell authority.
+- `middleware` contains backend guidance and the optional interpreter. If that
+  interpreter already uses this backend, the guidance is not added twice.
+- `permissions` is passed through unchanged when supplied. Choose
+  `AreneroFilesBackend` for these rules; the helper does not silently replace
+  an execution-capable backend or remove rules that Deep Agents rejects.
+- `capture_output=True` sets the existing `enable_capture_offload` flag on an
+  `AreneroBackend`. A file-only backend raises ValueError. False leaves an
+  existing flag unchanged. Configure once before agent calls, not during them.
+
+The helper does not create the agent, own resources, install a checkpointer,
+grant direct interpreter files, or add extra agent tools. Add other native agent
+options to `create_deep_agent` as usual. To use filters or other middleware,
+edit the returned middleware list before graph construction. Put tool filters
+before the backend guidance and interpreter. For custom routes, keep the manual
+CompositeBackend setup; pass its underlying Arenero backend to the middleware.
+
+`check_deepagents_setup(backend, artifacts_root="/", interpreter=None,
+permissions=None)` uses the doctor check format: `ok`, `checks`, and current
+kernel `capabilities`. Unlike `run_doctor(kernel)`, it does not run a worker,
+connect MCP servers, read files, or write a test file. Supply the actual root,
+interpreter, and permissions from your setup. It does not discover the agent's
+settings automatically or run automatically during graph creation.
+If the file kernel has an MCP hub, the normal capability report could connect
+servers. This check instead sets `capabilities=None` and
+`capabilities_deferred=True`. Call `kernel.capabilities()` explicitly when those
+connections are acceptable. Without an MCP hub, capabilities are included and
+the deferred flag is false.
+
+| Check | Result when the check fails |
+| --- | --- |
+| `deepagents:artifacts_root` | Required failure: root is invalid or outside the file backend. Use the settings helper or set the composite artifact root explicitly. |
+| `deepagents:backend_profile` | Required failure: filesystem permissions were supplied for an executing backend. Use the file-only profile. |
+| `deepagents:direct_files` | Optional warning: direct backend, workspace, or OS-handler access bypasses the supplied graph file rules. Omit those interpreter grants and use selected built-in file tools through PTC when rules must apply. |
+| `deepagents:shared_backend` | Optional warning: interpreter and graph use different backend objects. This can be intentional; confirm that they should see different files. |
+
+Required failures set `ok=False`; optional warnings do not. Inspect all checks,
+not only `ok`. The report does not revoke direct grants or enforce permissions.
+It checks the default backend only, not custom routes, tool-specific approvals,
+hosted/MCP tool authority, directory existence, or write permissions. Use the
+existing doctor and normal error results for runtime access checks.
+
+```mermaid
+flowchart LR
+    Config["Existing backend and optional interpreter"] --> Settings["deepagents_settings"]
+    Settings --> Composite["Native CompositeBackend: artifact root = file root"]
+    Settings --> Guidance["Existing middleware, without duplicate guidance"]
+    Composite --> Agent["create_deep_agent: same tools and schemas"]
+    Guidance --> Agent
+    Config --> Check["check_deepagents_setup: read-only checks"]
+    Check --> Report["Required errors, optional warnings, optional capabilities"]
+```
+
 ### File-only backend and permissions
 
 ```python
@@ -529,8 +612,8 @@ flowchart TD
 
 - `read` returns raw text, not numbered gutters. Negative offsets start at zero.
   Nonpositive limits do not inspect a file. Empty/past-end windows do not carry
-  invalid pagination fields. Non-UTF-8 bytes are Base64. FileData timestamps
-  describe record creation, not preserved underlying file metadata.
+  invalid pagination fields. Non-UTF-8 bytes are Base64. Unknown FileData dates
+  are omitted, not generated from the time of a read.
 - `glob` and grep include-globs reuse the Deep Agents matcher: basename matching
   at any depth, anchored/root-relative patterns, `**`, classes, braces, and dot
   rules. Only regular files are returned and paths are absolute. This does not
@@ -549,6 +632,34 @@ flowchart TD
   confinement boundary: `execute` keeps that kernel's existing mounted authority.
 - Native `a*` methods offload the sync backend to worker threads. Cancelling a
   caller does not undo a completed file change or forcibly stop an active thread.
+
+#### Optional real metadata
+
+`ls` entries and `glob` matches include `size` in bytes when available. Direct
+read-only/read-write mounts also include `modified_at`, in UTC ISO format.
+`read().file_data` includes that same real modification time. No creation date is
+reported: Monty's stat does not supply a portable creation time, and ctime is not
+creation time. File content, result types, and public method signatures do not
+change. Both backend profiles and their async methods share this behavior.
+
+| Storage | Size | Modification time |
+| --- | --- | --- |
+| Direct mounted host directory, including WorkspaceConfig | Native stat bytes | Real native stat mtime |
+| Overlay mount | Native stat bytes | Omitted; not a reliable saved-overlay clock |
+| Standard OSAccess with MemoryFile | Native stat bytes | Omitted; default OSAccess dates are synthetic |
+| CallbackFile, custom OS handler, or OSAccess subclass | Omitted | Omitted; no new callback/metadata contract is assumed |
+
+The adapter stats only the bounded returned paths, in one disposable Monty
+checkout. It uses the existing mounts and file handler, not host Path.stat on a
+joined virtual path. Metadata does not enter saved Python state. It remains
+best-effort: a failed stat omits metadata without failing successful file content
+or listing results. Existing file errors and scan truncation are unchanged.
+An unsafe symlink can still cause Monty to refuse a native directory scan;
+optional metadata does not bypass that refusal.
+Scans, reads, and stats are separate operations, not a filesystem snapshot; a
+concurrent edit can change metadata between them. Known callback files are not
+read just to populate a listing. This adds no filesystem stat tool or timestamps
+to the core shell/file-helper result schemas.
 
 ### Limited execute and deadlines
 
@@ -631,7 +742,8 @@ Limits and failure rules:
   budgets fail before command execution when capture is enabled. With capture
   disabled, the method delegates unchanged to normal execute.
 - Deep Agents attempts capture only if its artifact path resolves to this
-  executing backend. For a root such as `/workspace`, use
+  executing backend. `deepagents_settings(backend, capture_output=True)` wires
+  this for you. For manual setup with a root such as `/workspace`, use
   `CompositeBackend(default=backend, routes={}, artifacts_root=backend.root)` so
   `/workspace/large_tool_results/...` is inside that root. If an artifact path
   routes to different storage, Deep Agents skips native capture and uses its

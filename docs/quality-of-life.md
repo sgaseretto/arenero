@@ -444,6 +444,29 @@ flags.
 Doctor can connect configured MCP servers and can create a short test file in a
 configured workspace. Run it only when these diagnostic actions are acceptable.
 
+For optional Deep Agents adapter wiring, use the separate read-only check:
+
+```python
+from arenero.deepagents_setup import check_deepagents_setup, deepagents_settings
+
+settings = deepagents_settings(backend, interpreter=interpreter)
+report = check_deepagents_setup(
+    backend,
+    artifacts_root=settings["backend"].artifacts_root,
+    interpreter=interpreter,
+)
+```
+
+This check uses the same record format but does not run worker/file/MCP probes.
+Pass `permissions=rules` to check the profile and direct-file grant boundaries
+when rules are configured. Optional warnings do not make `ok` false or revoke
+grants. See the [adapter setup guide](deepagents-compatibility.md#root-aware-settings-and-setup-checks)
+for each check and the helper's resource and routing limits. Existing
+`run_doctor(kernel)` and CLI behavior stay unchanged.
+When an MCP hub is configured, `capabilities` is None and
+`capabilities_deferred` is true. Request `kernel.capabilities()` separately if
+you want to permit its normal MCP connection and discovery.
+
 ## Event sink
 
 ```python

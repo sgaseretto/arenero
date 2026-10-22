@@ -610,6 +610,8 @@ flowchart LR
     Backend --> Files["One virtual file store and limited shell"]
     FileOnly --> Files
     Backend -. "opt-in native output capture" .-> Saved["Bounded file plus preview"]
+    Setup["deepagents_settings"] --> Root["Artifact root equals backend root"]
+    Root --> Saved
 ```
 
 Add `AreneroBackend` from `arenero.deepagents_backend` for native Deep Agents file
@@ -626,7 +628,8 @@ selected built-in file tools through `ptc`:
 ```python
 from arenero import AreneroSandbox, PersistentMontyKernel
 from arenero.deepagents import CodeInterpreterMiddleware
-from arenero.deepagents_backend import AreneroBackendMiddleware, AreneroFilesBackend
+from arenero.deepagents_backend import AreneroFilesBackend
+from arenero.deepagents_setup import deepagents_settings
 from deepagents import FilesystemPermission, create_deep_agent
 from pydantic_monty import OSAccess
 
@@ -635,13 +638,15 @@ with PersistentMontyKernel(os_handler=OSAccess()) as file_kernel:
     with CodeInterpreterMiddleware(ptc=("read_file", "write_file")) as interpreter:
         agent = create_deep_agent(
             model=model,
-            backend=files,
-            permissions=[
-                FilesystemPermission(
-                    operations=["write"], paths=["/policies/**"], mode="deny"
-                )
-            ],
-            middleware=[AreneroBackendMiddleware(files), interpreter],
+            **deepagents_settings(
+                files,
+                interpreter=interpreter,
+                permissions=[
+                    FilesystemPermission(
+                        operations=["write"], paths=["/policies/**"], mode="deny"
+                    )
+                ],
+            ),
         )
         # Invoke the agent inside these contexts.
 ```
@@ -649,11 +654,34 @@ with PersistentMontyKernel(os_handler=OSAccess()) as file_kernel:
 `AreneroBackendMiddleware` adds backend instructions and corrects the standard
 `execute`/`grep` descriptions. It does not add tools or change their schemas.
 The combined `CodeInterpreterMiddleware(backend=backend)` setup does this
-automatically. Custom tool descriptions stay unchanged. For shell output
-capture, set `backend.enable_capture_offload = True` before graph execution.
+automatically. Custom tool descriptions stay unchanged. `deepagents_settings`
+selects this middleware and sets the artifact root to the backend root. It
+returns keyword settings only and does not close resources. Existing manual
+setups still work. For shell output capture, use:
+
+```python
+from arenero.deepagents_setup import check_deepagents_setup, deepagents_settings
+
+# backend is an AreneroBackend backed by an open file kernel.
+settings = deepagents_settings(backend, capture_output=True)
+report = check_deepagents_setup(
+    backend, artifacts_root=settings["backend"].artifacts_root
+)
+assert report["ok"], report["checks"]
+agent = create_deep_agent(model=model, **settings)
+```
+
 Deep Agents can then return a preview and a virtual file path. Capture is off by
 default and never runs an OS wrapper. Existing output and transfer caps still
 apply; an incomplete saved file is marked as such.
+
+The setup check reports bad artifact roots, incompatible execution/permission
+profiles, and direct interpreter file grants that bypass graph permissions.
+Supply the same `interpreter` and `permissions` to check that setup. Checks are
+read-only; warnings do not revoke grants. Native backend listings include byte
+size and UTC modification time for mounted files, and size only for memory
+files. Unknown dates are omitted, not replaced with the read time. See the
+[setup and metadata contracts](docs/deepagents-compatibility.md#root-aware-settings-and-setup-checks).
 
 Path permissions apply to built-in file tools, not host uploads, mounts, MCP
 tools, or direct `fs_*` grants. Do not pass `backend=files` to the interpreter
